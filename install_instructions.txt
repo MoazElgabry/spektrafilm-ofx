@@ -14,3 +14,16 @@ You may need administrator permission to copy files into /Library/OFX/Plugins/.
 
 After copying the bundle, restart your OFX host application so it rescans the
 plugin folder.
+
+
+User manual & reference guide
+===============================
+
+You can find plugin-relevant documentation either at:
+
+  /spektrafilm.ofx.bundle/Contents/Resources/spektrafilm_user_manual.pdf
+
+or by selecting "Open User Manual" from the "Manage" section in the plugin interface.
+
+
+Have fun and thank you for creating with spektrafilm!
