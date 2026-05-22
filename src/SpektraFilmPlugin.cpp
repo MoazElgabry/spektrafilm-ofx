@@ -151,7 +151,7 @@ inline constexpr ParamMetadata kParamMetadata[] = {
   {"rgbToRawMethod", "filmGroup", flow()},
   {"film", "filmGroup", flow()},
   {"filmFormat", "filmGroup", flow()},
-  {"filmPushPullMode", "filmGroup", kParamTagNone},
+  {"filmPushPullMode", "filmGroup", flow()},
   {"filmPushPullStops", "filmGroup", flow()},
   {"negativeBleachBypassAmount", "filmGroup", flowDevelopment()},
   {"negativeLeucoCyanCoupling", "filmGroup", development()},
