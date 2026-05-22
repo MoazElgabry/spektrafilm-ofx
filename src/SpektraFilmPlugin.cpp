@@ -235,10 +235,10 @@ inline constexpr ParamMetadata kParamMetadata[] = {
   {"scatterScale", "halationGroup", kParamTagNone},
   {"halationAmount", "halationGroup", flow()},
   {"halationScale", "halationGroup", flow()},
-  {"halationStrength", "halationGroup", flow()},
   {"halationBoostEv", "halationGroup", flow()},
   {"halationBoostRange", "halationGroup", kParamTagNone},
   {"halationProtectEv", "halationGroup", kParamTagNone},
+  {"halationStrength", "halationGroup", flow()},
 
   {"cameraDiffusionEnabled", "diffusionGroup", flow()},
   {"cameraDiffusionFamily", "diffusionGroup", flow()},
@@ -3629,10 +3629,10 @@ OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHandle) {
   defineDouble(paramSet, "scatterScale", "Scatter Scale", 1.0, 0.0, 4.0, "halationGroup");
   defineDouble(paramSet, "halationAmount", "Amount", 1.0, 0.0, 4.0, "halationGroup");
   defineDouble(paramSet, "halationScale", "Scale", 1.0, 0.0, 4.0, "halationGroup");
-  defineRGB(paramSet, "halationStrength", "Strength RGB", 0.05, 0.015, 0.0, "halationGroup");
   defineDouble(paramSet, "halationBoostEv", "Boost EV", 0.0, 0.0, 20.0, "halationGroup");
   defineDouble(paramSet, "halationBoostRange", "Boost Range", 0.3, 0.0, 1.0, "halationGroup");
   defineDouble(paramSet, "halationProtectEv", "Protect EV", 4.0, 0.0, 10.0, "halationGroup");
+  defineRGB(paramSet, "halationStrength", "Strength RGB", 0.05, 0.015, 0.0, "halationGroup");
   const char *diffusionFamilies[] = {"Glimmerglass", "Black Pro-Mist", "Pro-Mist", "CineBloom"};
   defineBool(paramSet, "cameraDiffusionEnabled", "Camera Enabled", false, "diffusionGroup");
   defineChoice(paramSet, "cameraDiffusionFamily", "Camera Family", diffusionFamilies, 4, 1, "diffusionGroup");

@@ -358,13 +358,18 @@ static float spektra_mitchell_weight(float t) {
 }
 
 static uint spektra_safe_index(int index, uint size) {
-  if (index < 0) {
-    return uint(-index);
+  if (size <= 1u) {
+    return 0u;
   }
-  if (index >= int(size)) {
-    return uint(2 * int(size - 1u) - index);
+  const int period = int(size) * 2 - 2;
+  int mirrored = index % period;
+  if (mirrored < 0) {
+    mirrored += period;
   }
-  return uint(index);
+  if (mirrored >= int(size)) {
+    mirrored = period - mirrored;
+  }
+  return uint(mirrored);
 }
 
 static uint spektra_color_space_index(int colorSpace, constant SpektraColorInfo &colorInfo) {
