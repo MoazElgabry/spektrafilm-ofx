@@ -197,7 +197,9 @@ inline constexpr ParamMetadata kParamMetadata[] = {
 
   {"grainEnabled", "grainGroup", flow()},
   {"grainModel", "grainGroup", flow()},
-  {"grainSublayersEnabled", "grainGroup", flow()},
+  {"grainAmount", "grainGroup", flow()},
+  {"grainSaturation", "grainGroup", flow()},
+  {"grainSublayersEnabled", "grainGroup", kParamTagNone},
   {"grainSubLayerCount", "grainGroup", kParamTagNone},
   {"grainParticleAreaUm2", "grainGroup", flow()},
   {"grainParticleScale", "grainGroup", kParamTagNone},
@@ -456,6 +458,8 @@ inline constexpr ParamDefault kParamDefaults[] = {
   boolDefault("grainEnabled", false),
   intDefault("grainModel", 0),
   intDefault("filmFormat", 4),
+  doubleDefault("grainAmount", 1.0),
+  doubleDefault("grainSaturation", 1.0),
   boolDefault("grainSublayersEnabled", true),
   intDefault("grainSubLayerCount", 1),
   doubleDefault("grainParticleAreaUm2", 0.1),
@@ -463,7 +467,7 @@ inline constexpr ParamDefault kParamDefaults[] = {
   double3DDefault("grainParticleScaleLayers", 6.0, 1.0, 0.4),
   double3DDefault("grainDensityMin", 0.04, 0.05, 0.06),
   double3DDefault("grainUniformity", 0.99, 0.97, 0.98),
-  doubleDefault("grainFinalBlurUm", 11.8),
+  doubleDefault("grainFinalBlurUm", 7.17),
   doubleDefault("grainBlurDyeCloudsUm", 1.0),
   double2DDefault("grainMicroStructure", 0.2, 30.0),
   intDefault("grainSeed", 1),
@@ -659,6 +663,8 @@ struct InstanceData {
   OfxParamHandle grainEnabled = nullptr;
   OfxParamHandle grainModel = nullptr;
   OfxParamHandle filmFormat = nullptr;
+  OfxParamHandle grainAmount = nullptr;
+  OfxParamHandle grainSaturation = nullptr;
   OfxParamHandle grainSublayersEnabled = nullptr;
   OfxParamHandle grainSubLayerCount = nullptr;
   OfxParamHandle grainParticleAreaUm2 = nullptr;
@@ -1180,6 +1186,8 @@ spektrafilm::RenderParams readParams(InstanceData *data, OfxTime time) {
     params.grainModel = spektrafilm::GrainModel::Preview;
   }
   params.filmFormat = static_cast<spektrafilm::FilmFormat>(getIntAtTime(data->filmFormat, time, 4));
+  params.grainAmount = static_cast<float>(getDoubleAtTime(data->grainAmount, time, 1.0));
+  params.grainSaturation = static_cast<float>(getDoubleAtTime(data->grainSaturation, time, 1.0));
   params.grainSublayersEnabled = getBoolAtTime(data->grainSublayersEnabled, time, true);
   params.grainSubLayerCount = getIntAtTime(data->grainSubLayerCount, time, 1);
   params.grainParticleAreaUm2 = static_cast<float>(getDoubleAtTime(data->grainParticleAreaUm2, time, 0.1));
@@ -1211,7 +1219,7 @@ spektrafilm::RenderParams readParams(InstanceData *data, OfxTime time) {
   params.grainUniformityR = static_cast<float>(grainUniformity[0]);
   params.grainUniformityG = static_cast<float>(grainUniformity[1]);
   params.grainUniformityB = static_cast<float>(grainUniformity[2]);
-  params.grainFinalBlurUm = static_cast<float>(getDoubleAtTime(data->grainFinalBlurUm, time, 11.8));
+  params.grainFinalBlurUm = static_cast<float>(getDoubleAtTime(data->grainFinalBlurUm, time, 7.17));
   params.grainBlurDyeCloudsUm = static_cast<float>(getDoubleAtTime(data->grainBlurDyeCloudsUm, time, 1.0));
   double microStructure[2] = {0.2, 30.0};
   if (data->grainMicroStructure) {
@@ -2566,6 +2574,8 @@ OfxStatus createInstance(OfxImageEffectHandle effect) {
   cacheParam(paramSet, "grainEnabled", data->grainEnabled);
   cacheParam(paramSet, "grainModel", data->grainModel);
   cacheParam(paramSet, "filmFormat", data->filmFormat);
+  cacheParam(paramSet, "grainAmount", data->grainAmount);
+  cacheParam(paramSet, "grainSaturation", data->grainSaturation);
   cacheParam(paramSet, "grainSublayersEnabled", data->grainSublayersEnabled);
   cacheParam(paramSet, "grainSubLayerCount", data->grainSubLayerCount);
   cacheParam(paramSet, "grainParticleAreaUm2", data->grainParticleAreaUm2);
@@ -3520,6 +3530,8 @@ OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHandle) {
   defineBool(paramSet, "grainEnabled", "Enabled", false, "grainGroup");
   const char *grainModels[] = {"Preview", "Production", "Grain Synthesis"};
   defineChoice(paramSet, "grainModel", "Model", grainModels, grainModelOptionCountForFlavor(), 0, "grainGroup");
+  defineDouble(paramSet, "grainAmount", "Amount", 1.0, 0.0, 2.0, "grainGroup");
+  defineDouble(paramSet, "grainSaturation", "Saturation", 1.0, 0.0, 1.0, "grainGroup");
   defineBool(paramSet, "grainSublayersEnabled", "Sublayers", true, "grainGroup");
   defineInt(paramSet, "grainSubLayerCount", "Sub Layer Count", 1, 1, 8, "grainGroup");
   defineDouble(paramSet, "grainParticleAreaUm2", "Particle Area um2", 0.1, 0.01, 5.0, "grainGroup");
@@ -3527,7 +3539,7 @@ OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHandle) {
   defineDouble3D(paramSet, "grainParticleScaleLayers", "Layer Scale", 6.0, 1.0, 0.4, "grainGroup");
   defineDouble3D(paramSet, "grainDensityMin", "Density Min", 0.04, 0.05, 0.06, "grainGroup");
   defineDouble3D(paramSet, "grainUniformity", "Uniformity RGB", 0.99, 0.97, 0.98, "grainGroup");
-  defineDouble(paramSet, "grainFinalBlurUm", "Final Grain Blur um", 11.8, 0.0, 25.0, "grainGroup");
+  defineDouble(paramSet, "grainFinalBlurUm", "Final Grain Blur um", 7.17, 0.0, 25.0, "grainGroup");
   defineDouble(paramSet, "grainBlurDyeCloudsUm", "Dye Cloud Blur um", 1.0, 0.0, 10.0, "grainGroup");
   defineDouble2D(paramSet, "grainMicroStructure", "Micro Structure", 0.2, 30.0, "grainGroup");
   defineInt(paramSet, "grainSeed", "Seed", 1, 0, 1000000, "grainGroup");

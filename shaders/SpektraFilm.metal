@@ -55,6 +55,8 @@ struct SpektraKernelParams {
   uint grainEnabled;
   int grainModel;
   int filmFormat;
+  float grainAmount;
+  float grainSaturation;
   uint grainSublayersEnabled;
   int grainSubLayerCount;
   float grainParticleAreaUm2;
@@ -558,6 +560,22 @@ static float spektra_layer_particle_scale(uint layer, constant SpektraKernelPara
   return max(layer == 0u ? params.grainParticleScaleLayer0 : (layer == 1u ? params.grainParticleScaleLayer1 : params.grainParticleScaleLayer2), 1.0e-3);
 }
 
+static float3 spektra_apply_grain_controls(
+  float3 baseDensity,
+  float3 grainedDensity,
+  constant SpektraKernelParams &params
+) {
+  const float amount = max(params.grainAmount, 0.0);
+  const float saturation = clamp(params.grainSaturation, 0.0, 1.0);
+  if (amount == 1.0 && saturation == 1.0) {
+    return grainedDensity;
+  }
+  float3 delta = (grainedDensity - baseDensity) * amount;
+  const float neutral = (delta.r + delta.g + delta.b) / 3.0;
+  delta = mix(float3(neutral), delta, saturation);
+  return max(baseDensity + delta, float3(0.0));
+}
+
 static float spektra_particle_developed_density(
   float density,
   float densityMax,
@@ -771,8 +789,9 @@ static float3 spektra_apply_grain_to_density(
   if (params.grainEnabled == 0u) {
     return densityCmy;
   }
+  float3 grainedDensity;
   if (params.grainModel == 1) {
-    return spektra_production_grain_density(
+    grainedDensity = spektra_production_grain_density(
       densityCmy,
       params,
       curveInfo,
@@ -783,8 +802,10 @@ static float3 spektra_apply_grain_to_density(
       filmUm,
       baseSeed
     );
+  } else {
+    grainedDensity = spektra_preview_grain_density(densityCmy, params, curveInfo, densityCurves, filmUm, baseSeed);
   }
-  return spektra_preview_grain_density(densityCmy, params, curveInfo, densityCurves, filmUm, baseSeed);
+  return spektra_apply_grain_controls(densityCmy, grainedDensity, params);
 }
 
 static float spektra_development_activity(float stops) {
@@ -3605,7 +3626,11 @@ kernel void spektrafilm_preview_grain_from_density(
   const uint baseSeed = params.grainSeed ^ frameSeed;
   const float2 filmUm = spektra_output_pixel_film_um(gid, params, dims);
   densityOut[index] = float4(
-    spektra_preview_grain_density(density.rgb, params, curveInfo, densityCurves, filmUm, baseSeed),
+    spektra_apply_grain_controls(
+      density.rgb,
+      spektra_preview_grain_density(density.rgb, params, curveInfo, densityCurves, filmUm, baseSeed),
+      params
+    ),
     density.a
   );
 }
@@ -4908,6 +4933,26 @@ kernel void spektrafilm_grain_density_blur_y(
     weightSum += weight;
   }
   densityOut[index] = value / max(weightSum, 1.0e-8);
+}
+
+kernel void spektrafilm_grain_apply_controls(
+  device const float4 *baseDensity [[buffer(0)]],
+  device const float4 *grainedDensity [[buffer(1)]],
+  device float4 *densityOut [[buffer(2)]],
+  constant SpektraKernelParams &params [[buffer(3)]],
+  constant uint2 &dims [[buffer(4)]],
+  uint2 gid [[thread_position_in_grid]]
+) {
+  if (gid.x >= dims.x || gid.y >= dims.y) {
+    return;
+  }
+  const uint index = gid.y * dims.x + gid.x;
+  const float4 base = baseDensity[index];
+  const float4 grained = grainedDensity[index];
+  densityOut[index] = float4(
+    spektra_apply_grain_controls(base.rgb, grained.rgb, params),
+    grained.a
+  );
 }
 
 kernel void spektrafilm_final_from_film_density(

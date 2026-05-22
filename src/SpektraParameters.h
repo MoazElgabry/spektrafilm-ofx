@@ -179,6 +179,8 @@ struct RenderParams {
   bool grainEnabled = true;
   GrainModel grainModel = GrainModel::Preview;
   FilmFormat filmFormat = FilmFormat::Standard35;
+  float grainAmount = 1.0f;
+  float grainSaturation = 1.0f;
   bool grainSublayersEnabled = true;
   int32_t grainSubLayerCount = 1;
   float grainParticleAreaUm2 = 0.1f;

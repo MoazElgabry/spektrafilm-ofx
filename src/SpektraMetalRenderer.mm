@@ -176,6 +176,8 @@ struct KernelParams {
   uint32_t grainEnabled;
   int32_t grainModel;
   int32_t filmFormat;
+  float grainAmount;
+  float grainSaturation;
   uint32_t grainSublayersEnabled;
   int32_t grainSubLayerCount;
   float grainParticleAreaUm2;
@@ -868,6 +870,8 @@ KernelParams toKernelParams(const RenderParams &params, double time, int32_t wid
   out.grainEnabled = params.grainEnabled ? 1u : 0u;
   out.grainModel = static_cast<int32_t>(params.grainModel);
   out.filmFormat = static_cast<int32_t>(params.filmFormat);
+  out.grainAmount = params.grainAmount;
+  out.grainSaturation = params.grainSaturation;
   out.grainSublayersEnabled = params.grainSublayersEnabled ? 1u : 0u;
   out.grainSubLayerCount = std::max(1, params.grainSubLayerCount);
   out.grainParticleAreaUm2 = params.grainParticleAreaUm2;
@@ -1824,6 +1828,7 @@ struct MetalRenderer::Impl {
   id<MTLComputePipelineState> grainResolveDensityPipeline = nil;
   id<MTLComputePipelineState> grainDensityBlurXPipeline = nil;
   id<MTLComputePipelineState> grainDensityBlurYPipeline = nil;
+  id<MTLComputePipelineState> grainApplyControlsPipeline = nil;
   id<MTLComputePipelineState> grainSynthesisLayersFromDensityPipeline = nil;
   id<MTLComputePipelineState> grainSynthesisLayersFromDensityFixedRadiusPipeline = nil;
   id<MTLComputePipelineState> grainSynthesisTargetDensityPipeline = nil;
@@ -2394,6 +2399,7 @@ struct MetalRenderer::Impl {
       grainResolveDensityPipeline = makePipeline(@"spektrafilm_grain_resolve_density");
       grainDensityBlurXPipeline = makePipeline(@"spektrafilm_grain_density_blur_x");
       grainDensityBlurYPipeline = makePipeline(@"spektrafilm_grain_density_blur_y");
+      grainApplyControlsPipeline = makePipeline(@"spektrafilm_grain_apply_controls");
       grainSynthesisLayersFromDensityPipeline = makePipeline(@"spektrafilm_grain_synthesis_layers_from_density");
       grainSynthesisLayersFromDensityFixedRadiusPipeline = makePipeline(@"spektrafilm_grain_synthesis_layers_from_density_fixed_radius");
       grainSynthesisTargetDensityPipeline = makePipeline(@"spektrafilm_grain_synthesis_target_density");
@@ -2445,7 +2451,7 @@ struct MetalRenderer::Impl {
           !previewGrainFromDensityPipeline || !productionGrainLayersFromDensityPipeline ||
           !grainLayerBlurXPipeline || !grainLayerBlurYPipeline ||
           !grainMicroSourcePipeline || !grainMicroBlurXPipeline || !grainMicroBlurYPipeline || !grainResolveDensityPipeline ||
-          !grainDensityBlurXPipeline || !grainDensityBlurYPipeline ||
+          !grainDensityBlurXPipeline || !grainDensityBlurYPipeline || !grainApplyControlsPipeline ||
           !grainSynthesisLayersFromDensityPipeline || !grainSynthesisLayersFromDensityFixedRadiusPipeline ||
           !grainSynthesisTargetDensityPipeline || !grainSynthesisTargetDensityNonLayeredPipeline ||
           !grainSynthesisTargetDensityHalfPipeline || !grainSynthesisTargetDensityNonLayeredHalfPipeline ||
@@ -2513,6 +2519,7 @@ bool MetalRenderer::isAvailable() const {
     impl_->grainLayerBlurXPipeline && impl_->grainLayerBlurYPipeline &&
     impl_->grainMicroSourcePipeline && impl_->grainMicroBlurXPipeline && impl_->grainMicroBlurYPipeline &&
     impl_->grainResolveDensityPipeline && impl_->grainDensityBlurXPipeline && impl_->grainDensityBlurYPipeline &&
+    impl_->grainApplyControlsPipeline &&
     impl_->grainSynthesisLayersFromDensityPipeline && impl_->grainSynthesisLayersFromDensityFixedRadiusPipeline &&
     impl_->grainSynthesisTargetDensityPipeline && impl_->grainSynthesisTargetDensityNonLayeredPipeline &&
     impl_->grainSynthesisTargetDensityHalfPipeline &&
@@ -2623,6 +2630,9 @@ bool MetalRenderer::render(
       params.grainEnabled &&
       params.grainModel == GrainModel::GrainSynthesis &&
       (densityWithGrainOutput || finalPrintSimulation || finalScanNegative);
+    const bool grainControlsPath =
+      (productionGrainPath || grainSynthesisPath) &&
+      (std::abs(params.grainAmount - 1.0f) > 1.0e-6f || std::abs(params.grainSaturation - 1.0f) > 1.0e-6f);
     const NSUInteger grainLayerBytes = static_cast<NSUInteger>(width) * static_cast<NSUInteger>(height) * 9u * sizeof(float);
     const float pixelSizeUm = filmFormatMm(params.filmFormat) * 1000.0f /
       static_cast<float>(std::max(width, height)) / enlargerScale(params);
@@ -2773,6 +2783,7 @@ bool MetalRenderer::render(
     id<MTLBuffer> grainMicroBufferB = (productionGrainPath || grainSynthesisPath) ? impl_->gpuScratchBuffer(bufferBytes, "grain micro B") : nil;
     id<MTLBuffer> grainDensityBufferA = (productionGrainPath || grainSynthesisPath) ? impl_->gpuScratchBuffer(bufferBytes, "grain density A") : nil;
     id<MTLBuffer> grainDensityBufferB = (productionGrainPath || grainSynthesisPath) ? impl_->gpuScratchBuffer(bufferBytes, "grain density B") : nil;
+    id<MTLBuffer> grainBaseDensityBuffer = grainControlsPath ? impl_->gpuScratchBuffer(bufferBytes, "grain base density") : nil;
     const bool optimizedGrainSynthesisPath = grainSynthesisPath && !impl_->useLegacyGrainSynthesis;
     const bool halfGrainSynthesisTargetPath = optimizedGrainSynthesisPath &&
       impl_->grainSynthesisTargetStorageMode == GrainSynthesisTargetStorageMode::HalfBuffer;
@@ -2811,6 +2822,10 @@ bool MetalRenderer::render(
     if (grainSynthesisPath && (!grainLayerBufferA || !grainLayerBufferB || !grainMicroBufferA || !grainMicroBufferB ||
         !grainDensityBufferA || !grainDensityBufferB)) {
       impl_->lastError = "Unable to allocate grain synthesis Metal buffers.";
+      return false;
+    }
+    if (grainControlsPath && !grainBaseDensityBuffer) {
+      impl_->lastError = "Unable to allocate grain controls Metal buffers.";
       return false;
     }
     if (optimizedGrainSynthesisPath && (!grainSynthesisComponentInfoBuffer || !grainSynthesisSampleOffsetBuffer ||
@@ -3265,12 +3280,58 @@ bool MetalRenderer::render(
       }
     };
 
-    auto encodeCopyBufferToDestination = [&](id<MTLBuffer> sourceBuffer) {
+    auto encodeCopyBuffer = [&](id<MTLBuffer> sourceBuffer, id<MTLBuffer> destinationBuffer) {
       [encoder setComputePipelineState:impl_->copyBufferPipeline];
       [encoder setBuffer:sourceBuffer offset:0 atIndex:0];
-      [encoder setBuffer:dstBuffer offset:0 atIndex:1];
+      [encoder setBuffer:destinationBuffer offset:0 atIndex:1];
       [encoder setBytes:dims length:sizeof(dims) atIndex:2];
       dispatch2D(impl_->copyBufferPipeline);
+    };
+
+    auto encodeCopyBufferToDestination = [&](id<MTLBuffer> sourceBuffer) {
+      encodeCopyBuffer(sourceBuffer, dstBuffer);
+    };
+
+    auto encodeApplyGrainControls = [&](id<MTLBuffer> grainedDensityBuffer) -> id<MTLBuffer> {
+      if (!grainControlsPath) {
+        return grainedDensityBuffer;
+      }
+      [encoder setComputePipelineState:impl_->grainApplyControlsPipeline];
+      [encoder setBuffer:grainBaseDensityBuffer offset:0 atIndex:0];
+      [encoder setBuffer:grainedDensityBuffer offset:0 atIndex:1];
+      [encoder setBuffer:grainDensityBufferB offset:0 atIndex:2];
+      [encoder setBuffer:paramBuffer offset:0 atIndex:3];
+      [encoder setBytes:dims length:sizeof(dims) atIndex:4];
+      dispatch2D(impl_->grainApplyControlsPipeline);
+      return grainDensityBufferB;
+    };
+
+    auto encodeSaveGrainBaseDensity = [&](id<MTLBuffer> baseDensityBuffer) {
+      if (grainControlsPath) {
+        encodeCopyBuffer(baseDensityBuffer, grainBaseDensityBuffer);
+      }
+    };
+
+    auto encodeBlurGrainDensity = [&](id<MTLBuffer> densityBuffer) -> id<MTLBuffer> {
+      id<MTLBuffer> blurSourceBuffer = encodeApplyGrainControls(densityBuffer);
+      id<MTLBuffer> blurXBuffer = blurSourceBuffer == grainDensityBufferA ? grainDensityBufferB : grainDensityBufferA;
+      id<MTLBuffer> blurYBuffer = blurXBuffer == grainDensityBufferA ? grainDensityBufferB : grainDensityBufferA;
+
+      [encoder setComputePipelineState:impl_->grainDensityBlurXPipeline];
+      [encoder setBuffer:blurSourceBuffer offset:0 atIndex:0];
+      [encoder setBuffer:blurXBuffer offset:0 atIndex:1];
+      [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+      [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+      dispatch2D(impl_->grainDensityBlurXPipeline);
+
+      [encoder setComputePipelineState:impl_->grainDensityBlurYPipeline];
+      [encoder setBuffer:blurXBuffer offset:0 atIndex:0];
+      [encoder setBuffer:blurYBuffer offset:0 atIndex:1];
+      [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+      [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+      dispatch2D(impl_->grainDensityBlurYPipeline);
+
+      return blurYBuffer;
     };
 
     auto encodeDevelopFromLogRaw = [&](id<MTLBuffer> logRawBuffer, id<MTLBuffer> densityBuffer) {
@@ -3762,8 +3823,10 @@ bool MetalRenderer::render(
 
       if (productionGrainPath) {
         encodeProductionGrainLayersFromDensity(halationDensityBufferA);
+        encodeSaveGrainBaseDensity(halationDensityBufferA);
       } else if (grainSynthesisPath) {
         encodeSelectedGrainSynthesisLayersFromDensity(halationDensityBufferA);
+        encodeSaveGrainBaseDensity(halationDensityBufferA);
       } else if (previewGrainFromDensityPath) {
         [encoder setComputePipelineState:impl_->previewGrainFromDensityPipeline];
         [encoder setBuffer:halationDensityBufferA offset:0 atIndex:0];
@@ -3828,8 +3891,10 @@ bool MetalRenderer::render(
 
       if (productionGrainPath) {
         encodeProductionGrainLayersFromDensity(dirDensityBufferA);
+        encodeSaveGrainBaseDensity(dirDensityBufferA);
       } else if (grainSynthesisPath) {
         encodeSelectedGrainSynthesisLayersFromDensity(dirDensityBufferA);
+        encodeSaveGrainBaseDensity(dirDensityBufferA);
       } else if (previewGrainFromDensityPath) {
         [encoder setComputePipelineState:impl_->previewGrainFromDensityPipeline];
         [encoder setBuffer:dirDensityBufferA offset:0 atIndex:0];
@@ -3878,6 +3943,7 @@ bool MetalRenderer::render(
         [encoder setBuffer:spectralInfoBuffer offset:0 atIndex:6];
         [encoder setBuffer:paperScanDensityDataBuffer offset:0 atIndex:7];
         dispatch3D(impl_->productionGrainLayersFromDensityPipeline);
+        encodeSaveGrainBaseDensity(grainMicroBufferA);
       }
 
       [encoder setComputePipelineState:impl_->grainLayerBlurXPipeline];
@@ -3929,21 +3995,7 @@ bool MetalRenderer::render(
       [encoder setBytes:dims length:sizeof(dims) atIndex:5];
       dispatch2D(impl_->grainResolveDensityPipeline);
 
-      [encoder setComputePipelineState:impl_->grainDensityBlurXPipeline];
-      [encoder setBuffer:grainDensityBufferA offset:0 atIndex:0];
-      [encoder setBuffer:grainDensityBufferB offset:0 atIndex:1];
-      [encoder setBuffer:paramBuffer offset:0 atIndex:2];
-      [encoder setBytes:dims length:sizeof(dims) atIndex:3];
-      dispatch2D(impl_->grainDensityBlurXPipeline);
-
-      [encoder setComputePipelineState:impl_->grainDensityBlurYPipeline];
-      [encoder setBuffer:grainDensityBufferB offset:0 atIndex:0];
-      [encoder setBuffer:grainDensityBufferA offset:0 atIndex:1];
-      [encoder setBuffer:paramBuffer offset:0 atIndex:2];
-      [encoder setBytes:dims length:sizeof(dims) atIndex:3];
-      dispatch2D(impl_->grainDensityBlurYPipeline);
-
-      encodeFinalFilmDensityOrPrintDiffusion(grainDensityBufferA);
+      encodeFinalFilmDensityOrPrintDiffusion(encodeBlurGrainDensity(grainDensityBufferA));
     } else if (grainSynthesisPath) {
       if (!dirPath && !preExposurePath) {
         [encoder setComputePipelineState:impl_->halationRawExposurePipeline];
@@ -3965,6 +4017,7 @@ bool MetalRenderer::render(
 
         encodeDevelopFromRaw(grainDensityBufferA, grainDensityBufferB);
         encodeSelectedGrainSynthesisLayersFromDensity(grainDensityBufferB);
+        encodeSaveGrainBaseDensity(grainDensityBufferB);
       }
 
       [encoder setComputePipelineState:impl_->grainLayerBlurXPipeline];
@@ -4016,21 +4069,7 @@ bool MetalRenderer::render(
       [encoder setBytes:dims length:sizeof(dims) atIndex:5];
       dispatch2D(impl_->grainSynthesisResolveDensityPipeline);
 
-      [encoder setComputePipelineState:impl_->grainDensityBlurXPipeline];
-      [encoder setBuffer:grainDensityBufferA offset:0 atIndex:0];
-      [encoder setBuffer:grainDensityBufferB offset:0 atIndex:1];
-      [encoder setBuffer:paramBuffer offset:0 atIndex:2];
-      [encoder setBytes:dims length:sizeof(dims) atIndex:3];
-      dispatch2D(impl_->grainDensityBlurXPipeline);
-
-      [encoder setComputePipelineState:impl_->grainDensityBlurYPipeline];
-      [encoder setBuffer:grainDensityBufferB offset:0 atIndex:0];
-      [encoder setBuffer:grainDensityBufferA offset:0 atIndex:1];
-      [encoder setBuffer:paramBuffer offset:0 atIndex:2];
-      [encoder setBytes:dims length:sizeof(dims) atIndex:3];
-      dispatch2D(impl_->grainDensityBlurYPipeline);
-
-      encodeFinalFilmDensityOrPrintDiffusion(grainDensityBufferA);
+      encodeFinalFilmDensityOrPrintDiffusion(encodeBlurGrainDensity(grainDensityBufferA));
     } else {
       [encoder setComputePipelineState:impl_->grainPipeline];
       [encoder setBuffer:renderSourceBuffer offset:0 atIndex:0];

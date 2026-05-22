@@ -84,6 +84,8 @@ inline constexpr TooltipEntry kTooltipEntries[] = {
   {"dirCalibrateToStock", "Restores Python-matching DIR coefficients for the current stock and resumes stock-follow calibration."},
   {"grainEnabled", "Enable film grain synthesis."},
   {"grainModel", "Preview is faster. Production uses layered dye-cloud grain. Grain Synthesis rebuilds density from a stochastic Boolean grain field."},
+  {"grainAmount", "Scales the final density-space grain contribution."},
+  {"grainSaturation", "Reduces colored grain by blending grain variation toward neutral CMY density."},
   {"grainSublayersEnabled", "Split grain into emulsion sublayers for less uniform density structure."},
   {"grainSubLayerCount", "Number of emulsion sublayers used by production grain."},
   {"grainParticleAreaUm2", "Mean silver-halide particle area before scaling, in square micrometers."},
