@@ -194,7 +194,7 @@ struct RenderParams {
   float grainUniformityR = 0.99f;
   float grainUniformityG = 0.97f;
   float grainUniformityB = 0.98f;
-  float grainFinalBlurUm = 0.0f;
+  float grainFinalBlurUm = 11.8f;
   float grainBlurDyeCloudsUm = 1.0f;
   float grainMicroStructureScale = 0.2f;
   float grainMicroStructureSigmaNm = 30.0f;
