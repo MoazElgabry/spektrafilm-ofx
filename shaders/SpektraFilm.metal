@@ -245,6 +245,17 @@ struct SpektraDiffusionComponent {
   float weightB;
 };
 
+struct SpektraGaussianBlurInfo {
+  float firstWeight;
+  float firstRatio;
+  float ratioStep;
+  float invWeightSum;
+  uint radius;
+  uint active;
+  uint _pad0;
+  uint _pad1;
+};
+
 struct SpektraFrameConstants {
   float4 print; // x: exposure factor, y: reference black Y, z: reference white Y
   float4 film;  // x: reference black Y, y: reference white Y
@@ -2981,16 +2992,6 @@ static float3 spektra_dir_correction_from_density(
   );
 }
 
-static float spektra_dir_blur_sigma(constant SpektraKernelParams &params) {
-  return max(params.dirCouplersDiffusionUm, 0.0) / max(params.filmPixelSizeUm, 1.0e-6);
-}
-
-static float spektra_dir_tail_sigma(constant SpektraKernelParams &params, uint component) {
-  constexpr float3 kExpGaussianFitSigmaScale = float3(0.5360, 1.5236, 2.7684);
-  return max(params.dirCouplersDiffusionTailUm, 0.0) *
-    kExpGaussianFitSigmaScale[component] / max(params.filmPixelSizeUm, 1.0e-6);
-}
-
 static float spektra_dir_tail_amplitude(uint component) {
   constexpr float3 kExpGaussianFitAmplitude = float3(0.1633, 0.6496, 0.1870);
   return kExpGaussianFitAmplitude[component];
@@ -3036,18 +3037,24 @@ static float4 spektra_channel_gaussian_sample_x(
     return spektra_float4_buffer_sample(source, width, height, int(gid.x), int(gid.y));
   }
   const int radius = min(int(ceil(3.0 * maxSigma)), 256);
-  float4 value = float4(0.0);
-  float3 weightSum = float3(0.0);
-  for (int offset = -radius; offset <= radius; ++offset) {
-    const float4 sample = spektra_float4_buffer_sample(source, width, height, int(gid.x) + offset, int(gid.y));
-    const float3 weight = float3(
-      spektra_gaussian_weight(float(offset), max(sigma.r, 1.0e-6)),
-      spektra_gaussian_weight(float(offset), max(sigma.g, 1.0e-6)),
-      spektra_gaussian_weight(float(offset), max(sigma.b, 1.0e-6))
-    );
-    value.rgb += sample.rgb * weight;
-    value.a += sample.a;
-    weightSum += weight;
+  const int x = int(gid.x);
+  const int y = int(gid.y);
+  const float3 safeSigma = max(sigma, float3(1.0e-6));
+  const float3 invSigma2 = 1.0 / max(safeSigma * safeSigma, float3(1.0e-8));
+  float3 weight = exp(-0.5 * invSigma2);
+  float3 ratio = exp(-1.5 * invSigma2);
+  const float3 ratioStep = exp(-invSigma2);
+  float4 value = spektra_float4_buffer_sample(source, width, height, x, y);
+  float3 weightSum = float3(1.0);
+  for (int offset = 1; offset <= radius; ++offset) {
+    const float4 samplePair =
+      spektra_float4_buffer_sample(source, width, height, x - offset, y) +
+      spektra_float4_buffer_sample(source, width, height, x + offset, y);
+    value.rgb += samplePair.rgb * weight;
+    value.a += samplePair.a;
+    weightSum += 2.0 * weight;
+    weight *= ratio;
+    ratio *= ratioStep;
   }
   value.rgb /= max(weightSum, float3(1.0e-8));
   value.a /= float(radius * 2 + 1);
@@ -3066,18 +3073,24 @@ static float4 spektra_channel_gaussian_sample_y(
     return spektra_float4_buffer_sample(source, width, height, int(gid.x), int(gid.y));
   }
   const int radius = min(int(ceil(3.0 * maxSigma)), 256);
-  float4 value = float4(0.0);
-  float3 weightSum = float3(0.0);
-  for (int offset = -radius; offset <= radius; ++offset) {
-    const float4 sample = spektra_float4_buffer_sample(source, width, height, int(gid.x), int(gid.y) + offset);
-    const float3 weight = float3(
-      spektra_gaussian_weight(float(offset), max(sigma.r, 1.0e-6)),
-      spektra_gaussian_weight(float(offset), max(sigma.g, 1.0e-6)),
-      spektra_gaussian_weight(float(offset), max(sigma.b, 1.0e-6))
-    );
-    value.rgb += sample.rgb * weight;
-    value.a += sample.a;
-    weightSum += weight;
+  const int x = int(gid.x);
+  const int y = int(gid.y);
+  const float3 safeSigma = max(sigma, float3(1.0e-6));
+  const float3 invSigma2 = 1.0 / max(safeSigma * safeSigma, float3(1.0e-8));
+  float3 weight = exp(-0.5 * invSigma2);
+  float3 ratio = exp(-1.5 * invSigma2);
+  const float3 ratioStep = exp(-invSigma2);
+  float4 value = spektra_float4_buffer_sample(source, width, height, x, y);
+  float3 weightSum = float3(1.0);
+  for (int offset = 1; offset <= radius; ++offset) {
+    const float4 samplePair =
+      spektra_float4_buffer_sample(source, width, height, x, y - offset) +
+      spektra_float4_buffer_sample(source, width, height, x, y + offset);
+    value.rgb += samplePair.rgb * weight;
+    value.a += samplePair.a;
+    weightSum += 2.0 * weight;
+    weight *= ratio;
+    ratio *= ratioStep;
   }
   value.rgb /= max(weightSum, float3(1.0e-8));
   value.a /= float(radius * 2 + 1);
@@ -3463,6 +3476,32 @@ kernel void spektrafilm_copy_buffer(
   destination[index] = source[index];
 }
 
+kernel void spektrafilm_half_to_float_buffer(
+  device const half4 *source [[buffer(0)]],
+  device float4 *destination [[buffer(1)]],
+  constant uint2 &dims [[buffer(2)]],
+  uint2 gid [[thread_position_in_grid]]
+) {
+  if (gid.x >= dims.x || gid.y >= dims.y) {
+    return;
+  }
+  const uint index = gid.y * dims.x + gid.x;
+  destination[index] = float4(source[index]);
+}
+
+kernel void spektrafilm_float_to_half_buffer(
+  device const float4 *source [[buffer(0)]],
+  device half4 *destination [[buffer(1)]],
+  constant uint2 &dims [[buffer(2)]],
+  uint2 gid [[thread_position_in_grid]]
+) {
+  if (gid.x >= dims.x || gid.y >= dims.y) {
+    return;
+  }
+  const uint index = gid.y * dims.x + gid.x;
+  destination[index] = half4(source[index]);
+}
+
 kernel void spektrafilm_raw_to_log_raw(
   device const float4 *rawIn [[buffer(0)]],
   device float4 *logRawOut [[buffer(1)]],
@@ -3477,6 +3516,132 @@ kernel void spektrafilm_raw_to_log_raw(
   logRawOut[index] = float4(log10(max(raw.rgb, float3(0.0)) + float3(1.0e-10)), raw.a);
 }
 
+static SpektraGaussianBlurInfo spektra_make_gaussian_blur_info(float sigma, int radiusLimit) {
+  SpektraGaussianBlurInfo info;
+  info.firstWeight = 0.0;
+  info.firstRatio = 0.0;
+  info.ratioStep = 0.0;
+  info.invWeightSum = 1.0;
+  info.radius = 0u;
+  info.active = sigma > 1.0e-4 ? 1u : 0u;
+  info._pad0 = 0u;
+  info._pad1 = 0u;
+  if (info.active == 0u) {
+    return info;
+  }
+  const int radius = min(int(ceil(3.0 * sigma)), radiusLimit);
+  info.radius = uint(max(radius, 0));
+  const float invSigma2 = 1.0 / max(sigma * sigma, 1.0e-8);
+  info.firstWeight = exp(-0.5 * invSigma2);
+  info.firstRatio = exp(-1.5 * invSigma2);
+  info.ratioStep = exp(-invSigma2);
+  float weight = info.firstWeight;
+  float ratio = info.firstRatio;
+  float weightSum = 1.0;
+  for (uint offset = 1u; offset <= info.radius; ++offset) {
+    weightSum += 2.0 * weight;
+    weight *= ratio;
+    ratio *= info.ratioStep;
+  }
+  info.invWeightSum = 1.0 / max(weightSum, 1.0e-8);
+  return info;
+}
+
+static float4 spektra_scalar_gaussian_sample_x_info(
+  device const float4 *source,
+  uint width,
+  uint height,
+  uint2 gid,
+  SpektraGaussianBlurInfo info
+) {
+  const uint index = gid.y * width + gid.x;
+  if (info.active == 0u || info.radius == 0u) {
+    return source[index];
+  }
+  const int x = int(gid.x);
+  const int y = int(gid.y);
+  const int radius = int(info.radius);
+  const bool interior = x >= radius && x + radius < int(width);
+  float weight = info.firstWeight;
+  float ratio = info.firstRatio;
+  float4 value = source[index];
+  for (int offset = 1; offset <= radius; ++offset) {
+    const float4 samplePair = interior
+      ? source[index - uint(offset)] + source[index + uint(offset)]
+      : spektra_float4_buffer_sample(source, width, height, x - offset, y) +
+        spektra_float4_buffer_sample(source, width, height, x + offset, y);
+    value += weight * samplePair;
+    weight *= ratio;
+    ratio *= info.ratioStep;
+  }
+  return value * info.invWeightSum;
+}
+
+static float4 spektra_scalar_gaussian_sample_y_info(
+  device const float4 *source,
+  uint width,
+  uint height,
+  uint2 gid,
+  SpektraGaussianBlurInfo info
+) {
+  const uint index = gid.y * width + gid.x;
+  if (info.active == 0u || info.radius == 0u) {
+    return source[index];
+  }
+  const int x = int(gid.x);
+  const int y = int(gid.y);
+  const int radius = int(info.radius);
+  const bool interior = y >= radius && y + radius < int(height);
+  float weight = info.firstWeight;
+  float ratio = info.firstRatio;
+  float4 value = source[index];
+  for (int offset = 1; offset <= radius; ++offset) {
+    const uint stride = uint(offset) * width;
+    const float4 samplePair = interior
+      ? source[index - stride] + source[index + stride]
+      : spektra_float4_buffer_sample(source, width, height, x, y - offset) +
+        spektra_float4_buffer_sample(source, width, height, x, y + offset);
+    value += weight * samplePair;
+    weight *= ratio;
+    ratio *= info.ratioStep;
+  }
+  return value * info.invWeightSum;
+}
+
+static float4 spektra_scalar_gaussian_sample_x_limited(
+  device const float4 *source,
+  uint width,
+  uint height,
+  uint2 gid,
+  float sigma,
+  int radiusLimit
+) {
+  return spektra_scalar_gaussian_sample_x_info(
+    source,
+    width,
+    height,
+    gid,
+    spektra_make_gaussian_blur_info(sigma, radiusLimit)
+  );
+}
+
+static float4 spektra_scalar_gaussian_sample_y_limited(
+  device const float4 *source,
+  uint width,
+  uint height,
+  uint2 gid,
+  float sigma,
+  int radiusLimit
+) {
+  return spektra_scalar_gaussian_sample_y_info(
+    source,
+    width,
+    height,
+    gid,
+    spektra_make_gaussian_blur_info(sigma, radiusLimit)
+  );
+}
+
 static float4 spektra_scalar_gaussian_sample_x(
   device const float4 *source,
   uint width,
@@ -3484,18 +3649,7 @@ static float4 spektra_scalar_gaussian_sample_x(
   uint2 gid,
   float sigma
 ) {
-  if (sigma <= 1.0e-4) {
-    return spektra_float4_buffer_sample(source, width, height, int(gid.x), int(gid.y));
-  }
-  const int radius = min(int(ceil(3.0 * sigma)), 256);
-  float4 value = float4(0.0);
-  float weightSum = 0.0;
-  for (int offset = -radius; offset <= radius; ++offset) {
-    const float weight = spektra_gaussian_weight(float(offset), sigma);
-    value += weight * spektra_float4_buffer_sample(source, width, height, int(gid.x) + offset, int(gid.y));
-    weightSum += weight;
-  }
-  return value / max(weightSum, 1.0e-8);
+  return spektra_scalar_gaussian_sample_x_limited(source, width, height, gid, sigma, 256);
 }
 
 static float4 spektra_scalar_gaussian_sample_y(
@@ -3505,18 +3659,7 @@ static float4 spektra_scalar_gaussian_sample_y(
   uint2 gid,
   float sigma
 ) {
-  if (sigma <= 1.0e-4) {
-    return spektra_float4_buffer_sample(source, width, height, int(gid.x), int(gid.y));
-  }
-  const int radius = min(int(ceil(3.0 * sigma)), 256);
-  float4 value = float4(0.0);
-  float weightSum = 0.0;
-  for (int offset = -radius; offset <= radius; ++offset) {
-    const float weight = spektra_gaussian_weight(float(offset), sigma);
-    value += weight * spektra_float4_buffer_sample(source, width, height, int(gid.x), int(gid.y) + offset);
-    weightSum += weight;
-  }
-  return value / max(weightSum, 1.0e-8);
+  return spektra_scalar_gaussian_sample_y_limited(source, width, height, gid, sigma, 256);
 }
 
 kernel void spektrafilm_diffusion_component_blur_x(
@@ -3684,7 +3827,7 @@ kernel void spektrafilm_dir_baseline(
 kernel void spektrafilm_dir_blur_x(
   device const float4 *correctionIn [[buffer(0)]],
   device float4 *correctionOut [[buffer(1)]],
-  constant SpektraKernelParams &params [[buffer(2)]],
+  constant SpektraGaussianBlurInfo &blurInfo [[buffer(2)]],
   constant uint2 &dims [[buffer(3)]],
   uint2 gid [[thread_position_in_grid]]
 ) {
@@ -3692,26 +3835,17 @@ kernel void spektrafilm_dir_blur_x(
     return;
   }
   const uint index = gid.y * dims.x + gid.x;
-  const float sigma = spektra_dir_blur_sigma(params);
-  if (sigma <= 1.0e-4) {
+  if (blurInfo.active == 0u) {
     correctionOut[index] = correctionIn[index];
     return;
   }
-  const int radius = min(int(ceil(3.0 * sigma)), 96);
-  float4 value = float4(0.0);
-  float weightSum = 0.0;
-  for (int offset = -radius; offset <= radius; ++offset) {
-    const float weight = spektra_gaussian_weight(float(offset), sigma);
-    value += weight * spektra_float4_buffer_sample(correctionIn, dims.x, dims.y, int(gid.x) + offset, int(gid.y));
-    weightSum += weight;
-  }
-  correctionOut[index] = value / max(weightSum, 1.0e-8);
+  correctionOut[index] = spektra_scalar_gaussian_sample_x_info(correctionIn, dims.x, dims.y, gid, blurInfo);
 }
 
 kernel void spektrafilm_dir_blur_y(
   device const float4 *correctionIn [[buffer(0)]],
   device float4 *correctionOut [[buffer(1)]],
-  constant SpektraKernelParams &params [[buffer(2)]],
+  constant SpektraGaussianBlurInfo &blurInfo [[buffer(2)]],
   constant uint2 &dims [[buffer(3)]],
   uint2 gid [[thread_position_in_grid]]
 ) {
@@ -3719,81 +3853,116 @@ kernel void spektrafilm_dir_blur_y(
     return;
   }
   const uint index = gid.y * dims.x + gid.x;
-  const float sigma = spektra_dir_blur_sigma(params);
-  if (sigma <= 1.0e-4) {
+  if (blurInfo.active == 0u) {
     correctionOut[index] = correctionIn[index];
     return;
   }
-  const int radius = min(int(ceil(3.0 * sigma)), 96);
-  float4 value = float4(0.0);
-  float weightSum = 0.0;
-  for (int offset = -radius; offset <= radius; ++offset) {
-    const float weight = spektra_gaussian_weight(float(offset), sigma);
-    value += weight * spektra_float4_buffer_sample(correctionIn, dims.x, dims.y, int(gid.x), int(gid.y) + offset);
-    weightSum += weight;
-  }
-  correctionOut[index] = value / max(weightSum, 1.0e-8);
+  correctionOut[index] = spektra_scalar_gaussian_sample_y_info(correctionIn, dims.x, dims.y, gid, blurInfo);
 }
 
 kernel void spektrafilm_dir_tail_blur_x(
   device const float4 *correctionIn [[buffer(0)]],
-  device float4 *correctionOut [[buffer(1)]],
-  constant SpektraKernelParams &params [[buffer(2)]],
+  device float4 *tailOut [[buffer(1)]],
+  constant SpektraGaussianBlurInfo *blurInfos [[buffer(2)]],
   constant uint2 &dims [[buffer(3)]],
-  constant uint &component [[buffer(4)]],
   uint2 gid [[thread_position_in_grid]]
 ) {
   if (gid.x >= dims.x || gid.y >= dims.y) {
     return;
   }
   const uint index = gid.y * dims.x + gid.x;
-  const float sigma = spektra_dir_tail_sigma(params, component);
-  if (sigma <= 1.0e-4) {
-    correctionOut[index] = correctionIn[index];
+  const uint pixelCount = dims.x * dims.y;
+  const SpektraGaussianBlurInfo info0 = blurInfos[0];
+  const SpektraGaussianBlurInfo info1 = blurInfos[1];
+  const SpektraGaussianBlurInfo info2 = blurInfos[2];
+  const uint maxRadius = max(info0.radius, max(info1.radius, info2.radius));
+  const float4 center = correctionIn[index];
+  if ((info0.active | info1.active | info2.active) == 0u || maxRadius == 0u) {
+    tailOut[index] = center;
+    tailOut[pixelCount + index] = center;
+    tailOut[pixelCount * 2u + index] = center;
     return;
   }
-  const int radius = min(int(ceil(3.0 * sigma)), 256);
-  float4 value = float4(0.0);
-  float weightSum = 0.0;
-  for (int offset = -radius; offset <= radius; ++offset) {
-    const float weight = spektra_gaussian_weight(float(offset), sigma);
-    value += weight * spektra_float4_buffer_sample(correctionIn, dims.x, dims.y, int(gid.x) + offset, int(gid.y));
-    weightSum += weight;
+  const int x = int(gid.x);
+  const int y = int(gid.y);
+  const bool interior = x >= int(maxRadius) && x + int(maxRadius) < int(dims.x);
+  float4 value0 = center;
+  float4 value1 = center;
+  float4 value2 = center;
+  float3 weight = float3(info0.firstWeight, info1.firstWeight, info2.firstWeight);
+  float3 ratio = float3(info0.firstRatio, info1.firstRatio, info2.firstRatio);
+  const float3 ratioStep = float3(info0.ratioStep, info1.ratioStep, info2.ratioStep);
+  for (uint offset = 1u; offset <= maxRadius; ++offset) {
+    const float4 samplePair = interior
+      ? correctionIn[index - offset] + correctionIn[index + offset]
+      : spektra_float4_buffer_sample(correctionIn, dims.x, dims.y, x - int(offset), y) +
+        spektra_float4_buffer_sample(correctionIn, dims.x, dims.y, x + int(offset), y);
+    if (offset <= info0.radius) {
+      value0 += weight.x * samplePair;
+      weight.x *= ratio.x;
+      ratio.x *= ratioStep.x;
+    }
+    if (offset <= info1.radius) {
+      value1 += weight.y * samplePair;
+      weight.y *= ratio.y;
+      ratio.y *= ratioStep.y;
+    }
+    if (offset <= info2.radius) {
+      value2 += weight.z * samplePair;
+      weight.z *= ratio.z;
+      ratio.z *= ratioStep.z;
+    }
   }
-  correctionOut[index] = value / max(weightSum, 1.0e-8);
+  tailOut[index] = value0 * info0.invWeightSum;
+  tailOut[pixelCount + index] = value1 * info1.invWeightSum;
+  tailOut[pixelCount * 2u + index] = value2 * info2.invWeightSum;
 }
 
 kernel void spektrafilm_dir_tail_blur_y_accumulate(
-  device const float4 *correctionIn [[buffer(0)]],
+  device const float4 *tailIn [[buffer(0)]],
   device float4 *correctionInOut [[buffer(1)]],
-  constant SpektraKernelParams &params [[buffer(2)]],
-  constant uint2 &dims [[buffer(3)]],
-  constant uint &component [[buffer(4)]],
+  constant SpektraGaussianBlurInfo *blurInfos [[buffer(2)]],
+  constant float &tailWeightIn [[buffer(3)]],
+  constant uint2 &dims [[buffer(4)]],
   uint2 gid [[thread_position_in_grid]]
 ) {
   if (gid.x >= dims.x || gid.y >= dims.y) {
     return;
   }
   const uint index = gid.y * dims.x + gid.x;
-  const float sigma = spektra_dir_tail_sigma(params, component);
-  float4 blurred = correctionIn[index];
-  if (sigma > 1.0e-4) {
-    const int radius = min(int(ceil(3.0 * sigma)), 256);
-    float4 value = float4(0.0);
-    float weightSum = 0.0;
-    for (int offset = -radius; offset <= radius; ++offset) {
-      const float weight = spektra_gaussian_weight(float(offset), sigma);
-      value += weight * spektra_float4_buffer_sample(correctionIn, dims.x, dims.y, int(gid.x), int(gid.y) + offset);
-      weightSum += weight;
-    }
-    blurred = value / max(weightSum, 1.0e-8);
+  const uint pixelCount = dims.x * dims.y;
+  const float tailWeight = clamp(tailWeightIn, 0.0, 1.0);
+  float4 base = correctionInOut[index];
+  const float4 blurred0 = spektra_scalar_gaussian_sample_y_info(tailIn, dims.x, dims.y, gid, blurInfos[0]);
+  const float4 blurred1 = spektra_scalar_gaussian_sample_y_info(tailIn + pixelCount, dims.x, dims.y, gid, blurInfos[1]);
+  const float4 blurred2 = spektra_scalar_gaussian_sample_y_info(tailIn + pixelCount * 2u, dims.x, dims.y, gid, blurInfos[2]);
+  base.rgb = base.rgb * (1.0 - tailWeight) +
+    tailWeight * (
+      spektra_dir_tail_amplitude(0u) * blurred0.rgb +
+      spektra_dir_tail_amplitude(1u) * blurred1.rgb +
+      spektra_dir_tail_amplitude(2u) * blurred2.rgb
+    );
+  correctionInOut[index] = base;
+}
+
+kernel void spektrafilm_dir_tail_mps_accumulate(
+  texture2d<float, access::read> blurredIn [[texture(0)]],
+  device float4 *correctionInOut [[buffer(0)]],
+  constant float &tailWeightIn [[buffer(1)]],
+  constant uint &component [[buffer(2)]],
+  constant uint2 &dims [[buffer(3)]],
+  uint2 gid [[thread_position_in_grid]]
+) {
+  if (gid.x >= dims.x || gid.y >= dims.y) {
+    return;
   }
-  const float tailWeight = clamp(params.dirCouplersDiffusionTailWeight, 0.0, 1.0);
+  const uint index = gid.y * dims.x + gid.x;
+  const float tailWeight = clamp(tailWeightIn, 0.0, 1.0);
   float4 base = correctionInOut[index];
   if (component == 0u) {
     base.rgb *= 1.0 - tailWeight;
   }
-  base.rgb += tailWeight * spektra_dir_tail_amplitude(component) * blurred.rgb;
+  base.rgb += tailWeight * spektra_dir_tail_amplitude(component) * blurredIn.read(gid).rgb;
   correctionInOut[index] = base;
 }
 

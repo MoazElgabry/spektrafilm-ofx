@@ -3,6 +3,7 @@
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 
 #include <algorithm>
 #include <array>
@@ -331,6 +332,11 @@ enum class GrainSynthesisTargetStorageMode : uint32_t {
   R16TextureArray = 2u,
 };
 
+enum class DirTailBackend : uint32_t {
+  Fused = 0u,
+  Mps = 1u,
+};
+
 struct KernelCurveInfo {
   uint32_t exposureCount;
   uint32_t _pad0;
@@ -400,6 +406,18 @@ struct KernelDiffusionComponent {
   float weightG;
   float weightB;
 };
+
+struct KernelGaussianBlurInfo {
+  float firstWeight = 0.0f;
+  float firstRatio = 0.0f;
+  float ratioStep = 0.0f;
+  float invWeightSum = 1.0f;
+  uint32_t radius = 0u;
+  uint32_t active = 0u;
+  uint32_t _pad0 = 0u;
+  uint32_t _pad1 = 0u;
+};
+static_assert(sizeof(KernelGaussianBlurInfo) == 32u);
 
 struct StaticProfileResources {
   int32_t film = -1;
@@ -1512,6 +1530,45 @@ KernelDirInfo makeDirInfo(const ProfileCurveSet &filmCurves, const RenderParams 
   return info;
 }
 
+KernelGaussianBlurInfo makeGaussianBlurInfo(float sigma, uint32_t radiusLimit) {
+  KernelGaussianBlurInfo info{};
+  if (sigma <= 1.0e-4f) {
+    return info;
+  }
+  const uint32_t radius = std::min<uint32_t>(
+    static_cast<uint32_t>(std::ceil(3.0f * sigma)),
+    radiusLimit
+  );
+  info.radius = radius;
+  info.active = 1u;
+  const double sigmaDouble = static_cast<double>(std::max(sigma, 1.0e-6f));
+  const double invSigma2 = 1.0 / std::max(sigmaDouble * sigmaDouble, 1.0e-8);
+  info.firstWeight = static_cast<float>(std::exp(-0.5 * invSigma2));
+  info.firstRatio = static_cast<float>(std::exp(-1.5 * invSigma2));
+  info.ratioStep = static_cast<float>(std::exp(-invSigma2));
+  double weight = info.firstWeight;
+  double ratio = info.firstRatio;
+  double weightSum = 1.0;
+  for (uint32_t offset = 1u; offset <= radius; ++offset) {
+    weightSum += 2.0 * weight;
+    weight *= ratio;
+    ratio *= info.ratioStep;
+  }
+  info.invWeightSum = static_cast<float>(1.0 / std::max(weightSum, 1.0e-8));
+  return info;
+}
+
+std::array<KernelGaussianBlurInfo, 3> makeDirTailBlurInfos(const KernelParams &params) {
+  constexpr std::array<float, 3> kTailSigmaScale = {0.5360f, 1.5236f, 2.7684f};
+  std::array<KernelGaussianBlurInfo, 3> infos{};
+  const float pixelSizeUm = std::max(params.filmPixelSizeUm, 1.0e-6f);
+  const float tailUm = std::max(params.dirCouplersDiffusionTailUm, 0.0f);
+  for (size_t component = 0; component < infos.size(); ++component) {
+    infos[component] = makeGaussianBlurInfo(tailUm * kTailSigmaScale[component] / pixelSizeUm, 256u);
+  }
+  return infos;
+}
+
 std::array<float, 3> densityCurveMaximums(const ProfileCurveSet &curves) {
   std::array<float, 3> maxima = {0.0f, 0.0f, 0.0f};
   for (uint32_t channel = 0; channel < 3u; ++channel) {
@@ -1859,6 +1916,50 @@ void *contiguousFloatWindowPointer(
   return base + static_cast<size_t>(destinationY) * view.rowBytes;
 }
 
+const void *contiguousHalfWindowPointer(
+  const ImageView &view,
+  const RenderWindow &window,
+  int32_t width,
+  int32_t height
+) {
+  if (view.bytesPerComponent != 2 ||
+      view.components != 4 ||
+      window.x1 != view.x1 ||
+      width <= 0 ||
+      height <= 0 ||
+      view.rowBytes != width * static_cast<int32_t>(4 * sizeof(uint16_t))) {
+    return nullptr;
+  }
+  const int32_t sourceY = window.y1 - view.y1;
+  if (sourceY < 0 || sourceY + height > view.height) {
+    return nullptr;
+  }
+  const auto *base = static_cast<const unsigned char *>(view.data);
+  return base + static_cast<size_t>(sourceY) * view.rowBytes;
+}
+
+void *contiguousHalfWindowPointer(
+  const MutableImageView &view,
+  const RenderWindow &window,
+  int32_t width,
+  int32_t height
+) {
+  if (view.bytesPerComponent != 2 ||
+      view.components != 4 ||
+      window.x1 != view.x1 ||
+      width <= 0 ||
+      height <= 0 ||
+      view.rowBytes != width * static_cast<int32_t>(4 * sizeof(uint16_t))) {
+    return nullptr;
+  }
+  const int32_t destinationY = window.y1 - view.y1;
+  if (destinationY < 0 || destinationY + height > view.height) {
+    return nullptr;
+  }
+  auto *base = static_cast<unsigned char *>(view.data);
+  return base + static_cast<size_t>(destinationY) * view.rowBytes;
+}
+
 } // namespace
 
 struct MetalRenderer::Impl {
@@ -1890,11 +1991,14 @@ struct MetalRenderer::Impl {
   id<MTLComputePipelineState> developFromLogRawPipeline = nil;
   id<MTLComputePipelineState> dirCorrectionFromDensityPipeline = nil;
   id<MTLComputePipelineState> copyBufferPipeline = nil;
+  id<MTLComputePipelineState> halfToFloatBufferPipeline = nil;
+  id<MTLComputePipelineState> floatToHalfBufferPipeline = nil;
   id<MTLComputePipelineState> dirBaselinePipeline = nil;
   id<MTLComputePipelineState> dirBlurXPipeline = nil;
   id<MTLComputePipelineState> dirBlurYPipeline = nil;
   id<MTLComputePipelineState> dirTailBlurXPipeline = nil;
   id<MTLComputePipelineState> dirTailBlurYAccumulatePipeline = nil;
+  id<MTLComputePipelineState> dirTailMpsAccumulatePipeline = nil;
   id<MTLComputePipelineState> dirRedevelopPipeline = nil;
   id<MTLComputePipelineState> previewGrainFromDensityPipeline = nil;
   id<MTLComputePipelineState> productionGrainLayersFromDensityPipeline = nil;
@@ -1965,6 +2069,7 @@ struct MetalRenderer::Impl {
   GrainSynthesisSamplerMode grainSynthesisSamplerMode = GrainSynthesisSamplerMode::R2;
   GrainSynthesisCellMode grainSynthesisCellMode = GrainSynthesisCellMode::OffsetList;
   GrainSynthesisTargetStorageMode grainSynthesisTargetStorageMode = GrainSynthesisTargetStorageMode::FloatBuffer;
+  DirTailBackend dirTailBackend = DirTailBackend::Fused;
   uint32_t grainSynthesisRadiusLutSize = 512u;
   uint32_t diffusionGroupSize = 1;
   std::string passTimingMode = "off";
@@ -1987,6 +2092,34 @@ struct MetalRenderer::Impl {
       diagnostics.uploadBytes += length;
     }
     return buffer;
+  }
+
+  id<MTLBuffer> newStaticBuffer(const void *bytes, NSUInteger length, const char *name) {
+    if (!bytes || length == 0) {
+      lastError = std::string("Unable to create empty Metal buffer ") + name + ".";
+      return nil;
+    }
+    if (!commandQueue) {
+      return newSharedBuffer(bytes, length, name);
+    }
+    id<MTLBuffer> privateBuffer = [device newBufferWithLength:length options:MTLResourceStorageModePrivate];
+    id<MTLBuffer> uploadBuffer = [device newBufferWithBytes:bytes length:length options:MTLResourceStorageModeShared];
+    id<MTLCommandBuffer> uploadCommandBuffer = [commandQueue commandBuffer];
+    id<MTLBlitCommandEncoder> blitEncoder = [uploadCommandBuffer blitCommandEncoder];
+    if (!privateBuffer || !uploadBuffer || !uploadCommandBuffer || !blitEncoder) {
+      return newSharedBuffer(bytes, length, name);
+    }
+    [blitEncoder copyFromBuffer:uploadBuffer sourceOffset:0 toBuffer:privateBuffer destinationOffset:0 size:length];
+    [blitEncoder endEncoding];
+    [uploadCommandBuffer commit];
+    [uploadCommandBuffer waitUntilCompleted];
+    if ([uploadCommandBuffer status] == MTLCommandBufferStatusError) {
+      return newSharedBuffer(bytes, length, name);
+    }
+    diagnostics.staticAllocationBytes += length;
+    diagnostics.staticAllocationCount += 1;
+    diagnostics.uploadBytes += length;
+    return privateBuffer;
   }
 
   id<MTLBuffer> scratchBuffer(NSUInteger length, const char *name, MTLStorageMode storageMode) {
@@ -2305,38 +2438,38 @@ struct MetalRenderer::Impl {
       bandpassHanatosData = unityHanatosBandpass.data();
     }
 
-    next.curveInfoBuffer = newSharedBuffer(&next.curveInfo, sizeof(next.curveInfo), "film curve info");
-    next.logExposureBuffer = newSharedBuffer(filmCurves->logExposure, logExposureBytes, "film log exposure");
-    next.densityCurvesBuffer = newSharedBuffer(filmCurves->densityCurves, densityCurveBytes, "film density curves");
-    next.spectralInfoBuffer = newSharedBuffer(&next.spectralInfo, sizeof(next.spectralInfo), "spectral info");
-    next.wavelengthsBuffer = newSharedBuffer(filmCurves->wavelengths, wavelengthBytes, "film wavelengths");
-    next.logSensitivityBuffer = newSharedBuffer(filmSensitivityLinear.data(), sensitivityBytes, "film linear sensitivity");
-    next.bandpassHanatosBuffer = newSharedBuffer(bandpassHanatosData, sensitivityBytes, "film Hanatos bandpass");
-    next.hanatosRawResponseBuffer = newSharedBuffer(hanatosRawResponse.data(), hanatosRawResponse.size() * sizeof(float), "film Hanatos raw response");
-    next.mallettBasisIlluminantBuffer = newSharedBuffer(mallettRawMatrix.data(), mallettRawMatrix.size() * sizeof(float), "film Mallett raw matrix");
-    next.inputToReferenceXyzBuffer = newSharedBuffer(filmCurves->inputToReferenceXyz, inputMatrixBytes, "input to reference XYZ");
-    next.inputToSrgbBuffer = newSharedBuffer(filmCurves->inputToSrgb, inputMatrixBytes, "input to sRGB");
-    next.colorInfoBuffer = newSharedBuffer(&next.colorInfo, sizeof(next.colorInfo), "color info");
-    next.colorDecodeLutBuffer = newSharedBuffer(colorDecodeLuts(), transferLutBytes, "color decode LUT");
-    next.colorTransferKindBuffer = newSharedBuffer(colorTransferKinds(), transferKindBytes, "color transfer kind");
-    next.paperCurveInfoBuffer = newSharedBuffer(&next.paperCurveInfo, sizeof(next.paperCurveInfo), "paper curve info");
-    next.paperLogExposureBuffer = newSharedBuffer(paperCurves->logExposure, paperLogExposureBytes, "paper log exposure");
-    next.paperDensityCurvesBuffer = newSharedBuffer(paperCurves->densityCurves, paperDensityCurveBytes, "paper density curves");
-    next.filmChannelDensityBuffer = newSharedBuffer(filmCurves->channelDensity, sensitivityBytes, "film channel density");
-    next.filmBaseDensityBuffer = newSharedBuffer(filmCurves->baseDensity, baseDensityBytes, "film base density");
-    next.paperLogSensitivityBuffer = newSharedBuffer(paperSensitivityLinear.data(), sensitivityBytes, "paper linear sensitivity");
-    next.thKg3IlluminantBuffer = newSharedBuffer(thKg3Illuminant(), baseDensityBytes, "TH-KG3 illuminant");
-    next.customEnlargerFiltersBuffer = newSharedBuffer(customEnlargerFilters(), sensitivityBytes, "custom enlarger filters");
-    next.neutralPrintFiltersBuffer = newSharedBuffer(neutralPrintFilters(), neutralPrintFilterBytes, "neutral print filters");
-    next.academyPrinterDensityDataBuffer = newSharedBuffer(
+    next.curveInfoBuffer = newStaticBuffer(&next.curveInfo, sizeof(next.curveInfo), "film curve info");
+    next.logExposureBuffer = newStaticBuffer(filmCurves->logExposure, logExposureBytes, "film log exposure");
+    next.densityCurvesBuffer = newStaticBuffer(filmCurves->densityCurves, densityCurveBytes, "film density curves");
+    next.spectralInfoBuffer = newStaticBuffer(&next.spectralInfo, sizeof(next.spectralInfo), "spectral info");
+    next.wavelengthsBuffer = newStaticBuffer(filmCurves->wavelengths, wavelengthBytes, "film wavelengths");
+    next.logSensitivityBuffer = newStaticBuffer(filmSensitivityLinear.data(), sensitivityBytes, "film linear sensitivity");
+    next.bandpassHanatosBuffer = newStaticBuffer(bandpassHanatosData, sensitivityBytes, "film Hanatos bandpass");
+    next.hanatosRawResponseBuffer = newStaticBuffer(hanatosRawResponse.data(), hanatosRawResponse.size() * sizeof(float), "film Hanatos raw response");
+    next.mallettBasisIlluminantBuffer = newStaticBuffer(mallettRawMatrix.data(), mallettRawMatrix.size() * sizeof(float), "film Mallett raw matrix");
+    next.inputToReferenceXyzBuffer = newStaticBuffer(filmCurves->inputToReferenceXyz, inputMatrixBytes, "input to reference XYZ");
+    next.inputToSrgbBuffer = newStaticBuffer(filmCurves->inputToSrgb, inputMatrixBytes, "input to sRGB");
+    next.colorInfoBuffer = newStaticBuffer(&next.colorInfo, sizeof(next.colorInfo), "color info");
+    next.colorDecodeLutBuffer = newStaticBuffer(colorDecodeLuts(), transferLutBytes, "color decode LUT");
+    next.colorTransferKindBuffer = newStaticBuffer(colorTransferKinds(), transferKindBytes, "color transfer kind");
+    next.paperCurveInfoBuffer = newStaticBuffer(&next.paperCurveInfo, sizeof(next.paperCurveInfo), "paper curve info");
+    next.paperLogExposureBuffer = newStaticBuffer(paperCurves->logExposure, paperLogExposureBytes, "paper log exposure");
+    next.paperDensityCurvesBuffer = newStaticBuffer(paperCurves->densityCurves, paperDensityCurveBytes, "paper density curves");
+    next.filmChannelDensityBuffer = newStaticBuffer(filmCurves->channelDensity, sensitivityBytes, "film channel density");
+    next.filmBaseDensityBuffer = newStaticBuffer(filmCurves->baseDensity, baseDensityBytes, "film base density");
+    next.paperLogSensitivityBuffer = newStaticBuffer(paperSensitivityLinear.data(), sensitivityBytes, "paper linear sensitivity");
+    next.thKg3IlluminantBuffer = newStaticBuffer(thKg3Illuminant(), baseDensityBytes, "TH-KG3 illuminant");
+    next.customEnlargerFiltersBuffer = newStaticBuffer(customEnlargerFilters(), sensitivityBytes, "custom enlarger filters");
+    next.neutralPrintFiltersBuffer = newStaticBuffer(neutralPrintFilters(), neutralPrintFilterBytes, "neutral print filters");
+    next.academyPrinterDensityDataBuffer = newStaticBuffer(
       academyPrinterDensityData(),
       sensitivityBytes + neutralPrintFilterBytes,
       "Academy printer density data"
     );
-    next.paperScanDensityDataBuffer = newSharedBuffer(paperScanDensityData.data(), paperScanDensityData.size() * sizeof(float), "paper scan density data");
-    next.scanIlluminantsAndCmfsBuffer = newSharedBuffer(scanIlluminantsAndCmfs.data(), scanIlluminantsAndCmfs.size() * sizeof(float), "scan illuminants and CMFs");
-    next.scanToOutputRgbDataBuffer = newSharedBuffer(scanToOutputRgbData.data(), scanToOutputRgbData.size() * sizeof(float), "scan output matrices");
-    next.colorEncodeLutBuffer = newSharedBuffer(colorEncodeLuts(), transferLutBytes, "color encode LUT");
+    next.paperScanDensityDataBuffer = newStaticBuffer(paperScanDensityData.data(), paperScanDensityData.size() * sizeof(float), "paper scan density data");
+    next.scanIlluminantsAndCmfsBuffer = newStaticBuffer(scanIlluminantsAndCmfs.data(), scanIlluminantsAndCmfs.size() * sizeof(float), "scan illuminants and CMFs");
+    next.scanToOutputRgbDataBuffer = newStaticBuffer(scanToOutputRgbData.data(), scanToOutputRgbData.size() * sizeof(float), "scan output matrices");
+    next.colorEncodeLutBuffer = newStaticBuffer(colorEncodeLuts(), transferLutBytes, "color encode LUT");
 
     if (!next.validFor(params)) {
       if (lastError.empty()) {
@@ -2395,6 +2528,9 @@ struct MetalRenderer::Impl {
       }
       passGpuTimingEnabled = passTimingMode != "off";
       useScannerTextures = envString("SPEKTRAFILM_SCANNER_IMAGE_STORAGE", "buffer") == "texture";
+      dirTailBackend = envString("SPEKTRAFILM_DIR_TAIL_BACKEND", "fused") == "mps"
+        ? DirTailBackend::Mps
+        : DirTailBackend::Fused;
       const std::string diffusionGroupSizeText = envString("SPEKTRAFILM_DIFFUSION_GROUP_SIZE", "1");
       if (diffusionGroupSizeText == "1") {
         diffusionGroupSize = 1u;
@@ -2485,11 +2621,14 @@ struct MetalRenderer::Impl {
       developFromLogRawPipeline = makePipeline(@"spektrafilm_develop_from_log_raw");
       dirCorrectionFromDensityPipeline = makePipeline(@"spektrafilm_dir_correction_from_density");
       copyBufferPipeline = makePipeline(@"spektrafilm_copy_buffer");
+      halfToFloatBufferPipeline = makePipeline(@"spektrafilm_half_to_float_buffer");
+      floatToHalfBufferPipeline = makePipeline(@"spektrafilm_float_to_half_buffer");
       dirBaselinePipeline = makePipeline(@"spektrafilm_dir_baseline");
       dirBlurXPipeline = makePipeline(@"spektrafilm_dir_blur_x");
       dirBlurYPipeline = makePipeline(@"spektrafilm_dir_blur_y");
       dirTailBlurXPipeline = makePipeline(@"spektrafilm_dir_tail_blur_x");
       dirTailBlurYAccumulatePipeline = makePipeline(@"spektrafilm_dir_tail_blur_y_accumulate");
+      dirTailMpsAccumulatePipeline = makePipeline(@"spektrafilm_dir_tail_mps_accumulate");
       dirRedevelopPipeline = makePipeline(@"spektrafilm_dir_redevelop");
       previewGrainFromDensityPipeline = makePipeline(@"spektrafilm_preview_grain_from_density");
       productionGrainLayersFromDensityPipeline = makePipeline(@"spektrafilm_production_grain_layers_from_density");
@@ -2554,8 +2693,10 @@ struct MetalRenderer::Impl {
           !diffusionGroupBlurXPipeline || !diffusionGroupBlurYAccumulatePipeline || !diffusionResolvePipeline ||
           !developFromLogRawPipeline ||
           !dirCorrectionFromDensityPipeline || !copyBufferPipeline ||
+          !halfToFloatBufferPipeline || !floatToHalfBufferPipeline ||
           !dirBaselinePipeline || !dirBlurXPipeline || !dirBlurYPipeline ||
-          !dirTailBlurXPipeline || !dirTailBlurYAccumulatePipeline || !dirRedevelopPipeline ||
+          !dirTailBlurXPipeline || !dirTailBlurYAccumulatePipeline || !dirTailMpsAccumulatePipeline ||
+          !dirRedevelopPipeline ||
           !previewGrainFromDensityPipeline || !productionGrainLayersFromDensityPipeline ||
           !grainLayerBlurXPipeline || !grainLayerBlurYPipeline ||
           !grainMicroSourcePipeline || !grainMicroBlurXPipeline || !grainMicroBlurYPipeline || !grainResolveDensityPipeline ||
@@ -2624,8 +2765,10 @@ bool MetalRenderer::isAvailable() const {
     impl_->diffusionComponentBlurYAccumulatePipeline &&
     impl_->diffusionGroupBlurXPipeline && impl_->diffusionGroupBlurYAccumulatePipeline && impl_->diffusionResolvePipeline &&
     impl_->developFromLogRawPipeline && impl_->dirCorrectionFromDensityPipeline && impl_->copyBufferPipeline &&
+    impl_->halfToFloatBufferPipeline && impl_->floatToHalfBufferPipeline &&
     impl_->dirBaselinePipeline && impl_->dirBlurXPipeline && impl_->dirBlurYPipeline &&
-    impl_->dirTailBlurXPipeline && impl_->dirTailBlurYAccumulatePipeline && impl_->dirRedevelopPipeline &&
+    impl_->dirTailBlurXPipeline && impl_->dirTailBlurYAccumulatePipeline &&
+    impl_->dirTailMpsAccumulatePipeline && impl_->dirRedevelopPipeline &&
     impl_->previewGrainFromDensityPipeline && impl_->productionGrainLayersFromDensityPipeline &&
     impl_->grainLayerBlurXPipeline && impl_->grainLayerBlurYPipeline &&
     impl_->grainMicroSourcePipeline && impl_->grainMicroBlurXPipeline && impl_->grainMicroBlurYPipeline &&
@@ -2714,6 +2857,14 @@ bool MetalRenderer::render(
     }
     const StaticProfileResources &resources = impl_->staticResources;
     const ProfileCurveSet *filmCurves = resources.filmCurves;
+    float effectiveHalationStrengthR = params.halationStrengthR;
+    float effectiveHalationStrengthG = params.halationStrengthG;
+    float effectiveHalationStrengthB = params.halationStrengthB;
+    if (filmCurves && filmCurves->halationStrength && isDefaultHalationStrength(params)) {
+      effectiveHalationStrengthR = filmCurves->halationStrength[0];
+      effectiveHalationStrengthG = filmCurves->halationStrength[1];
+      effectiveHalationStrengthB = filmCurves->halationStrength[2];
+    }
     const NSUInteger densityCurveBytes = static_cast<NSUInteger>(filmCurves->exposureCount) * 3u * sizeof(float);
     const bool densityOutput = params.renderOutput == RenderOutputMode::FilmDensityCmy;
     const bool densityWithGrainOutput = params.renderOutput == RenderOutputMode::FilmDensityCmyWithGrain;
@@ -2732,20 +2883,30 @@ bool MetalRenderer::render(
       finalPrintSimulation;
     const bool needsFilmDensityPath = densityOutput || densityWithGrainOutput || finalPrintSimulation || finalScanNegative;
     const bool needsHalationLogRawPath = true;
-    const bool halationPath =
+    const bool halationScatterPath =
       params.halationEnabled &&
       needsHalationLogRawPath &&
-      (params.scatterAmount > 0.0f || params.halationAmount > 0.0f);
+      params.scatterAmount > 0.0f &&
+      params.scatterScale > 0.0f;
+    const bool halationBouncePath =
+      params.halationEnabled &&
+      needsHalationLogRawPath &&
+      params.halationAmount > 0.0f &&
+      params.halationScale > 0.0f &&
+      (effectiveHalationStrengthR > 0.0f || effectiveHalationStrengthG > 0.0f || effectiveHalationStrengthB > 0.0f);
+    const bool halationPath = halationScatterPath || halationBouncePath;
     const bool halationBoostPath =
       params.halationEnabled &&
       params.halationBoostEv > 0.0f &&
       needsFilmDensityPath;
     const bool dirPath = params.dirCouplersAmount > 0.0f && needsFilmDensityPath;
+    const bool dirBlurPath = dirPath && params.dirCouplersDiffusionUm > 0.0f;
     const bool dirTailPath =
       dirPath &&
-      params.dirCouplersDiffusionUm > 0.0f &&
+      dirBlurPath &&
       params.dirCouplersDiffusionTailUm > 0.0f &&
       params.dirCouplersDiffusionTailWeight > 0.0f;
+    const bool dirTailMpsPath = dirTailPath && impl_->dirTailBackend == DirTailBackend::Mps;
     const bool productionGrainPath =
       params.grainEnabled &&
       params.grainModel == GrainModel::Production &&
@@ -2758,6 +2919,7 @@ bool MetalRenderer::render(
       (productionGrainPath || grainSynthesisPath) &&
       (std::abs(params.grainAmount - 1.0f) > 1.0e-6f || std::abs(params.grainSaturation - 1.0f) > 1.0e-6f);
     const NSUInteger grainLayerBytes = static_cast<NSUInteger>(width) * static_cast<NSUInteger>(height) * 9u * sizeof(float);
+    const NSUInteger dirCorrectionBufferBBytes = dirTailPath && !dirTailMpsPath ? bufferBytes * 3u : bufferBytes;
     const float pixelSizeUm = filmFormatMm(params.filmFormat) * 1000.0f /
       static_cast<float>(std::max(width, height)) / enlargerScale(params);
     KernelDiffusionInfo cameraDiffusionInfo{};
@@ -2788,6 +2950,8 @@ bool MetalRenderer::render(
     const bool preExposurePath =
       halationBoostPath || cameraDiffusionPath || halationPath || printDiffusionPath || finalPostProcessPath ||
       densityOutput || densityWithGrainOutput;
+    const bool directDirBaselinePath = dirPath && !halationBoostPath && !cameraDiffusionPath && !halationPath;
+    const bool preExposureBranchPath = preExposurePath && !directDirBaselinePath;
     impl_->diagnostics.halationPath = halationPath;
     impl_->diagnostics.cameraDiffusionPath = cameraDiffusionPath;
     impl_->diagnostics.printDiffusionPath = printDiffusionPath;
@@ -2835,8 +2999,12 @@ bool MetalRenderer::render(
 
     id<MTLBuffer> srcBuffer = nil;
     id<MTLBuffer> dstBuffer = nil;
+    id<MTLBuffer> sourceHalfBuffer = nil;
+    id<MTLBuffer> destinationHalfBuffer = nil;
     bool sourceWrappedDirectly = false;
     bool destinationWrappedDirectly = false;
+    bool sourceHalfWrappedDirectly = false;
+    bool destinationHalfWrappedDirectly = false;
     if (const void *directSource = contiguousFloatWindowPointer(source, window, width, height)) {
       srcBuffer = [impl_->device newBufferWithBytesNoCopy:const_cast<void *>(directSource)
                                                    length:bufferBytes
@@ -2844,8 +3012,20 @@ bool MetalRenderer::render(
                                               deallocator:nil];
       sourceWrappedDirectly = srcBuffer != nil;
     }
+    if (!srcBuffer && !params.autoExposure) {
+      if (const void *directHalfSource = contiguousHalfWindowPointer(source, window, width, height)) {
+        const NSUInteger halfBufferBytes = static_cast<NSUInteger>(width) * static_cast<NSUInteger>(height) * 4u * sizeof(uint16_t);
+        sourceHalfBuffer = [impl_->device newBufferWithBytesNoCopy:const_cast<void *>(directHalfSource)
+                                                            length:halfBufferBytes
+                                                           options:MTLResourceStorageModeShared
+                                                       deallocator:nil];
+        sourceHalfWrappedDirectly = sourceHalfBuffer != nil;
+      }
+    }
     if (!srcBuffer) {
-      srcBuffer = impl_->sharedScratchBuffer(bufferBytes, "source staging");
+      srcBuffer = sourceHalfWrappedDirectly
+        ? impl_->gpuScratchBuffer(bufferBytes, "source float staging")
+        : impl_->sharedScratchBuffer(bufferBytes, "source staging");
     }
     if (void *directDestination = contiguousFloatWindowPointer(destination, window, width, height)) {
       dstBuffer = [impl_->device newBufferWithBytesNoCopy:directDestination
@@ -2854,10 +3034,22 @@ bool MetalRenderer::render(
                                               deallocator:nil];
       destinationWrappedDirectly = dstBuffer != nil;
     }
-    impl_->diagnostics.sourceNoCopy = sourceWrappedDirectly;
-    impl_->diagnostics.destinationNoCopy = destinationWrappedDirectly;
     if (!dstBuffer) {
-      dstBuffer = impl_->sharedScratchBuffer(bufferBytes, "destination staging");
+      if (void *directHalfDestination = contiguousHalfWindowPointer(destination, window, width, height)) {
+        const NSUInteger halfBufferBytes = static_cast<NSUInteger>(width) * static_cast<NSUInteger>(height) * 4u * sizeof(uint16_t);
+        destinationHalfBuffer = [impl_->device newBufferWithBytesNoCopy:directHalfDestination
+                                                                 length:halfBufferBytes
+                                                                options:MTLResourceStorageModeShared
+                                                            deallocator:nil];
+        destinationHalfWrappedDirectly = destinationHalfBuffer != nil;
+      }
+    }
+    impl_->diagnostics.sourceNoCopy = sourceWrappedDirectly || sourceHalfWrappedDirectly;
+    impl_->diagnostics.destinationNoCopy = destinationWrappedDirectly || destinationHalfWrappedDirectly;
+    if (!dstBuffer) {
+      dstBuffer = destinationHalfWrappedDirectly
+        ? impl_->gpuScratchBuffer(bufferBytes, "destination float staging")
+        : impl_->sharedScratchBuffer(bufferBytes, "destination staging");
     }
     id<MTLBuffer> paramBuffer = impl_->sharedScratchBuffer(sizeof(KernelParams), "kernel params");
     id<MTLBuffer> enlargedSourceBuffer = sourceTransformPath ? impl_->gpuScratchBuffer(bufferBytes, "enlarger source") : nil;
@@ -2884,13 +3076,13 @@ bool MetalRenderer::render(
     id<MTLTexture> scannerTextureC = (scannerTexturePath && scannerNeedsUnsharp) ? impl_->gpuScratchTexture(width, height, "scanner texture C") : nil;
     id<MTLBuffer> printGlareBufferA = printGlarePath ? impl_->gpuScratchBuffer(bufferBytes, "print glare A") : nil;
     id<MTLBuffer> printGlareBufferB = printGlarePath ? impl_->gpuScratchBuffer(bufferBytes, "print glare B") : nil;
-    id<MTLBuffer> halationRawBufferA = preExposurePath ? impl_->gpuScratchBuffer(bufferBytes, "pre-exposure raw A") : nil;
-    id<MTLBuffer> halationRawBufferB = preExposurePath ? impl_->gpuScratchBuffer(bufferBytes, "pre-exposure raw B") : nil;
-    id<MTLBuffer> halationRawBufferC = preExposurePath ? impl_->gpuScratchBuffer(cameraDiffusionPath ? diffusionTempBytes : bufferBytes, "pre-exposure raw C") : nil;
-    id<MTLBuffer> halationRawBufferD = preExposurePath ? impl_->gpuScratchBuffer(bufferBytes, "pre-exposure raw D") : nil;
-    id<MTLBuffer> halationLogRawBuffer = preExposurePath ? impl_->gpuScratchBuffer(bufferBytes, "pre-exposure log raw") : nil;
-    id<MTLBuffer> halationDensityBufferA = preExposurePath ? impl_->gpuScratchBuffer(bufferBytes, "pre-exposure density A") : nil;
-    id<MTLBuffer> halationDensityBufferB = (preExposurePath && previewGrainFromDensityPath) ? impl_->gpuScratchBuffer(bufferBytes, "pre-exposure density B") : nil;
+    id<MTLBuffer> halationRawBufferA = preExposureBranchPath ? impl_->gpuScratchBuffer(bufferBytes, "pre-exposure raw A") : nil;
+    id<MTLBuffer> halationRawBufferB = preExposureBranchPath ? impl_->gpuScratchBuffer(bufferBytes, "pre-exposure raw B") : nil;
+    id<MTLBuffer> halationRawBufferC = preExposureBranchPath ? impl_->gpuScratchBuffer(cameraDiffusionPath ? diffusionTempBytes : bufferBytes, "pre-exposure raw C") : nil;
+    id<MTLBuffer> halationRawBufferD = preExposureBranchPath ? impl_->gpuScratchBuffer(bufferBytes, "pre-exposure raw D") : nil;
+    id<MTLBuffer> halationLogRawBuffer = preExposureBranchPath ? impl_->gpuScratchBuffer(bufferBytes, "pre-exposure log raw") : nil;
+    id<MTLBuffer> halationDensityBufferA = preExposureBranchPath ? impl_->gpuScratchBuffer(bufferBytes, "pre-exposure density A") : nil;
+    id<MTLBuffer> halationDensityBufferB = (preExposureBranchPath && previewGrainFromDensityPath) ? impl_->gpuScratchBuffer(bufferBytes, "pre-exposure density B") : nil;
     id<MTLBuffer> halationBoostMaxBuffer = halationBoostPath
       ? impl_->gpuScratchBuffer(static_cast<NSUInteger>(std::max(halationBoostMaxChunkCount, 4u)) * sizeof(float), "halation boost max")
       : nil;
@@ -2911,8 +3103,10 @@ bool MetalRenderer::render(
     id<MTLBuffer> dirDensityBufferA = dirPath ? impl_->gpuScratchBuffer(bufferBytes, "DIR density A") : nil;
     id<MTLBuffer> dirDensityBufferB = (dirPath && previewGrainFromDensityPath) ? impl_->gpuScratchBuffer(bufferBytes, "DIR density B") : nil;
     id<MTLBuffer> dirCorrectionBufferA = dirPath ? impl_->gpuScratchBuffer(bufferBytes, "DIR correction A") : nil;
-    id<MTLBuffer> dirCorrectionBufferB = dirPath ? impl_->gpuScratchBuffer(bufferBytes, "DIR correction B") : nil;
+    id<MTLBuffer> dirCorrectionBufferB = dirBlurPath ? impl_->gpuScratchBuffer(dirCorrectionBufferBBytes, "DIR correction B") : nil;
     id<MTLBuffer> dirCorrectionBufferC = dirTailPath ? impl_->gpuScratchBuffer(bufferBytes, "DIR correction C") : nil;
+    id<MTLTexture> dirTailSourceTexture = dirTailMpsPath ? impl_->gpuScratchTexture(width, height, "DIR tail MPS source") : nil;
+    id<MTLTexture> dirTailBlurTexture = dirTailMpsPath ? impl_->gpuScratchTexture(width, height, "DIR tail MPS blur") : nil;
     id<MTLBuffer> grainLayerBufferA = (productionGrainPath || grainSynthesisPath) ? impl_->gpuScratchBuffer(grainLayerBytes, "grain layer A") : nil;
     id<MTLBuffer> grainLayerBufferB = (productionGrainPath || grainSynthesisPath) ? impl_->gpuScratchBuffer(grainLayerBytes, "grain layer B") : nil;
     id<MTLBuffer> grainMicroBufferA = (productionGrainPath || grainSynthesisPath) ? impl_->gpuScratchBuffer(bufferBytes, "grain micro A") : nil;
@@ -2972,12 +3166,13 @@ bool MetalRenderer::render(
       return false;
     }
     if (dirPath && (!dirInfoBuffer || !dirCorrectedDensityCurvesBuffer || !dirLogRawBuffer || !dirDensityBufferA ||
-        !dirCorrectionBufferA || !dirCorrectionBufferB || (dirTailPath && !dirCorrectionBufferC) ||
+        !dirCorrectionBufferA || (dirBlurPath && !dirCorrectionBufferB) || (dirTailPath && !dirCorrectionBufferC) ||
+        (dirTailMpsPath && (!dirTailSourceTexture || !dirTailBlurTexture)) ||
         (previewGrainFromDensityPath && !dirDensityBufferB))) {
       impl_->lastError = "Unable to allocate DIR coupler Metal buffers.";
       return false;
     }
-    if (preExposurePath && (!halationRawBufferA || !halationRawBufferB || !halationRawBufferC || !halationRawBufferD ||
+    if (preExposureBranchPath && (!halationRawBufferA || !halationRawBufferB || !halationRawBufferC || !halationRawBufferD ||
         !halationLogRawBuffer || !halationDensityBufferA || (previewGrainFromDensityPath && !halationDensityBufferB))) {
       impl_->lastError = "Unable to allocate pre-development Metal buffers.";
       return false;
@@ -3016,7 +3211,7 @@ bool MetalRenderer::render(
       return false;
     }
 
-    if (!sourceWrappedDirectly) {
+    if (!sourceWrappedDirectly && !sourceHalfWrappedDirectly) {
       const auto sourceCopyStart = PerfClock::now();
       copySourceToFloatStaging(source, window, width, height, static_cast<float *>([srcBuffer contents]));
       impl_->diagnostics.sourceCopyMs += elapsedMilliseconds(sourceCopyStart, PerfClock::now());
@@ -3025,6 +3220,11 @@ bool MetalRenderer::render(
 
     KernelParams kernelParams = toKernelParams(params, time, width, height);
     applyProfileHalationDefaults(kernelParams, params, *filmCurves);
+    const KernelGaussianBlurInfo dirCoreBlurInfo = makeGaussianBlurInfo(
+      std::max(kernelParams.dirCouplersDiffusionUm, 0.0f) / std::max(kernelParams.filmPixelSizeUm, 1.0e-6f),
+      96u
+    );
+    const std::array<KernelGaussianBlurInfo, 3> dirTailBlurInfos = makeDirTailBlurInfos(kernelParams);
     if (params.autoExposure) {
       kernelParams.autoExposureEv = measureAutoExposureEv(static_cast<const float *>([srcBuffer contents]), width, height, params);
     }
@@ -3080,14 +3280,21 @@ bool MetalRenderer::render(
     id<MTLCommandBuffer> commandBuffer = nil;
     id<MTLComputeCommandEncoder> encoder = nil;
     bool encodeFailed = false;
-    auto beginCommandEncoder = [&]() -> bool {
-      commandBuffer = [impl_->commandQueue commandBuffer];
+    auto beginComputeEncoder = [&]() -> bool {
       encoder = [commandBuffer computeCommandEncoder];
-      if (!commandBuffer || !encoder) {
+      if (!encoder) {
         impl_->lastError = "Unable to create Metal command encoder.";
         return false;
       }
       return true;
+    };
+    auto beginCommandEncoder = [&]() -> bool {
+      commandBuffer = [impl_->commandQueue commandBuffer];
+      if (!commandBuffer) {
+        impl_->lastError = "Unable to create Metal command buffer.";
+        return false;
+      }
+      return beginComputeEncoder();
     };
     if (!beginCommandEncoder()) {
       return false;
@@ -3238,6 +3445,17 @@ bool MetalRenderer::render(
       impl_->diagnostics.passCount += 1u;
       finishSplitTimedPass(passIndex, splitPassStart);
     };
+
+    if (sourceHalfWrappedDirectly) {
+      [encoder setComputePipelineState:impl_->halfToFloatBufferPipeline];
+      [encoder setBuffer:sourceHalfBuffer offset:0 atIndex:0];
+      [encoder setBuffer:srcBuffer offset:0 atIndex:1];
+      [encoder setBytes:dims length:sizeof(dims) atIndex:2];
+      dispatch2D(
+        impl_->halfToFloatBufferPipeline,
+        static_cast<uint64_t>(width) * static_cast<uint64_t>(height) * (sizeof(uint16_t) * 4u + sizeof(float) * 4u)
+      );
+    }
 
     id<MTLBuffer> renderSourceBuffer = srcBuffer;
     if (sourceTransformPath) {
@@ -3519,38 +3737,119 @@ bool MetalRenderer::render(
     };
 
     auto encodeDirCorrectionBlur = [&](id<MTLBuffer> correctionBuffer) -> id<MTLBuffer> {
+      if (!dirBlurPath) {
+        return correctionBuffer;
+      }
       id<MTLBuffer> finalCorrectionBuffer = dirTailPath ? dirCorrectionBufferC : dirCorrectionBufferA;
 
       [encoder setComputePipelineState:impl_->dirBlurXPipeline];
       [encoder setBuffer:correctionBuffer offset:0 atIndex:0];
       [encoder setBuffer:dirCorrectionBufferB offset:0 atIndex:1];
-      [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+      [encoder setBytes:&dirCoreBlurInfo length:sizeof(dirCoreBlurInfo) atIndex:2];
       [encoder setBytes:dims length:sizeof(dims) atIndex:3];
       dispatch2D(impl_->dirBlurXPipeline);
 
       [encoder setComputePipelineState:impl_->dirBlurYPipeline];
       [encoder setBuffer:dirCorrectionBufferB offset:0 atIndex:0];
       [encoder setBuffer:finalCorrectionBuffer offset:0 atIndex:1];
-      [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+      [encoder setBytes:&dirCoreBlurInfo length:sizeof(dirCoreBlurInfo) atIndex:2];
       [encoder setBytes:dims length:sizeof(dims) atIndex:3];
       dispatch2D(impl_->dirBlurYPipeline);
 
       if (dirTailPath) {
-        for (uint32_t component = 0; component < 3u; ++component) {
+        const float tailWeight = kernelParams.dirCouplersDiffusionTailWeight;
+        if (dirTailMpsPath) {
+          [encoder setComputePipelineState:impl_->bufferToTexturePipeline];
+          [encoder setBuffer:correctionBuffer offset:0 atIndex:0];
+          [encoder setBytes:dims length:sizeof(dims) atIndex:1];
+          [encoder setTexture:dirTailSourceTexture atIndex:0];
+          dispatch2D(impl_->bufferToTexturePipeline);
+
+          auto encodeMpsTailBlur = [&](uint32_t component, float sigma) {
+            if (encodeFailed) {
+              return;
+            }
+            [encoder endEncoding];
+            encoder = nil;
+            const size_t passIndex = impl_->diagnostics.passes.size();
+            MetalPassDiagnostics pass{};
+            pass.name = "spektrafilm_dir_tail_mps_gaussian_blur";
+            pass.width = static_cast<uint32_t>(width);
+            pass.height = static_cast<uint32_t>(height);
+            pass.depth = 1u;
+            pass.threadgroupWidth = 0u;
+            pass.threadgroupHeight = 0u;
+            pass.estimatedBytes = static_cast<uint64_t>(bufferBytes) * 2u;
+            impl_->diagnostics.passes.push_back(pass);
+            const auto splitPassStart = useSplitPassTiming ? PerfClock::now() : PerfClock::time_point{};
+            MPSImageGaussianBlur *blur = [[MPSImageGaussianBlur alloc] initWithDevice:impl_->device sigma:sigma];
+            if (!blur) {
+              impl_->lastError = "Unable to create MPS DIR tail Gaussian blur.";
+              encodeFailed = true;
+              return;
+            }
+            blur.edgeMode = MPSImageEdgeModeClamp;
+            blur.options = MPSKernelOptionsSkipAPIValidation;
+            [blur encodeToCommandBuffer:commandBuffer sourceTexture:dirTailSourceTexture destinationTexture:dirTailBlurTexture];
+            impl_->diagnostics.passCount += 1u;
+            if (useSplitPassTiming) {
+              [commandBuffer commit];
+              [commandBuffer waitUntilCompleted];
+              const double passMs = elapsedMilliseconds(splitPassStart, PerfClock::now());
+              splitCommandMs += passMs;
+              if ([commandBuffer status] == MTLCommandBufferStatusError) {
+                NSError *error = [commandBuffer error];
+                impl_->lastError = error ? [[error localizedDescription] UTF8String] : "Metal command buffer failed.";
+                encodeFailed = true;
+                return;
+              }
+              if (passIndex < impl_->diagnostics.passes.size()) {
+                impl_->diagnostics.passes[passIndex].gpuMs = passMs;
+                impl_->diagnostics.passes[passIndex].gpuTimeAvailable = true;
+              }
+              if (!beginCommandEncoder()) {
+                encodeFailed = true;
+              }
+            } else if (!beginComputeEncoder()) {
+              encodeFailed = true;
+            }
+            (void)component;
+          };
+
+          for (uint32_t component = 0; component < 3u; ++component) {
+            constexpr std::array<float, 3> kTailSigmaScale = {0.5360f, 1.5236f, 2.7684f};
+            const float sigma = std::max(kernelParams.dirCouplersDiffusionTailUm, 0.0f) *
+              kTailSigmaScale[component] / std::max(kernelParams.filmPixelSizeUm, 1.0e-6f);
+            encodeMpsTailBlur(component, sigma);
+            if (encodeFailed) {
+              break;
+            }
+            [encoder setComputePipelineState:impl_->dirTailMpsAccumulatePipeline];
+            [encoder setTexture:dirTailBlurTexture atIndex:0];
+            [encoder setBuffer:finalCorrectionBuffer offset:0 atIndex:0];
+            [encoder setBytes:&tailWeight length:sizeof(tailWeight) atIndex:1];
+            [encoder setBytes:&component length:sizeof(component) atIndex:2];
+            [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+            dispatch2D(impl_->dirTailMpsAccumulatePipeline);
+          }
+        } else {
           [encoder setComputePipelineState:impl_->dirTailBlurXPipeline];
           [encoder setBuffer:correctionBuffer offset:0 atIndex:0];
           [encoder setBuffer:dirCorrectionBufferB offset:0 atIndex:1];
-          [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+          [encoder setBytes:dirTailBlurInfos.data()
+                     length:dirTailBlurInfos.size() * sizeof(dirTailBlurInfos[0])
+                    atIndex:2];
           [encoder setBytes:dims length:sizeof(dims) atIndex:3];
-          [encoder setBytes:&component length:sizeof(component) atIndex:4];
           dispatch2D(impl_->dirTailBlurXPipeline);
 
           [encoder setComputePipelineState:impl_->dirTailBlurYAccumulatePipeline];
           [encoder setBuffer:dirCorrectionBufferB offset:0 atIndex:0];
           [encoder setBuffer:finalCorrectionBuffer offset:0 atIndex:1];
-          [encoder setBuffer:paramBuffer offset:0 atIndex:2];
-          [encoder setBytes:dims length:sizeof(dims) atIndex:3];
-          [encoder setBytes:&component length:sizeof(component) atIndex:4];
+          [encoder setBytes:dirTailBlurInfos.data()
+                     length:dirTailBlurInfos.size() * sizeof(dirTailBlurInfos[0])
+                    atIndex:2];
+          [encoder setBytes:&tailWeight length:sizeof(tailWeight) atIndex:3];
+          [encoder setBytes:dims length:sizeof(dims) atIndex:4];
           dispatch2D(impl_->dirTailBlurYAccumulatePipeline);
         }
       }
@@ -3867,7 +4166,7 @@ bool MetalRenderer::render(
       }
     };
 
-    if (preExposurePath) {
+    if (preExposureBranchPath) {
       [encoder setComputePipelineState:impl_->halationRawExposurePipeline];
       [encoder setBuffer:renderSourceBuffer offset:0 atIndex:0];
       [encoder setBuffer:halationRawBufferA offset:0 atIndex:1];
@@ -3928,7 +4227,7 @@ bool MetalRenderer::render(
         currentRawBuffer = diffusionDestinationBuffer;
       }
 
-      if (halationPath && params.scatterAmount > 0.0f && params.scatterScale > 0.0f) {
+      if (halationScatterPath) {
         id<MTLBuffer> scatterTempBuffer = currentRawBuffer == halationRawBufferA ? halationRawBufferB : halationRawBufferA;
         id<MTLBuffer> scatterCoreBuffer = halationRawBufferC;
         id<MTLBuffer> scatterAccumBuffer = halationRawBufferD;
@@ -3985,7 +4284,7 @@ bool MetalRenderer::render(
 
       const bool needsPreExposureLogRaw = dirPath;
       bool preExposureDensityReady = false;
-      if (halationPath) {
+      if (halationBouncePath) {
         id<MTLBuffer> bounceAccumBuffer = currentRawBuffer == halationRawBufferA ? halationRawBufferB : halationRawBufferA;
         [encoder setComputePipelineState:impl_->halationClearPipeline];
         [encoder setBuffer:currentRawBuffer offset:0 atIndex:0];
@@ -4334,6 +4633,16 @@ bool MetalRenderer::render(
       [encoder setBuffer:colorEncodeLutBuffer offset:0 atIndex:30];
       dispatch2D(impl_->grainPipeline);
     }
+    if (destinationHalfWrappedDirectly) {
+      [encoder setComputePipelineState:impl_->floatToHalfBufferPipeline];
+      [encoder setBuffer:dstBuffer offset:0 atIndex:0];
+      [encoder setBuffer:destinationHalfBuffer offset:0 atIndex:1];
+      [encoder setBytes:dims length:sizeof(dims) atIndex:2];
+      dispatch2D(
+        impl_->floatToHalfBufferPipeline,
+        static_cast<uint64_t>(width) * static_cast<uint64_t>(height) * (sizeof(float) * 4u + sizeof(uint16_t) * 4u)
+      );
+    }
     if (encodeFailed) {
       return false;
     }
@@ -4379,7 +4688,7 @@ bool MetalRenderer::render(
       }
     }
 
-    if (!destinationWrappedDirectly) {
+    if (!destinationWrappedDirectly && !destinationHalfWrappedDirectly) {
       const auto outputCopyStart = PerfClock::now();
       copyFloatStagingToDestination(static_cast<const float *>([dstBuffer contents]), destination, window, width, height);
       impl_->diagnostics.outputCopyMs += elapsedMilliseconds(outputCopyStart, PerfClock::now());

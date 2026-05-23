@@ -164,6 +164,7 @@ function(add_spektra_ofx_plugin target artifact_name display_name plugin_id flav
     "-framework Foundation"
     "-framework Metal"
     "-framework MetalKit"
+    "-framework MetalPerformanceShaders"
     "-framework QuartzCore"
   )
 
@@ -423,6 +424,7 @@ target_link_libraries(SpektraFilmPerfHarness PRIVATE
   "-framework Foundation"
   "-framework Metal"
   "-framework MetalKit"
+  "-framework MetalPerformanceShaders"
   "-framework QuartzCore"
 )
 
@@ -430,6 +432,7 @@ target_link_libraries(SpektraFilmEvaluationHarness PRIVATE
   "-framework Foundation"
   "-framework Metal"
   "-framework MetalKit"
+  "-framework MetalPerformanceShaders"
   "-framework QuartzCore"
 )
 
@@ -440,6 +443,7 @@ target_link_libraries(SpektraVariantGenerator PRIVATE
   "-framework ImageIO"
   "-framework Metal"
   "-framework MetalKit"
+  "-framework MetalPerformanceShaders"
   "-framework QuartzCore"
 )
 

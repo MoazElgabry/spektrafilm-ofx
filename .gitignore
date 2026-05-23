@@ -69,6 +69,7 @@ PHOTOCHEMICAL_IDEAS.md
 WINDOWS_PORT.md
 
 # Licensed SMPTE standards CSVs are local-only build inputs.
+Resources/data/standards/
 Resources/data/standards/smpte_st_2065_2/st2065-2a-2020.csv
 Resources/data/standards/smpte_st_2065_2/st2065-2b-2020.csv
 
