@@ -147,6 +147,9 @@ struct SpektraKernelParams {
   float scannerBlurSigmaPx;
   float scannerUnsharpSigmaPx;
   float scannerUnsharpAmount;
+  uint densityCurveLookupMode;
+  uint spectralTransmittanceMode;
+  uint _padPerf0;
   float time;
 };
 
@@ -945,7 +948,8 @@ static float spektra_interp_density_curve(
   float gammaFactor,
   constant SpektraCurveInfo &curveInfo,
   device const float *logExposure,
-  device const float *densityCurves
+  device const float *densityCurves,
+  uint lookupMode
 ) {
   const uint count = curveInfo.exposureCount;
   if (count == 0u) {
@@ -960,6 +964,23 @@ static float spektra_interp_density_curve(
   }
   if (logRaw >= lastX) {
     return densityCurves[(count - 1u) * 3u + channel];
+  }
+
+  if (lookupMode != 0u && count > 1u) {
+    const float indexF = clamp(
+      (logRaw - firstX) * float(count - 1u) / max(lastX - firstX, 1.0e-9),
+      0.0,
+      float(count - 1u)
+    );
+    if (lookupMode == 2u) {
+      const uint idx = uint(clamp(floor(indexF + 0.5), 0.0, float(count - 1u)));
+      return densityCurves[idx * 3u + channel];
+    }
+    const uint loUniform = uint(floor(indexF));
+    const uint hiUniform = min(loUniform + 1u, count - 1u);
+    const float y0Uniform = densityCurves[loUniform * 3u + channel];
+    const float y1Uniform = densityCurves[hiUniform * 3u + channel];
+    return mix(y0Uniform, y1Uniform, indexF - float(loUniform));
   }
 
   uint lo = 0u;
@@ -1160,9 +1181,9 @@ static float3 spektra_develop_film_density(
   if (params.filmPushPullMode == 1) {
     const float3 lookupRaw = spektra_experimental_push_pull_log_raw(logRaw, params.filmPushPullStops);
     const float3 density = float3(
-      spektra_interp_density_curve(lookupRaw.r, 0u, params.filmGamma, curveInfo, logExposure, densityCurves),
-      spektra_interp_density_curve(lookupRaw.g, 1u, params.filmGamma, curveInfo, logExposure, densityCurves),
-      spektra_interp_density_curve(lookupRaw.b, 2u, params.filmGamma, curveInfo, logExposure, densityCurves)
+      spektra_interp_density_curve(lookupRaw.r, 0u, params.filmGamma, curveInfo, logExposure, densityCurves, params.densityCurveLookupMode),
+      spektra_interp_density_curve(lookupRaw.g, 1u, params.filmGamma, curveInfo, logExposure, densityCurves, params.densityCurveLookupMode),
+      spektra_interp_density_curve(lookupRaw.b, 2u, params.filmGamma, curveInfo, logExposure, densityCurves, params.densityCurveLookupMode)
     );
     return density * float3(
       spektra_experimental_push_pull_density_gain(lookupRaw.r, 0u, params.filmPushPullStops),
@@ -1171,9 +1192,9 @@ static float3 spektra_develop_film_density(
     );
   }
   return float3(
-    spektra_interp_density_curve(logRaw.r, 0u, params.filmGamma, curveInfo, logExposure, densityCurves),
-    spektra_interp_density_curve(logRaw.g, 1u, params.filmGamma, curveInfo, logExposure, densityCurves),
-    spektra_interp_density_curve(logRaw.b, 2u, params.filmGamma, curveInfo, logExposure, densityCurves)
+    spektra_interp_density_curve(logRaw.r, 0u, params.filmGamma, curveInfo, logExposure, densityCurves, params.densityCurveLookupMode),
+    spektra_interp_density_curve(logRaw.g, 1u, params.filmGamma, curveInfo, logExposure, densityCurves, params.densityCurveLookupMode),
+    spektra_interp_density_curve(logRaw.b, 2u, params.filmGamma, curveInfo, logExposure, densityCurves, params.densityCurveLookupMode)
   );
 }
 
@@ -1230,6 +1251,18 @@ static float spektra_filtered_enlarger_illuminant(
     params.filterMShift,
     params.filterYShift
   );
+}
+
+static float spektra_spectral_transmittance(float density, constant SpektraKernelParams &params) {
+  constexpr float kLog2Ten = 3.3219280948873623;
+  constexpr float kLnTen = 2.302585092994046;
+  if (params.spectralTransmittanceMode == 1u) {
+    return exp2(-density * kLog2Ten);
+  }
+  if (params.spectralTransmittanceMode == 2u) {
+    return fast::exp(-density * kLnTen);
+  }
+  return pow(10.0, -density);
 }
 
 static float spektra_preflash_filtered_enlarger_illuminant(
@@ -1383,7 +1416,7 @@ static float3 spektra_print_raw_from_film_density(
         bypassedFilmDensityCmy.b * filmChannelDensity[channelOffset + 2u] +
         filmBaseDensity[wavelength] +
         spektra_bleach_bypass_silver_spectral_density(retainedSilverDensity);
-      const float transmittance = pow(10.0, -densitySpectral);
+      const float transmittance = spektra_spectral_transmittance(densitySpectral, params);
       const float3 apd = max(float3(
         academyPrinterDensityData[channelOffset],
         academyPrinterDensityData[channelOffset + 1u],
@@ -1402,7 +1435,7 @@ static float3 spektra_print_raw_from_film_density(
       bypassedFilmDensityCmy.b * filmChannelDensity[channelOffset + 2u] +
       filmBaseDensity[wavelength] +
       spektra_bleach_bypass_silver_spectral_density(retainedSilverDensity);
-    const float lightRaw = pow(10.0, -densitySpectral) *
+    const float lightRaw = spektra_spectral_transmittance(densitySpectral, params) *
       spektra_filtered_enlarger_illuminant(wavelength, params, info, thKg3Illuminant, customEnlargerFilters, neutralPrintFilters);
     const float light = isfinite(lightRaw) ? lightRaw : 0.0;
     raw += light * spektra_sensitivity(wavelength, paperLogSensitivity);
@@ -1485,7 +1518,7 @@ static float3 spektra_print_raw_preflash(
     float3 normalization = float3(0.0);
     for (uint wavelength = 0u; wavelength < info.filmWavelengthCount; ++wavelength) {
       const uint channelOffset = wavelength * 3u;
-      const float transmittance = pow(10.0, -filmBaseDensity[wavelength]);
+      const float transmittance = spektra_spectral_transmittance(filmBaseDensity[wavelength], params);
       const float3 apd = max(float3(
         academyPrinterDensityData[channelOffset],
         academyPrinterDensityData[channelOffset + 1u],
@@ -1500,7 +1533,7 @@ static float3 spektra_print_raw_preflash(
   }
   for (uint wavelength = 0u; wavelength < info.filmWavelengthCount; ++wavelength) {
     const float densityBase = filmBaseDensity[wavelength];
-    const float lightRaw = pow(10.0, -densityBase) *
+    const float lightRaw = spektra_spectral_transmittance(densityBase, params) *
       spektra_preflash_filtered_enlarger_illuminant(wavelength, params, info, thKg3Illuminant, customEnlargerFilters, neutralPrintFilters);
     const float light = isfinite(lightRaw) ? lightRaw : 0.0;
     raw += light * spektra_sensitivity(wavelength, paperLogSensitivity);
@@ -1704,9 +1737,9 @@ static float3 spektra_develop_print_density(
   device const float *paperDensityCurves
 ) {
   const float3 density = float3(
-    spektra_interp_density_curve(logRaw.r, 0u, params.printGamma, paperCurveInfo, paperLogExposure, paperDensityCurves),
-    spektra_interp_density_curve(logRaw.g, 1u, params.printGamma, paperCurveInfo, paperLogExposure, paperDensityCurves),
-    spektra_interp_density_curve(logRaw.b, 2u, params.printGamma, paperCurveInfo, paperLogExposure, paperDensityCurves)
+    spektra_interp_density_curve(logRaw.r, 0u, params.printGamma, paperCurveInfo, paperLogExposure, paperDensityCurves, params.densityCurveLookupMode),
+    spektra_interp_density_curve(logRaw.g, 1u, params.printGamma, paperCurveInfo, paperLogExposure, paperDensityCurves, params.densityCurveLookupMode),
+    spektra_interp_density_curve(logRaw.b, 2u, params.printGamma, paperCurveInfo, paperLogExposure, paperDensityCurves, params.densityCurveLookupMode)
   );
   if (params.printShadowShape == 0.0 && params.printHighlightShape == 0.0) {
     return density;
@@ -1756,7 +1789,7 @@ static SpektraScanResult spektra_scan_density_to_output_rgb_linear_y(
       densityCmy.b * channelDensity[channelOffset + 2u] +
       baseDensity[wavelength] +
       spektra_bleach_bypass_silver_spectral_density(retainedSilverDensity);
-    const float lightRaw = pow(10.0, -densitySpectral) * scanIlluminant[wavelength];
+    const float lightRaw = spektra_spectral_transmittance(densitySpectral, params) * scanIlluminant[wavelength];
     const float light = isfinite(lightRaw) ? lightRaw : 0.0;
     const float3 cmf = float3(
       standardObserverCmfs[channelOffset],

@@ -295,6 +295,9 @@ struct KernelParams {
   float scannerBlurSigmaPx;
   float scannerUnsharpSigmaPx;
   float scannerUnsharpAmount;
+  uint32_t densityCurveLookupMode;
+  uint32_t spectralTransmittanceMode;
+  uint32_t _padPerf0;
   float time;
 };
 
@@ -361,6 +364,18 @@ enum class GrainSynthesisTargetStorageMode : uint32_t {
 enum class DirTailBackend : uint32_t {
   Fused = 0u,
   Mps = 1u,
+};
+
+enum class DensityCurveLookupMode : uint32_t {
+  Binary = 0u,
+  UniformLinear = 1u,
+  UniformNearest = 2u,
+};
+
+enum class SpectralTransmittanceMode : uint32_t {
+  Pow = 0u,
+  Exp2 = 1u,
+  FastExp = 2u,
 };
 
 struct KernelCurveInfo {
@@ -2198,6 +2213,8 @@ struct MetalRenderer::Impl {
   GrainSynthesisCellMode grainSynthesisCellMode = GrainSynthesisCellMode::OffsetList;
   GrainSynthesisTargetStorageMode grainSynthesisTargetStorageMode = GrainSynthesisTargetStorageMode::FloatBuffer;
   DirTailBackend dirTailBackend = DirTailBackend::Mps;
+  DensityCurveLookupMode densityCurveLookupMode = DensityCurveLookupMode::Binary;
+  SpectralTransmittanceMode spectralTransmittanceMode = SpectralTransmittanceMode::Pow;
   uint32_t grainSynthesisRadiusLutSize = 512u;
   uint32_t diffusionGroupSize = 2;
   float diffusionClusterSigmaRatio = 0.10f;
@@ -2206,6 +2223,8 @@ struct MetalRenderer::Impl {
   std::string blurDownsample = "auto";
   std::string intermediatePrecision = "float";
   std::string diffusionClusterSigma = "0.10";
+  std::string densityCurveLookup = "binary";
+  std::string spectralTransmittance = "pow";
   std::unordered_map<int, MPSImageGaussianBlur *> mpsGaussianBlurCache;
   uint32_t forcedThreadgroupWidth = 0;
   uint32_t forcedThreadgroupHeight = 0;
@@ -2717,6 +2736,27 @@ struct MetalRenderer::Impl {
       dirTailBackend = envString("SPEKTRAFILM_DIR_TAIL_BACKEND", "mps") == "mps"
         ? DirTailBackend::Mps
         : DirTailBackend::Fused;
+      densityCurveLookup = envString("SPEKTRAFILM_DENSITY_CURVE_LOOKUP", "binary");
+      if (densityCurveLookup == "uniform" || densityCurveLookup == "uniform-linear" || densityCurveLookup == "linear") {
+        densityCurveLookup = "uniform-linear";
+        densityCurveLookupMode = DensityCurveLookupMode::UniformLinear;
+      } else if (densityCurveLookup == "nearest" || densityCurveLookup == "uniform-nearest") {
+        densityCurveLookup = "uniform-nearest";
+        densityCurveLookupMode = DensityCurveLookupMode::UniformNearest;
+      } else {
+        densityCurveLookup = "binary";
+        densityCurveLookupMode = DensityCurveLookupMode::Binary;
+      }
+      spectralTransmittance = envString("SPEKTRAFILM_SPECTRAL_TRANSMITTANCE", "pow");
+      if (spectralTransmittance == "exp2") {
+        spectralTransmittanceMode = SpectralTransmittanceMode::Exp2;
+      } else if (spectralTransmittance == "fast-exp" || spectralTransmittance == "fast-exp2" || spectralTransmittance == "fast") {
+        spectralTransmittance = "fast-exp";
+        spectralTransmittanceMode = SpectralTransmittanceMode::FastExp;
+      } else {
+        spectralTransmittance = "pow";
+        spectralTransmittanceMode = SpectralTransmittanceMode::Pow;
+      }
       const std::string diffusionGroupSizeText = envString("SPEKTRAFILM_DIFFUSION_GROUP_SIZE", "2");
       if (diffusionGroupSizeText == "1") {
         diffusionGroupSize = 1u;
@@ -3072,6 +3112,8 @@ bool MetalRenderer::render(
     impl_->diagnostics.blurDownsample = impl_->blurDownsample;
     impl_->diagnostics.intermediatePrecision = impl_->intermediatePrecision;
     impl_->diagnostics.diffusionClusterSigma = impl_->diffusionClusterSigma;
+    impl_->diagnostics.densityCurveLookup = impl_->densityCurveLookup;
+    impl_->diagnostics.spectralTransmittance = impl_->spectralTransmittance;
     impl_->diagnostics.halationGroupedTail = impl_->halationGroupedTail;
     impl_->diagnostics.scannerMps = impl_->scannerMps;
     impl_->diagnostics.grainBlurRecurrence = impl_->grainBlurRecurrence;
@@ -3520,6 +3562,8 @@ bool MetalRenderer::render(
     }
 
     KernelParams kernelParams = toKernelParams(params, time, width, height);
+    kernelParams.densityCurveLookupMode = static_cast<uint32_t>(impl_->densityCurveLookupMode);
+    kernelParams.spectralTransmittanceMode = static_cast<uint32_t>(impl_->spectralTransmittanceMode);
     applyProfileHalationDefaults(kernelParams, params, *filmCurves);
     const KernelGaussianBlurInfo dirCoreBlurInfo = makeGaussianBlurInfo(
       std::max(kernelParams.dirCouplersDiffusionUm, 0.0f) / std::max(kernelParams.filmPixelSizeUm, 1.0e-6f),

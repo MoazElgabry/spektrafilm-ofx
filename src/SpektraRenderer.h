@@ -61,6 +61,8 @@ struct RendererDiagnostics {
   std::string intermediatePrecision = "float";
   std::string diffusionClusterSigma = "0.10";
   std::string dirTailBackend = "mps";
+  std::string densityCurveLookup = "binary";
+  std::string spectralTransmittance = "pow";
   std::vector<RendererPassDiagnostics> passes;
 };
 

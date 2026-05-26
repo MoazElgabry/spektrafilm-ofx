@@ -41,6 +41,8 @@ struct Options {
   std::string scannerMps = "0";
   std::string grainBlurRecurrence = "1";
   std::string dirTailBackend = "mps";
+  std::string densityCurveLookup = "binary";
+  std::string spectralTransmittance = "pow";
   std::string sourceFormat = "float";
   std::string destinationFormat = "float";
   std::string hostLayout = "contiguous";
@@ -74,6 +76,8 @@ void printUsage(const char *name) {
     << "       [--intermediate-precision float|half-blur] [--diffusion-cluster-sigma off|0.05|0.10]\n"
     << "       [--halation-grouped-tail 0|1] [--scanner-mps 0|1] [--grain-blur-recurrence 0|1]\n"
     << "       [--dir-tail-backend fused|mps]\n"
+    << "       [--density-curve-lookup binary|uniform-linear|uniform-nearest]\n"
+    << "       [--spectral-transmittance pow|exp2|fast-exp]\n"
     << "       [--grain-synthesis-samples N] [--grain-synthesis-layered on|off]\n"
     << "       [--grain-synthesis-radius-stddev X] [--grain-synthesis-observation-sigma-um X]\n"
     << "       [--grain-synthesis-sampler r2|antithetic|sobol-blue]\n"
@@ -284,6 +288,28 @@ bool parseArgs(int argc, const char **argv, Options &options) {
         return false;
       }
       options.dirTailBackend = mode;
+    } else if (arg == "--density-curve-lookup") {
+      const char *value = requireValue("--density-curve-lookup");
+      std::string mode = value ? std::string(value) : "";
+      if (mode == "uniform" || mode == "linear") {
+        mode = "uniform-linear";
+      } else if (mode == "nearest") {
+        mode = "uniform-nearest";
+      }
+      if (mode != "binary" && mode != "uniform-linear" && mode != "uniform-nearest") {
+        return false;
+      }
+      options.densityCurveLookup = mode;
+    } else if (arg == "--spectral-transmittance") {
+      const char *value = requireValue("--spectral-transmittance");
+      std::string mode = value ? std::string(value) : "";
+      if (mode == "fast" || mode == "fast-exp2") {
+        mode = "fast-exp";
+      }
+      if (mode != "pow" && mode != "exp2" && mode != "fast-exp") {
+        return false;
+      }
+      options.spectralTransmittance = mode;
     } else if (arg == "--detail") {
       options.detail = true;
     } else if (arg == "--pass-counters") {
@@ -601,6 +627,8 @@ int main(int argc, const char **argv) {
     setenv("SPEKTRAFILM_SCANNER_MPS", options.scannerMps.c_str(), 1);
     setenv("SPEKTRAFILM_GRAIN_BLUR_RECURRENCE", options.grainBlurRecurrence.c_str(), 1);
     setenv("SPEKTRAFILM_DIR_TAIL_BACKEND", options.dirTailBackend.c_str(), 1);
+    setenv("SPEKTRAFILM_DENSITY_CURVE_LOOKUP", options.densityCurveLookup.c_str(), 1);
+    setenv("SPEKTRAFILM_SPECTRAL_TRANSMITTANCE", options.spectralTransmittance.c_str(), 1);
     setenv("SPEKTRAFILM_PASS_TIMING", options.passTiming.c_str(), 1);
     setenv("SPEKTRAFILM_GRAIN_SYNTHESIS_SAMPLER", options.grainSynthesisSampler.c_str(), 1);
     setenv("SPEKTRAFILM_GRAIN_SYNTHESIS_RADIUS_LUT", options.grainSynthesisRadiusLut.c_str(), 1);
@@ -658,7 +686,7 @@ int main(int argc, const char **argv) {
       << "avg_private_scratch_alloc_bytes,avg_private_scratch_alloc_count,avg_upload_bytes,"
       << "source_no_copy,destination_no_copy,private_scratch,pass_gpu_timing,pass_timing_mode,threadgroup,diffusion_group_size,"
       << "scanner_image_storage,blur_backend,blur_downsample,intermediate_precision,diffusion_cluster_sigma,halation_grouped_tail,"
-      << "scanner_mps,grain_blur_recurrence,dir_tail_backend,source_format,destination_format,host_layout,grain_synthesis_sampler,grain_synthesis_radius_lut,grain_synthesis_target_storage,"
+      << "scanner_mps,grain_blur_recurrence,dir_tail_backend,density_curve_lookup,spectral_transmittance,source_format,destination_format,host_layout,grain_synthesis_sampler,grain_synthesis_radius_lut,grain_synthesis_target_storage,"
       << "grain_synthesis_cell_mode,halation,camera_diffusion,print_diffusion,dir,production_grain,final_post_process,mean_luma\n";
     std::vector<std::string> detailRows;
 
@@ -721,6 +749,8 @@ int main(int argc, const char **argv) {
       std::string intermediatePrecision = "float";
       std::string diffusionClusterSigma = "0.10";
       std::string dirTailBackend = "mps";
+      std::string densityCurveLookup = "binary";
+      std::string spectralTransmittance = "pow";
 
       for (int i = 0; i < options.iterations; ++i) {
         const auto start = Clock::now();
@@ -766,6 +796,8 @@ int main(int argc, const char **argv) {
         intermediatePrecision = diag.intermediatePrecision.empty() ? options.intermediatePrecision : diag.intermediatePrecision;
         diffusionClusterSigma = diag.diffusionClusterSigma.empty() ? options.diffusionClusterSigma : diag.diffusionClusterSigma;
         dirTailBackend = diag.dirTailBackend.empty() ? options.dirTailBackend : diag.dirTailBackend;
+        densityCurveLookup = diag.densityCurveLookup.empty() ? options.densityCurveLookup : diag.densityCurveLookup;
+        spectralTransmittance = diag.spectralTransmittance.empty() ? options.spectralTransmittance : diag.spectralTransmittance;
         if (options.detail) {
           for (size_t passIndex = 0; passIndex < diag.passes.size(); ++passIndex) {
             const spektrafilm::MetalPassDiagnostics &pass = diag.passes[passIndex];
@@ -828,6 +860,8 @@ int main(int argc, const char **argv) {
                 << (scannerMps ? 1 : 0) << ','
                 << (grainBlurRecurrence ? 1 : 0) << ','
                 << dirTailBackend << ','
+                << densityCurveLookup << ','
+                << spectralTransmittance << ','
                 << options.sourceFormat << ','
                 << options.destinationFormat << ','
                 << options.hostLayout << ','
