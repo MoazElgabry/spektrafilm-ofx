@@ -10,7 +10,19 @@
 #include "ofxMultiThread.h"
 #include "ofxParam.h"
 
-#include <ApplicationServices/ApplicationServices.h>
+#if defined __APPLE__
+#  include <ApplicationServices/ApplicationServices.h>
+#  include <dlfcn.h>
+#elif defined _WIN32
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
+#  include <shellapi.h>
+#endif
 
 #include <algorithm>
 #include <cctype>
@@ -19,7 +31,6 @@
 #include <cstdint>
 #include <cstring>
 #include <ctime>
-#include <dlfcn.h>
 #include <fstream>
 #include <filesystem>
 #include <iomanip>
@@ -31,13 +42,16 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <unordered_map>
 #include <vector>
 
 #if defined __APPLE__
 #  define SPEKTRA_EXPORT __attribute__((visibility("default")))
+#elif defined _WIN32
+#  define SPEKTRA_EXPORT __declspec(dllexport)
 #else
-#  error spektrafilm OFX currently builds on macOS only.
+#  define SPEKTRA_EXPORT
 #endif
 
 #ifndef kOfxBitDepthHalf
@@ -45,7 +59,7 @@
 #endif
 
 #ifndef SPEKTRAFILM_VERSION_STRING
-#  define SPEKTRAFILM_VERSION_STRING "0.1.0"
+#  define SPEKTRAFILM_VERSION_STRING "0.2.0"
 #endif
 
 #ifndef SPEKTRAFILM_PLUGIN_IDENTIFIER
@@ -65,7 +79,7 @@ namespace {
 constexpr const char *kPluginIdentifier = SPEKTRAFILM_PLUGIN_IDENTIFIER;
 constexpr const char *kPluginLabel = SPEKTRAFILM_PLUGIN_LABEL;
 constexpr int kPluginVersionMajor = 0;
-constexpr int kPluginVersionMinor = 1;
+constexpr int kPluginVersionMinor = 2;
 
 OfxHost *gHost = nullptr;
 OfxImageEffectSuiteV1 *gEffectHost = nullptr;
@@ -302,6 +316,7 @@ bool parameterVisibleInFlavor(const ParamMetadata &metadata) {
 }
 
 bool shouldDefineParam(const char *name) {
+  (void)name;
   return true;
 }
 
@@ -431,7 +446,7 @@ inline constexpr ParamDefault kParamDefaults[] = {
   intDefault("printTiming", 0),
   doubleDefault("printPushPullStops", 0.0),
   doubleDefault("printBleachBypassAmount", 0.0),
-  doubleDefault("printExposureEv", 1.0),
+  doubleDefault("printExposureEv", 0.0),
   doubleDefault("printGamma", 1.0),
   doubleDefault("printShadowShape", 0.0),
   doubleDefault("printHighlightShape", 0.0),
@@ -1153,7 +1168,7 @@ spektrafilm::RenderParams readParams(InstanceData *data, OfxTime time) {
   params.filmExposureEv = static_cast<float>(getDoubleAtTime(data->filmExposureEv, time, 0.0));
   params.autoExposure = getBoolAtTime(data->autoExposure, time, false);
   params.autoExposureMethod = static_cast<spektrafilm::AutoExposureMethod>(getIntAtTime(data->autoExposureMethod, time, 0));
-  params.printExposureEv = static_cast<float>(getDoubleAtTime(data->printExposureEv, time, 1.0));
+  params.printExposureEv = static_cast<float>(getDoubleAtTime(data->printExposureEv, time, 0.0));
   params.filmPushPullMode = static_cast<spektrafilm::PushPullMode>(getIntAtTime(data->filmPushPullMode, time, 0));
   params.filmPushPullStops = static_cast<float>(getDoubleAtTime(data->filmPushPullStops, time, 0.0));
   params.printPushPullStops = static_cast<float>(getDoubleAtTime(data->printPushPullStops, time, 0.0));
@@ -1215,7 +1230,7 @@ spektrafilm::RenderParams readParams(InstanceData *data, OfxTime time) {
   params.dirCouplersGammaGToB = static_cast<float>(dirGammaGToRb[1]);
   params.dirCouplersGammaBToR = static_cast<float>(dirGammaBToRg[0]);
   params.dirCouplersGammaBToG = static_cast<float>(dirGammaBToRg[1]);
-  params.grainEnabled = getBoolAtTime(data->grainEnabled, time, true);
+  params.grainEnabled = getBoolAtTime(data->grainEnabled, time, false);
   params.grainModel = static_cast<spektrafilm::GrainModel>(getIntAtTime(data->grainModel, time, 0));
   if (!flavorAllowsDevelopmentControls() && params.grainModel == spektrafilm::GrainModel::GrainSynthesis) {
     params.grainModel = spektrafilm::GrainModel::Preview;
@@ -1545,6 +1560,7 @@ bool deleteDefaultsFile(std::string &error) {
   return deleteSnapshotFile(userDefaultsPath(), error);
 }
 
+#if defined __APPLE__
 std::string clipboardStatusMessage(const char *prefix, OSStatus status) {
   return std::string(prefix) + " (clipboard status " + std::to_string(static_cast<long long>(status)) + ").";
 }
@@ -1624,6 +1640,168 @@ bool readTextFromClipboard(std::string &text, bool &found, std::string &error) {
   CFRelease(pasteboard);
   return true;
 }
+#elif defined _WIN32
+std::string clipboardStatusMessage(const char *prefix, DWORD status) {
+  return std::string(prefix) + " (Win32 error " + std::to_string(static_cast<unsigned long>(status)) + ").";
+}
+
+UINT spektraClipboardFormat() {
+  return RegisterClipboardFormatA("com.spektrafilm.ofx-params");
+}
+
+bool writeClipboardBytes(UINT format, const std::string &text, std::string &error) {
+  if (format == 0) {
+    error = clipboardStatusMessage("Could not register spektrafilm clipboard format", GetLastError());
+    return false;
+  }
+
+  constexpr uint64_t headerSize = sizeof(uint64_t);
+  const uint64_t textSize = static_cast<uint64_t>(text.size());
+  if (textSize > static_cast<uint64_t>(std::numeric_limits<SIZE_T>::max() - headerSize)) {
+    error = "spektrafilm params are too large for the system clipboard.";
+    return false;
+  }
+
+  const SIZE_T allocationSize = static_cast<SIZE_T>(headerSize + textSize);
+  HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, allocationSize);
+  if (!memory) {
+    error = clipboardStatusMessage("Could not allocate system clipboard memory", GetLastError());
+    return false;
+  }
+
+  void *locked = GlobalLock(memory);
+  if (!locked) {
+    error = clipboardStatusMessage("Could not lock system clipboard memory", GetLastError());
+    GlobalFree(memory);
+    return false;
+  }
+  std::memcpy(locked, &textSize, sizeof(textSize));
+  if (!text.empty()) {
+    std::memcpy(static_cast<uint8_t *>(locked) + headerSize, text.data(), text.size());
+  }
+  GlobalUnlock(memory);
+
+  if (!SetClipboardData(format, memory)) {
+    error = clipboardStatusMessage("Could not write spektrafilm params to system clipboard", GetLastError());
+    GlobalFree(memory);
+    return false;
+  }
+  return true;
+}
+
+void writeClipboardTextFallback(const std::string &text) {
+  HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, static_cast<SIZE_T>(text.size() + 1u));
+  if (!memory) {
+    return;
+  }
+  void *locked = GlobalLock(memory);
+  if (!locked) {
+    GlobalFree(memory);
+    return;
+  }
+  std::memcpy(locked, text.data(), text.size());
+  static_cast<char *>(locked)[text.size()] = '\0';
+  GlobalUnlock(memory);
+  if (!SetClipboardData(CF_TEXT, memory)) {
+    GlobalFree(memory);
+  }
+}
+
+bool writeTextToClipboard(const std::string &text, std::string &error) {
+  error.clear();
+  if (!OpenClipboard(nullptr)) {
+    error = clipboardStatusMessage("Could not open system clipboard", GetLastError());
+    return false;
+  }
+
+  if (!EmptyClipboard()) {
+    error = clipboardStatusMessage("Could not clear system clipboard", GetLastError());
+    CloseClipboard();
+    return false;
+  }
+
+  const bool wroteBytes = writeClipboardBytes(spektraClipboardFormat(), text, error);
+  if (wroteBytes) {
+    writeClipboardTextFallback(text);
+  }
+  CloseClipboard();
+  return wroteBytes;
+}
+
+bool readClipboardBytes(UINT format, std::string &text) {
+  if (format == 0 || !IsClipboardFormatAvailable(format)) {
+    return false;
+  }
+  HGLOBAL memory = GetClipboardData(format);
+  if (!memory) {
+    return false;
+  }
+  const SIZE_T allocationSize = GlobalSize(memory);
+  if (allocationSize < sizeof(uint64_t)) {
+    return false;
+  }
+  void *locked = GlobalLock(memory);
+  if (!locked) {
+    return false;
+  }
+
+  uint64_t textSize = 0;
+  std::memcpy(&textSize, locked, sizeof(textSize));
+  const SIZE_T payloadSize = allocationSize - sizeof(uint64_t);
+  if (textSize > static_cast<uint64_t>(payloadSize)) {
+    GlobalUnlock(memory);
+    return false;
+  }
+
+  const auto *bytes = static_cast<const char *>(locked) + sizeof(uint64_t);
+  text.assign(bytes, static_cast<size_t>(textSize));
+  GlobalUnlock(memory);
+  return true;
+}
+
+bool readClipboardTextFallback(std::string &text) {
+  if (!IsClipboardFormatAvailable(CF_TEXT)) {
+    return false;
+  }
+  HGLOBAL memory = GetClipboardData(CF_TEXT);
+  if (!memory) {
+    return false;
+  }
+  const char *locked = static_cast<const char *>(GlobalLock(memory));
+  if (!locked) {
+    return false;
+  }
+  text.assign(locked);
+  GlobalUnlock(memory);
+  return true;
+}
+
+bool readTextFromClipboard(std::string &text, bool &found, std::string &error) {
+  text.clear();
+  found = false;
+  error.clear();
+  if (!OpenClipboard(nullptr)) {
+    error = clipboardStatusMessage("Could not open system clipboard", GetLastError());
+    return false;
+  }
+
+  found = readClipboardBytes(spektraClipboardFormat(), text) || readClipboardTextFallback(text);
+  CloseClipboard();
+  return true;
+}
+#else
+bool writeTextToClipboard(const std::string &, std::string &error) {
+  error = "Writing spektrafilm params to the system clipboard is not implemented on this platform.";
+  return false;
+}
+
+bool readTextFromClipboard(std::string &text, bool &found, std::string &error) {
+  text.clear();
+  found = false;
+  error = "Reading spektrafilm params from the system clipboard is not implemented on this platform.";
+  return false;
+}
+#endif
 
 void showMessage(OfxImageEffectHandle effect, const char *type, const char *id, const std::string &message) {
   if (gMessageHost) {
@@ -2277,6 +2455,7 @@ std::filesystem::path generatedLutExportPath(int destination, const std::string 
 }
 
 std::filesystem::path bundledUserManualPath() {
+#if defined __APPLE__
   Dl_info imageInfo{};
   if (dladdr(&gPluginImageAnchor, &imageInfo) == 0 || !imageInfo.dli_fname) {
     return {};
@@ -2287,6 +2466,36 @@ std::filesystem::path bundledUserManualPath() {
     return {};
   }
   return contentsPath / "Resources" / "manual.pdf";
+#elif defined _WIN32
+  HMODULE module = nullptr;
+  if (!GetModuleHandleExW(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCWSTR>(&gPluginImageAnchor),
+        &module
+      )) {
+    return {};
+  }
+
+  std::vector<wchar_t> buffer(MAX_PATH);
+  for (;;) {
+    const DWORD length = GetModuleFileNameW(module, buffer.data(), static_cast<DWORD>(buffer.size()));
+    if (length == 0) {
+      return {};
+    }
+    if (length < buffer.size() - 1) {
+      const std::filesystem::path imagePath(std::wstring(buffer.data(), length));
+      const std::filesystem::path contentsPath = imagePath.parent_path().parent_path();
+      if (contentsPath.empty()) {
+        return {};
+      }
+      return contentsPath / "Resources" / "manual.pdf";
+    }
+    buffer.resize(buffer.size() * 2u);
+  }
+  return {};
+#else
+  return {};
+#endif
 }
 
 bool openBundledUserManual(std::string &error) {
@@ -2296,6 +2505,7 @@ bool openBundledUserManual(std::string &error) {
     return false;
   }
 
+#if defined __APPLE__
   const std::string pathString = manualPath.string();
   CFURLRef manualUrl = CFURLCreateFromFileSystemRepresentation(
     kCFAllocatorDefault,
@@ -2315,6 +2525,25 @@ bool openBundledUserManual(std::string &error) {
     return false;
   }
   return true;
+#elif defined _WIN32
+  const HINSTANCE result = ShellExecuteW(
+    nullptr,
+    L"open",
+    manualPath.wstring().c_str(),
+    nullptr,
+    nullptr,
+    SW_SHOWNORMAL
+  );
+  if (reinterpret_cast<intptr_t>(result) <= 32) {
+    error = "Could not open the spektrafilm user manual. ShellExecute returned " +
+      std::to_string(reinterpret_cast<intptr_t>(result)) + ".";
+    return false;
+  }
+  return true;
+#else
+  error = "Opening the spektrafilm user manual is not implemented on this platform.";
+  return false;
+#endif
 }
 
 std::string getStringValue(OfxParamHandle handle) {
@@ -3559,7 +3788,7 @@ OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHandle) {
   const char *autoExposureMethods[] = {"Center weighted", "Median"};
   defineChoice(paramSet, "autoExposureMethod", "Auto Exposure Meter", autoExposureMethods, 2, 0, "filmGroup");
   defineDouble(paramSet, "filmGamma", "Gamma", 1.0, 0.1, 2.0, "filmGroup");
-  defineDouble(paramSet, "printExposureEv", "Exposure EV", 1.0, -5.0, 5.0, "printGroup");
+  defineDouble(paramSet, "printExposureEv", "Exposure EV", 0.0, -5.0, 5.0, "printGroup");
   defineDouble(paramSet, "printGamma", "Gamma", 1.0, 0.1, 2.0, "printGroup");
   defineDouble(paramSet, "printShadowShape", "Shadow Shape", 0.0, -1.0, 1.0, "printGroup");
   defineDouble(paramSet, "printHighlightShape", "Highlight Shape", 0.0, -1.0, 1.0, "printGroup");
@@ -3694,8 +3923,12 @@ OfxStatus describe(OfxImageEffectHandle effect) {
   gPropHost->propSetString(props, kOfxPropIcon, 1, pngIconFileForFlavor());
   gPropHost->propSetString(props, kOfxImageEffectPluginPropGrouping, 0, "spektrafilm OFX");
   gPropHost->propSetString(props, kOfxImageEffectPropSupportedContexts, 0, kOfxImageEffectContextFilter);
+#if defined(_WIN32)
+  gPropHost->propSetString(props, kOfxImageEffectPropSupportedPixelDepths, 0, kOfxBitDepthHalf);
+#else
   gPropHost->propSetString(props, kOfxImageEffectPropSupportedPixelDepths, 0, kOfxBitDepthHalf);
   gPropHost->propSetString(props, kOfxImageEffectPropSupportedPixelDepths, 1, kOfxBitDepthFloat);
+#endif
   gPropHost->propSetString(props, kOfxImageEffectPropColourManagementStyle, 0, kOfxImageEffectColourManagementCore);
   gPropHost->propSetString(props, kOfxImageEffectPropColourManagementAvailableConfigs, 0, kOfxConfigIdentifier);
   gPropHost->propSetInt(props, kOfxImageEffectPropSupportsMultipleClipDepths, 0, 0);
@@ -3774,6 +4007,11 @@ SPEKTRA_EXPORT OfxPlugin *OfxGetPlugin(int nth) {
 
 SPEKTRA_EXPORT int OfxGetNumberOfPlugins(void) {
   return 1;
+}
+
+SPEKTRA_EXPORT OfxStatus OfxSetHost(const OfxHost *host) {
+  setHost(const_cast<OfxHost *>(host));
+  return kOfxStatOK;
 }
 
 }

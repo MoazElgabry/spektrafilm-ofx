@@ -985,8 +985,6 @@ static float spektra_interp_density_curve(
 static float3 spektra_hanatos_raw(
   float3 xyz,
   constant SpektraSpectralInfo &info,
-  device const float *logSensitivity,
-  device const float *bandpassHanatos2025,
   device const float *hanatosRawResponseLut
 ) {
   const float b = xyz.x + xyz.y + xyz.z;
@@ -1036,8 +1034,6 @@ static float3 spektra_hanatos_raw(
 
 static float3 spektra_mallett_raw(
   float3 linearSrgb,
-  constant SpektraSpectralInfo &info,
-  device const float *logSensitivity,
   device const float *mallettRawMatrix
 ) {
   const float3 srgb = max(linearSrgb, float3(0.0));
@@ -1046,6 +1042,27 @@ static float3 spektra_mallett_raw(
     mallettRawMatrix[3u] * srgb.r + mallettRawMatrix[4u] * srgb.g + mallettRawMatrix[5u] * srgb.b,
     mallettRawMatrix[6u] * srgb.r + mallettRawMatrix[7u] * srgb.g + mallettRawMatrix[8u] * srgb.b
   );
+}
+
+static float3 spektra_film_raw_from_decoded(
+  float3 decoded,
+  constant SpektraKernelParams &params,
+  constant SpektraColorInfo &colorInfo,
+  constant SpektraSpectralInfo &info,
+  device const float *hanatosSpectraLut,
+  device const float *mallettBasisIlluminant,
+  device const float *inputToReferenceXyz,
+  device const float *inputToSrgb
+) {
+  float3 raw;
+  if (params.rgbToRawMethod == 1) {
+    const float3 srgb = spektra_mul_color_matrix(decoded, params.inputColorSpace, colorInfo, inputToSrgb);
+    raw = spektra_mallett_raw(srgb, mallettBasisIlluminant);
+  } else {
+    const float3 xyz = spektra_mul_color_matrix(decoded, params.inputColorSpace, colorInfo, inputToReferenceXyz);
+    raw = spektra_hanatos_raw(xyz, info, hanatosSpectraLut);
+  }
+  return max(raw * exp2(params.filmExposureEv + params.autoExposureEv), float3(0.0));
 }
 
 static float3 spektra_film_raw(
@@ -1062,13 +1079,19 @@ static float3 spektra_film_raw(
   device const float *decodeLuts,
   device const uint *transferKinds
 ) {
+  (void)logSensitivity;
+  (void)bandpassHanatos2025;
   const float3 decoded = spektra_decode_input_rgb(rgb, params, colorInfo, decodeLuts, transferKinds);
-  const float3 xyz = spektra_mul_color_matrix(decoded, params.inputColorSpace, colorInfo, inputToReferenceXyz);
-  const float3 srgb = spektra_mul_color_matrix(decoded, params.inputColorSpace, colorInfo, inputToSrgb);
-  const float3 raw = params.rgbToRawMethod == 1
-    ? spektra_mallett_raw(srgb, info, logSensitivity, mallettBasisIlluminant)
-    : spektra_hanatos_raw(xyz, info, logSensitivity, bandpassHanatos2025, hanatosSpectraLut);
-  return max(raw * exp2(params.filmExposureEv + params.autoExposureEv), float3(0.0));
+  return spektra_film_raw_from_decoded(
+    decoded,
+    params,
+    colorInfo,
+    info,
+    hanatosSpectraLut,
+    mallettBasisIlluminant,
+    inputToReferenceXyz,
+    inputToSrgb
+  );
 }
 
 static float3 spektra_film_log_raw(
@@ -1115,10 +1138,15 @@ static float3 spektra_film_log_raw_linear_srgb(
 ) {
   constexpr int kLinearSrgbColorSpace = 15;
   const float3 rgb = max(linearSrgb, float3(0.0));
-  const float3 xyz = spektra_mul_color_matrix(rgb, kLinearSrgbColorSpace, colorInfo, inputToReferenceXyz);
-  const float3 raw = rgbToRawMethod == 1
-    ? spektra_mallett_raw(rgb, info, logSensitivity, mallettBasisIlluminant)
-    : spektra_hanatos_raw(xyz, info, logSensitivity, bandpassHanatos2025, hanatosSpectraLut);
+  (void)logSensitivity;
+  (void)bandpassHanatos2025;
+  float3 raw;
+  if (rgbToRawMethod == 1) {
+    raw = spektra_mallett_raw(rgb, mallettBasisIlluminant);
+  } else {
+    const float3 xyz = spektra_mul_color_matrix(rgb, kLinearSrgbColorSpace, colorInfo, inputToReferenceXyz);
+    raw = spektra_hanatos_raw(xyz, info, hanatosSpectraLut);
+  }
   return log10(max(raw, float3(0.0)) + float3(1.0e-10));
 }
 
@@ -3301,6 +3329,53 @@ kernel void spektrafilm_halation_scatter_tail_blur_y(
   rawOut[index] = float4(rawOut[index].rgb + spektra_halation_scatter_tail_weight(component) * blurred.rgb, blurred.a);
 }
 
+kernel void spektrafilm_halation_scatter_tail_group_blur_x(
+  device const float4 *rawIn [[buffer(0)]],
+  device float4 *tailOut [[buffer(1)]],
+  constant SpektraKernelParams &params [[buffer(2)]],
+  constant uint2 &dims [[buffer(3)]],
+  uint2 gid [[thread_position_in_grid]]
+) {
+  if (gid.x >= dims.x || gid.y >= dims.y) {
+    return;
+  }
+  const uint index = gid.y * dims.x + gid.x;
+  const uint pixelCount = dims.x * dims.y;
+  tailOut[index] = spektra_channel_gaussian_sample_x(
+    rawIn, dims.x, dims.y, gid, spektra_halation_scatter_tail_sigma(params, 0u));
+  tailOut[pixelCount + index] = spektra_channel_gaussian_sample_x(
+    rawIn, dims.x, dims.y, gid, spektra_halation_scatter_tail_sigma(params, 1u));
+  tailOut[pixelCount * 2u + index] = spektra_channel_gaussian_sample_x(
+    rawIn, dims.x, dims.y, gid, spektra_halation_scatter_tail_sigma(params, 2u));
+}
+
+kernel void spektrafilm_halation_scatter_tail_group_blur_y(
+  device const float4 *tailIn [[buffer(0)]],
+  device float4 *accumInOut [[buffer(1)]],
+  constant SpektraKernelParams &params [[buffer(2)]],
+  constant uint2 &dims [[buffer(3)]],
+  uint2 gid [[thread_position_in_grid]]
+) {
+  if (gid.x >= dims.x || gid.y >= dims.y) {
+    return;
+  }
+  const uint index = gid.y * dims.x + gid.x;
+  const uint pixelCount = dims.x * dims.y;
+  const float4 blurred0 = spektra_channel_gaussian_sample_y(
+    tailIn, dims.x, dims.y, gid, spektra_halation_scatter_tail_sigma(params, 0u));
+  const float4 blurred1 = spektra_channel_gaussian_sample_y(
+    tailIn + pixelCount, dims.x, dims.y, gid, spektra_halation_scatter_tail_sigma(params, 1u));
+  const float4 blurred2 = spektra_channel_gaussian_sample_y(
+    tailIn + pixelCount * 2u, dims.x, dims.y, gid, spektra_halation_scatter_tail_sigma(params, 2u));
+  accumInOut[index] = float4(
+    accumInOut[index].rgb +
+      spektra_halation_scatter_tail_weight(0u) * blurred0.rgb +
+      spektra_halation_scatter_tail_weight(1u) * blurred1.rgb +
+      spektra_halation_scatter_tail_weight(2u) * blurred2.rgb,
+    blurred0.a
+  );
+}
+
 kernel void spektrafilm_halation_scatter_resolve(
   device const float4 *rawIn [[buffer(0)]],
   device const float4 *coreIn [[buffer(1)]],
@@ -3662,6 +3737,73 @@ static float4 spektra_scalar_gaussian_sample_y(
   return spektra_scalar_gaussian_sample_y_limited(source, width, height, gid, sigma, 256);
 }
 
+static float spektra_layer_gaussian_sample_x_limited(
+  device const float *source,
+  uint width,
+  uint height,
+  uint2 gid,
+  uint component,
+  float sigma,
+  int radiusLimit
+) {
+  const SpektraGaussianBlurInfo info = spektra_make_gaussian_blur_info(sigma, radiusLimit);
+  const uint index = gid.y * width + gid.x;
+  if (info.active == 0u || info.radius == 0u) {
+    return source[index * 9u + component];
+  }
+  const int x = int(gid.x);
+  const int y = int(gid.y);
+  const int radius = int(info.radius);
+  const bool interior = x >= radius && x + radius < int(width);
+  float value = source[index * 9u + component];
+  float weight = info.firstWeight;
+  float ratio = info.firstRatio;
+  for (int offset = 1; offset <= radius; ++offset) {
+    const float samplePair = interior
+      ? source[(index - uint(offset)) * 9u + component] + source[(index + uint(offset)) * 9u + component]
+      : spektra_layer_buffer_sample(source, width, height, x - offset, y, component) +
+        spektra_layer_buffer_sample(source, width, height, x + offset, y, component);
+    value += weight * samplePair;
+    weight *= ratio;
+    ratio *= info.ratioStep;
+  }
+  return value * info.invWeightSum;
+}
+
+static float spektra_layer_gaussian_sample_y_limited(
+  device const float *source,
+  uint width,
+  uint height,
+  uint2 gid,
+  uint component,
+  float sigma,
+  int radiusLimit
+) {
+  const SpektraGaussianBlurInfo info = spektra_make_gaussian_blur_info(sigma, radiusLimit);
+  const uint index = gid.y * width + gid.x;
+  if (info.active == 0u || info.radius == 0u) {
+    return source[index * 9u + component];
+  }
+  const int x = int(gid.x);
+  const int y = int(gid.y);
+  const int radius = int(info.radius);
+  const bool interior = y >= radius && y + radius < int(height);
+  float value = source[index * 9u + component];
+  float weight = info.firstWeight;
+  float ratio = info.firstRatio;
+  for (int offset = 1; offset <= radius; ++offset) {
+    const uint stride = uint(offset) * width;
+    const float samplePair = interior
+      ? source[(index - stride) * 9u + component] + source[(index + stride) * 9u + component]
+      : spektra_layer_buffer_sample(source, width, height, x, y - offset, component) +
+        spektra_layer_buffer_sample(source, width, height, x, y + offset, component);
+    value += weight * samplePair;
+    weight *= ratio;
+    ratio *= info.ratioStep;
+  }
+  return value * info.invWeightSum;
+}
+
 kernel void spektrafilm_diffusion_component_blur_x(
   device const float4 *source [[buffer(0)]],
   device float4 *tempOut [[buffer(1)]],
@@ -3751,6 +3893,400 @@ kernel void spektrafilm_diffusion_group_blur_y_accumulate(
     } else {
       blurred = spektra_scalar_gaussian_sample_y(plane, dims.x, dims.y, gid, sigma);
     }
+    accum = float4(
+      accum.rgb + blurred.rgb * float3(component.weightR, component.weightG, component.weightB),
+      blurred.a
+    );
+  }
+  accumInOut[index] = accum;
+}
+
+kernel void spektrafilm_diffusion_downsample(
+  device const float4 *source [[buffer(0)]],
+  device float4 *destination [[buffer(1)]],
+  constant uint2 &fullDims [[buffer(2)]],
+  constant uint2 &reducedDims [[buffer(3)]],
+  constant uint &scaleIn [[buffer(4)]],
+  uint2 gid [[thread_position_in_grid]]
+) {
+  if (gid.x >= reducedDims.x || gid.y >= reducedDims.y) {
+    return;
+  }
+  const uint scale = max(scaleIn, 1u);
+  float4 value = float4(0.0);
+  float weightSum = 0.0;
+  const int baseX = int(gid.x * scale);
+  const int baseY = int(gid.y * scale);
+  for (uint oy = 0u; oy < scale; ++oy) {
+    for (uint ox = 0u; ox < scale; ++ox) {
+      const int x = min(baseX + int(ox), int(fullDims.x) - 1);
+      const int y = min(baseY + int(oy), int(fullDims.y) - 1);
+      value += spektra_float4_buffer_sample(source, fullDims.x, fullDims.y, x, y);
+      weightSum += 1.0;
+    }
+  }
+  destination[gid.y * reducedDims.x + gid.x] = value / max(weightSum, 1.0e-8);
+}
+
+kernel void spektrafilm_diffusion_downsample_blur_x(
+  device const float4 *source [[buffer(0)]],
+  device float4 *destination [[buffer(1)]],
+  device const SpektraDiffusionComponent *components [[buffer(2)]],
+  constant uint2 &reducedDims [[buffer(3)]],
+  constant uint &componentIndex [[buffer(4)]],
+  constant float &sigmaScale [[buffer(5)]],
+  uint2 gid [[thread_position_in_grid]]
+) {
+  if (gid.x >= reducedDims.x || gid.y >= reducedDims.y) {
+    return;
+  }
+  const SpektraDiffusionComponent component = components[componentIndex];
+  const float sigma = max(component.sigmaPx * sigmaScale, 1.0e-6);
+  destination[gid.y * reducedDims.x + gid.x] = spektra_scalar_gaussian_sample_x(
+    source, reducedDims.x, reducedDims.y, gid, sigma);
+}
+
+kernel void spektrafilm_diffusion_downsample_blur_y(
+  device const float4 *source [[buffer(0)]],
+  device float4 *destination [[buffer(1)]],
+  device const SpektraDiffusionComponent *components [[buffer(2)]],
+  constant uint2 &reducedDims [[buffer(3)]],
+  constant uint &componentIndex [[buffer(4)]],
+  constant float &sigmaScale [[buffer(5)]],
+  uint2 gid [[thread_position_in_grid]]
+) {
+  if (gid.x >= reducedDims.x || gid.y >= reducedDims.y) {
+    return;
+  }
+  const SpektraDiffusionComponent component = components[componentIndex];
+  const float sigma = max(component.sigmaPx * sigmaScale, 1.0e-6);
+  destination[gid.y * reducedDims.x + gid.x] = spektra_scalar_gaussian_sample_y(
+    source, reducedDims.x, reducedDims.y, gid, sigma);
+}
+
+static float4 spektra_reduced_bilinear_sample(
+  device const float4 *source,
+  uint2 reducedDims,
+  float2 coord
+) {
+  const float2 clamped = clamp(coord, float2(0.0), float2(max(float(reducedDims.x) - 1.0, 0.0), max(float(reducedDims.y) - 1.0, 0.0)));
+  const int x0 = int(floor(clamped.x));
+  const int y0 = int(floor(clamped.y));
+  const int x1 = min(x0 + 1, int(reducedDims.x) - 1);
+  const int y1 = min(y0 + 1, int(reducedDims.y) - 1);
+  const float tx = clamped.x - float(x0);
+  const float ty = clamped.y - float(y0);
+  const float4 p00 = source[uint(y0) * reducedDims.x + uint(x0)];
+  const float4 p10 = source[uint(y0) * reducedDims.x + uint(x1)];
+  const float4 p01 = source[uint(y1) * reducedDims.x + uint(x0)];
+  const float4 p11 = source[uint(y1) * reducedDims.x + uint(x1)];
+  return mix(mix(p00, p10, tx), mix(p01, p11, tx), ty);
+}
+
+kernel void spektrafilm_diffusion_downsample_upsample_accumulate(
+  device const float4 *reducedBlur [[buffer(0)]],
+  device float4 *accumInOut [[buffer(1)]],
+  device const SpektraDiffusionComponent *components [[buffer(2)]],
+  constant uint2 &fullDims [[buffer(3)]],
+  constant uint2 &reducedDims [[buffer(4)]],
+  constant uint &componentIndex [[buffer(5)]],
+  constant uint &scaleIn [[buffer(6)]],
+  uint2 gid [[thread_position_in_grid]]
+) {
+  if (gid.x >= fullDims.x || gid.y >= fullDims.y) {
+    return;
+  }
+  const uint index = gid.y * fullDims.x + gid.x;
+  const uint scale = max(scaleIn, 1u);
+  const float2 coord = (float2(float(gid.x), float(gid.y)) + 0.5) / float(scale) - 0.5;
+  const SpektraDiffusionComponent component = components[componentIndex];
+  const float4 blurred = spektra_reduced_bilinear_sample(reducedBlur, reducedDims, coord);
+  accumInOut[index] = float4(
+    accumInOut[index].rgb + blurred.rgb * float3(component.weightR, component.weightG, component.weightB),
+    blurred.a
+  );
+}
+
+kernel void spektrafilm_diffusion_downsample_group_blur_x(
+  device const float4 *source [[buffer(0)]],
+  device float4 *tempOut [[buffer(1)]],
+  device const SpektraDiffusionComponent *components [[buffer(2)]],
+  constant uint2 &reducedDims [[buffer(3)]],
+  constant uint2 &componentRange [[buffer(4)]],
+  constant float &sigmaScale [[buffer(5)]],
+  uint2 gid [[thread_position_in_grid]]
+) {
+  if (gid.x >= reducedDims.x || gid.y >= reducedDims.y) {
+    return;
+  }
+  const uint index = gid.y * reducedDims.x + gid.x;
+  const uint pixelCount = reducedDims.x * reducedDims.y;
+  const uint componentStart = componentRange.x;
+  const uint groupCount = min(componentRange.y, 4u);
+  for (uint slot = 0u; slot < groupCount; ++slot) {
+    const SpektraDiffusionComponent component = components[componentStart + slot];
+    const float sigma = max(component.sigmaPx * sigmaScale, 1.0e-6);
+    tempOut[slot * pixelCount + index] = sigma <= 1.0e-4
+      ? source[index]
+      : spektra_scalar_gaussian_sample_x(source, reducedDims.x, reducedDims.y, gid, sigma);
+  }
+}
+
+kernel void spektrafilm_diffusion_downsample_group_blur_y(
+  device const float4 *tempIn [[buffer(0)]],
+  device float4 *blurOut [[buffer(1)]],
+  device const SpektraDiffusionComponent *components [[buffer(2)]],
+  constant uint2 &reducedDims [[buffer(3)]],
+  constant uint2 &componentRange [[buffer(4)]],
+  constant float &sigmaScale [[buffer(5)]],
+  uint2 gid [[thread_position_in_grid]]
+) {
+  if (gid.x >= reducedDims.x || gid.y >= reducedDims.y) {
+    return;
+  }
+  const uint index = gid.y * reducedDims.x + gid.x;
+  const uint pixelCount = reducedDims.x * reducedDims.y;
+  const uint componentStart = componentRange.x;
+  const uint groupCount = min(componentRange.y, 4u);
+  for (uint slot = 0u; slot < groupCount; ++slot) {
+    const SpektraDiffusionComponent component = components[componentStart + slot];
+    const float sigma = max(component.sigmaPx * sigmaScale, 1.0e-6);
+    device const float4 *plane = tempIn + slot * pixelCount;
+    blurOut[slot * pixelCount + index] = sigma <= 1.0e-4
+      ? plane[index]
+      : spektra_scalar_gaussian_sample_y(plane, reducedDims.x, reducedDims.y, gid, sigma);
+  }
+}
+
+kernel void spektrafilm_diffusion_downsample_group_upsample_accumulate(
+  device const float4 *reducedBlur [[buffer(0)]],
+  device float4 *accumInOut [[buffer(1)]],
+  device const SpektraDiffusionComponent *components [[buffer(2)]],
+  constant uint2 &fullDims [[buffer(3)]],
+  constant uint2 &reducedDims [[buffer(4)]],
+  constant uint2 &componentRange [[buffer(5)]],
+  constant uint &scaleIn [[buffer(6)]],
+  uint2 gid [[thread_position_in_grid]]
+) {
+  if (gid.x >= fullDims.x || gid.y >= fullDims.y) {
+    return;
+  }
+  const uint index = gid.y * fullDims.x + gid.x;
+  const uint reducedPixelCount = reducedDims.x * reducedDims.y;
+  const uint scale = max(scaleIn, 1u);
+  const float2 coord = (float2(float(gid.x), float(gid.y)) + 0.5) / float(scale) - 0.5;
+  const uint componentStart = componentRange.x;
+  const uint groupCount = min(componentRange.y, 4u);
+  float4 accum = accumInOut[index];
+  for (uint slot = 0u; slot < groupCount; ++slot) {
+    const SpektraDiffusionComponent component = components[componentStart + slot];
+    device const float4 *plane = reducedBlur + slot * reducedPixelCount;
+    const float4 blurred = spektra_reduced_bilinear_sample(plane, reducedDims, coord);
+    accum = float4(
+      accum.rgb + blurred.rgb * float3(component.weightR, component.weightG, component.weightB),
+      blurred.a
+    );
+  }
+  accumInOut[index] = accum;
+}
+
+static float4 spektra_half4_buffer_sample(
+  device const half4 *source,
+  uint width,
+  uint height,
+  int x,
+  int y
+) {
+  const uint sx = spektra_safe_index(x, width);
+  const uint sy = spektra_safe_index(y, height);
+  return float4(source[sy * width + sx]);
+}
+
+static float4 spektra_scalar_gaussian_sample_y_half(
+  device const half4 *source,
+  uint width,
+  uint height,
+  uint2 gid,
+  float sigma
+) {
+  const SpektraGaussianBlurInfo info = spektra_make_gaussian_blur_info(sigma, 256);
+  if (info.active == 0u || info.radius == 0u) {
+    return spektra_half4_buffer_sample(source, width, height, int(gid.x), int(gid.y));
+  }
+  const int x = int(gid.x);
+  const int y = int(gid.y);
+  const int radius = int(info.radius);
+  const bool interior = y >= radius && y + radius < int(height);
+  const uint index = gid.y * width + gid.x;
+  float4 value = float4(source[index]);
+  float weight = info.firstWeight;
+  float ratio = info.firstRatio;
+  for (int offset = 1; offset <= radius; ++offset) {
+    const float4 samplePair = interior
+      ? float4(source[(gid.y - uint(offset)) * width + gid.x]) + float4(source[(gid.y + uint(offset)) * width + gid.x])
+      : spektra_half4_buffer_sample(source, width, height, x, y - offset) +
+        spektra_half4_buffer_sample(source, width, height, x, y + offset);
+    value += weight * samplePair;
+    weight *= ratio;
+    ratio *= info.ratioStep;
+  }
+  return value * info.invWeightSum;
+}
+
+static float4 spektra_reduced_bilinear_sample_half(
+  device const half4 *source,
+  uint2 reducedDims,
+  float2 coord
+) {
+  const float2 clamped = clamp(coord, float2(0.0), float2(max(float(reducedDims.x) - 1.0, 0.0), max(float(reducedDims.y) - 1.0, 0.0)));
+  const int x0 = int(floor(clamped.x));
+  const int y0 = int(floor(clamped.y));
+  const int x1 = min(x0 + 1, int(reducedDims.x) - 1);
+  const int y1 = min(y0 + 1, int(reducedDims.y) - 1);
+  const float tx = clamped.x - float(x0);
+  const float ty = clamped.y - float(y0);
+  const float4 p00 = float4(source[uint(y0) * reducedDims.x + uint(x0)]);
+  const float4 p10 = float4(source[uint(y0) * reducedDims.x + uint(x1)]);
+  const float4 p01 = float4(source[uint(y1) * reducedDims.x + uint(x0)]);
+  const float4 p11 = float4(source[uint(y1) * reducedDims.x + uint(x1)]);
+  return mix(mix(p00, p10, tx), mix(p01, p11, tx), ty);
+}
+
+kernel void spektrafilm_diffusion_downsample_blur_x_half(
+  device const float4 *source [[buffer(0)]],
+  device half4 *destination [[buffer(1)]],
+  device const SpektraDiffusionComponent *components [[buffer(2)]],
+  constant uint2 &reducedDims [[buffer(3)]],
+  constant uint &componentIndex [[buffer(4)]],
+  constant float &sigmaScale [[buffer(5)]],
+  uint2 gid [[thread_position_in_grid]]
+) {
+  if (gid.x >= reducedDims.x || gid.y >= reducedDims.y) {
+    return;
+  }
+  const SpektraDiffusionComponent component = components[componentIndex];
+  const float sigma = max(component.sigmaPx * sigmaScale, 1.0e-6);
+  destination[gid.y * reducedDims.x + gid.x] = half4(spektra_scalar_gaussian_sample_x(
+    source, reducedDims.x, reducedDims.y, gid, sigma));
+}
+
+kernel void spektrafilm_diffusion_downsample_blur_y_half(
+  device const half4 *source [[buffer(0)]],
+  device half4 *destination [[buffer(1)]],
+  device const SpektraDiffusionComponent *components [[buffer(2)]],
+  constant uint2 &reducedDims [[buffer(3)]],
+  constant uint &componentIndex [[buffer(4)]],
+  constant float &sigmaScale [[buffer(5)]],
+  uint2 gid [[thread_position_in_grid]]
+) {
+  if (gid.x >= reducedDims.x || gid.y >= reducedDims.y) {
+    return;
+  }
+  const SpektraDiffusionComponent component = components[componentIndex];
+  const float sigma = max(component.sigmaPx * sigmaScale, 1.0e-6);
+  destination[gid.y * reducedDims.x + gid.x] = half4(spektra_scalar_gaussian_sample_y_half(
+    source, reducedDims.x, reducedDims.y, gid, sigma));
+}
+
+kernel void spektrafilm_diffusion_downsample_upsample_accumulate_half(
+  device const half4 *reducedBlur [[buffer(0)]],
+  device float4 *accumInOut [[buffer(1)]],
+  device const SpektraDiffusionComponent *components [[buffer(2)]],
+  constant uint2 &fullDims [[buffer(3)]],
+  constant uint2 &reducedDims [[buffer(4)]],
+  constant uint &componentIndex [[buffer(5)]],
+  constant uint &scaleIn [[buffer(6)]],
+  uint2 gid [[thread_position_in_grid]]
+) {
+  if (gid.x >= fullDims.x || gid.y >= fullDims.y) {
+    return;
+  }
+  const uint index = gid.y * fullDims.x + gid.x;
+  const uint scale = max(scaleIn, 1u);
+  const float2 coord = (float2(float(gid.x), float(gid.y)) + 0.5) / float(scale) - 0.5;
+  const SpektraDiffusionComponent component = components[componentIndex];
+  const float4 blurred = spektra_reduced_bilinear_sample_half(reducedBlur, reducedDims, coord);
+  accumInOut[index] = float4(
+    accumInOut[index].rgb + blurred.rgb * float3(component.weightR, component.weightG, component.weightB),
+    blurred.a
+  );
+}
+
+kernel void spektrafilm_diffusion_downsample_group_blur_x_half(
+  device const float4 *source [[buffer(0)]],
+  device half4 *tempOut [[buffer(1)]],
+  device const SpektraDiffusionComponent *components [[buffer(2)]],
+  constant uint2 &reducedDims [[buffer(3)]],
+  constant uint2 &componentRange [[buffer(4)]],
+  constant float &sigmaScale [[buffer(5)]],
+  uint2 gid [[thread_position_in_grid]]
+) {
+  if (gid.x >= reducedDims.x || gid.y >= reducedDims.y) {
+    return;
+  }
+  const uint index = gid.y * reducedDims.x + gid.x;
+  const uint pixelCount = reducedDims.x * reducedDims.y;
+  const uint componentStart = componentRange.x;
+  const uint groupCount = min(componentRange.y, 4u);
+  for (uint slot = 0u; slot < groupCount; ++slot) {
+    const SpektraDiffusionComponent component = components[componentStart + slot];
+    const float sigma = max(component.sigmaPx * sigmaScale, 1.0e-6);
+    tempOut[slot * pixelCount + index] = half4(sigma <= 1.0e-4
+      ? source[index]
+      : spektra_scalar_gaussian_sample_x(source, reducedDims.x, reducedDims.y, gid, sigma));
+  }
+}
+
+kernel void spektrafilm_diffusion_downsample_group_blur_y_half(
+  device const half4 *tempIn [[buffer(0)]],
+  device half4 *blurOut [[buffer(1)]],
+  device const SpektraDiffusionComponent *components [[buffer(2)]],
+  constant uint2 &reducedDims [[buffer(3)]],
+  constant uint2 &componentRange [[buffer(4)]],
+  constant float &sigmaScale [[buffer(5)]],
+  uint2 gid [[thread_position_in_grid]]
+) {
+  if (gid.x >= reducedDims.x || gid.y >= reducedDims.y) {
+    return;
+  }
+  const uint index = gid.y * reducedDims.x + gid.x;
+  const uint pixelCount = reducedDims.x * reducedDims.y;
+  const uint componentStart = componentRange.x;
+  const uint groupCount = min(componentRange.y, 4u);
+  for (uint slot = 0u; slot < groupCount; ++slot) {
+    const SpektraDiffusionComponent component = components[componentStart + slot];
+    const float sigma = max(component.sigmaPx * sigmaScale, 1.0e-6);
+    device const half4 *plane = tempIn + slot * pixelCount;
+    blurOut[slot * pixelCount + index] = half4(sigma <= 1.0e-4
+      ? float4(plane[index])
+      : spektra_scalar_gaussian_sample_y_half(plane, reducedDims.x, reducedDims.y, gid, sigma));
+  }
+}
+
+kernel void spektrafilm_diffusion_downsample_group_upsample_accumulate_half(
+  device const half4 *reducedBlur [[buffer(0)]],
+  device float4 *accumInOut [[buffer(1)]],
+  device const SpektraDiffusionComponent *components [[buffer(2)]],
+  constant uint2 &fullDims [[buffer(3)]],
+  constant uint2 &reducedDims [[buffer(4)]],
+  constant uint2 &componentRange [[buffer(5)]],
+  constant uint &scaleIn [[buffer(6)]],
+  uint2 gid [[thread_position_in_grid]]
+) {
+  if (gid.x >= fullDims.x || gid.y >= fullDims.y) {
+    return;
+  }
+  const uint index = gid.y * fullDims.x + gid.x;
+  const uint reducedPixelCount = reducedDims.x * reducedDims.y;
+  const uint scale = max(scaleIn, 1u);
+  const float2 coord = (float2(float(gid.x), float(gid.y)) + 0.5) / float(scale) - 0.5;
+  const uint componentStart = componentRange.x;
+  const uint groupCount = min(componentRange.y, 4u);
+  float4 accum = accumInOut[index];
+  for (uint slot = 0u; slot < groupCount; ++slot) {
+    const SpektraDiffusionComponent component = components[componentStart + slot];
+    device const half4 *plane = reducedBlur + slot * reducedPixelCount;
+    const float4 blurred = spektra_reduced_bilinear_sample_half(plane, reducedDims, coord);
     accum = float4(
       accum.rgb + blurred.rgb * float3(component.weightR, component.weightG, component.weightB),
       blurred.a
@@ -5071,6 +5607,7 @@ kernel void spektrafilm_grain_layer_blur_x(
   constant SpektraCurveInfo &curveInfo [[buffer(4)]],
   constant SpektraSpectralInfo &spectralInfo [[buffer(5)]],
   device const float *paperScanDensityData [[buffer(6)]],
+  constant uint &useRecurrence [[buffer(7)]],
   uint3 gid [[thread_position_in_grid]]
 ) {
   if (gid.x >= dims.x || gid.y >= dims.y || gid.z >= 9u) {
@@ -5090,6 +5627,11 @@ kernel void spektrafilm_grain_layer_blur_x(
   const float sigma = spektra_grain_layer_blur_sigma(layer, channel, params, filmDensityCurveLayerMaxima);
   if (sigma <= 1.0e-4) {
     layerOut[index * 9u + component] = layerIn[index * 9u + component];
+    return;
+  }
+  if (useRecurrence != 0u) {
+    layerOut[index * 9u + component] = spektra_layer_gaussian_sample_x_limited(
+      layerIn, dims.x, dims.y, gid.xy, component, sigma, 64);
     return;
   }
   const int radius = min(int(ceil(3.0 * sigma)), 64);
@@ -5111,6 +5653,7 @@ kernel void spektrafilm_grain_layer_blur_y(
   constant SpektraCurveInfo &curveInfo [[buffer(4)]],
   constant SpektraSpectralInfo &spectralInfo [[buffer(5)]],
   device const float *paperScanDensityData [[buffer(6)]],
+  constant uint &useRecurrence [[buffer(7)]],
   uint3 gid [[thread_position_in_grid]]
 ) {
   if (gid.x >= dims.x || gid.y >= dims.y || gid.z >= 9u) {
@@ -5130,6 +5673,11 @@ kernel void spektrafilm_grain_layer_blur_y(
   const float sigma = spektra_grain_layer_blur_sigma(layer, channel, params, filmDensityCurveLayerMaxima);
   if (sigma <= 1.0e-4) {
     layerOut[index * 9u + component] = layerIn[index * 9u + component];
+    return;
+  }
+  if (useRecurrence != 0u) {
+    layerOut[index * 9u + component] = spektra_layer_gaussian_sample_y_limited(
+      layerIn, dims.x, dims.y, gid.xy, component, sigma, 64);
     return;
   }
   const int radius = min(int(ceil(3.0 * sigma)), 64);
@@ -5180,6 +5728,7 @@ kernel void spektrafilm_grain_micro_blur_x(
   device float4 *microOut [[buffer(1)]],
   constant SpektraKernelParams &params [[buffer(2)]],
   constant uint2 &dims [[buffer(3)]],
+  constant uint &useRecurrence [[buffer(4)]],
   uint2 gid [[thread_position_in_grid]]
 ) {
   if (gid.x >= dims.x || gid.y >= dims.y) {
@@ -5189,6 +5738,10 @@ kernel void spektrafilm_grain_micro_blur_x(
   const float sigma = spektra_microstructure_blur_sigma(params);
   if (params.grainSublayersEnabled == 0u || sigma <= 0.4) {
     microOut[index] = microIn[index];
+    return;
+  }
+  if (useRecurrence != 0u) {
+    microOut[index] = spektra_scalar_gaussian_sample_x_limited(microIn, dims.x, dims.y, gid, sigma, 64);
     return;
   }
   const int radius = min(int(ceil(3.0 * sigma)), 64);
@@ -5207,6 +5760,7 @@ kernel void spektrafilm_grain_micro_blur_y(
   device float4 *microOut [[buffer(1)]],
   constant SpektraKernelParams &params [[buffer(2)]],
   constant uint2 &dims [[buffer(3)]],
+  constant uint &useRecurrence [[buffer(4)]],
   uint2 gid [[thread_position_in_grid]]
 ) {
   if (gid.x >= dims.x || gid.y >= dims.y) {
@@ -5216,6 +5770,10 @@ kernel void spektrafilm_grain_micro_blur_y(
   const float sigma = spektra_microstructure_blur_sigma(params);
   if (params.grainSublayersEnabled == 0u || sigma <= 0.4) {
     microOut[index] = microIn[index];
+    return;
+  }
+  if (useRecurrence != 0u) {
+    microOut[index] = spektra_scalar_gaussian_sample_y_limited(microIn, dims.x, dims.y, gid, sigma, 64);
     return;
   }
   const int radius = min(int(ceil(3.0 * sigma)), 64);
@@ -5271,6 +5829,7 @@ kernel void spektrafilm_grain_density_blur_x(
   device float4 *densityOut [[buffer(1)]],
   constant SpektraKernelParams &params [[buffer(2)]],
   constant uint2 &dims [[buffer(3)]],
+  constant uint &useRecurrence [[buffer(4)]],
   uint2 gid [[thread_position_in_grid]]
 ) {
   if (gid.x >= dims.x || gid.y >= dims.y) {
@@ -5280,6 +5839,10 @@ kernel void spektrafilm_grain_density_blur_x(
   const float sigma = spektra_grain_final_blur_um(params) / max(params.filmPixelSizeUm, 1.0e-6);
   if (sigma <= 0.0 || (params.grainSublayersEnabled == 0u && sigma <= 0.4)) {
     densityOut[index] = densityIn[index];
+    return;
+  }
+  if (useRecurrence != 0u) {
+    densityOut[index] = spektra_scalar_gaussian_sample_x_limited(densityIn, dims.x, dims.y, gid, sigma, 64);
     return;
   }
   const int radius = min(int(ceil(3.0 * sigma)), 64);
@@ -5298,6 +5861,7 @@ kernel void spektrafilm_grain_density_blur_y(
   device float4 *densityOut [[buffer(1)]],
   constant SpektraKernelParams &params [[buffer(2)]],
   constant uint2 &dims [[buffer(3)]],
+  constant uint &useRecurrence [[buffer(4)]],
   uint2 gid [[thread_position_in_grid]]
 ) {
   if (gid.x >= dims.x || gid.y >= dims.y) {
@@ -5307,6 +5871,10 @@ kernel void spektrafilm_grain_density_blur_y(
   const float sigma = spektra_grain_final_blur_um(params) / max(params.filmPixelSizeUm, 1.0e-6);
   if (sigma <= 0.0 || (params.grainSublayersEnabled == 0u && sigma <= 0.4)) {
     densityOut[index] = densityIn[index];
+    return;
+  }
+  if (useRecurrence != 0u) {
+    densityOut[index] = spektra_scalar_gaussian_sample_y_limited(densityIn, dims.x, dims.y, gid, sigma, 64);
     return;
   }
   const int radius = min(int(ceil(3.0 * sigma)), 64);
@@ -5529,6 +6097,34 @@ kernel void spektrafilm_print_raw_from_film_density(
   printRawOut[index] = float4(max(rawTimed * exp2(params.printExposureEv), float3(0.0)), density.a);
 }
 
+kernel void spektrafilm_print_density_from_print_raw(
+  device const float4 *printRaw [[buffer(0)]],
+  device float4 *destination [[buffer(1)]],
+  constant SpektraKernelParams &params [[buffer(2)]],
+  constant uint2 &dims [[buffer(3)]],
+  constant SpektraCurveInfo &paperCurveInfo [[buffer(4)]],
+  device const float *paperLogExposure [[buffer(5)]],
+  device const float *paperDensityCurves [[buffer(6)]],
+  constant SpektraSpectralInfo &spectralInfo [[buffer(7)]],
+  uint2 gid [[thread_position_in_grid]]
+) {
+  if (gid.x >= dims.x || gid.y >= dims.y) {
+    return;
+  }
+  const uint index = gid.y * dims.x + gid.x;
+  float4 pixel = printRaw[index];
+  pixel.rgb = log10(max(pixel.rgb, float3(0.0)) + float3(1.0e-10));
+  pixel.rgb = spektra_develop_print_density(
+    pixel.rgb,
+    params,
+    spectralInfo,
+    paperCurveInfo,
+    paperLogExposure,
+    paperDensityCurves
+  );
+  destination[index] = pixel;
+}
+
 kernel void spektrafilm_final_from_print_raw(
   device const float4 *printRaw [[buffer(0)]],
   device float4 *destination [[buffer(1)]],
@@ -5700,13 +6296,17 @@ kernel void spektrafilm_print_glare_blur_x(
   device float4 *destination [[buffer(1)]],
   constant SpektraKernelParams &params [[buffer(2)]],
   constant uint2 &dims [[buffer(3)]],
+  constant uint &useRecurrence [[buffer(4)]],
   uint2 gid [[thread_position_in_grid]]
 ) {
   if (gid.x >= dims.x || gid.y >= dims.y) {
     return;
   }
   const uint index = gid.y * dims.x + gid.x;
-  destination[index] = spektra_rgb_gaussian_sample_x(source, dims.x, dims.y, gid, max(params.glareBlur, 0.0));
+  const float sigma = max(params.glareBlur, 0.0);
+  destination[index] = useRecurrence != 0u
+    ? spektra_scalar_gaussian_sample_x(source, dims.x, dims.y, gid, sigma)
+    : spektra_rgb_gaussian_sample_x(source, dims.x, dims.y, gid, sigma);
 }
 
 kernel void spektrafilm_print_glare_blur_y(
@@ -5714,13 +6314,17 @@ kernel void spektrafilm_print_glare_blur_y(
   device float4 *destination [[buffer(1)]],
   constant SpektraKernelParams &params [[buffer(2)]],
   constant uint2 &dims [[buffer(3)]],
+  constant uint &useRecurrence [[buffer(4)]],
   uint2 gid [[thread_position_in_grid]]
 ) {
   if (gid.x >= dims.x || gid.y >= dims.y) {
     return;
   }
   const uint index = gid.y * dims.x + gid.x;
-  destination[index] = spektra_rgb_gaussian_sample_y(source, dims.x, dims.y, gid, max(params.glareBlur, 0.0));
+  const float sigma = max(params.glareBlur, 0.0);
+  destination[index] = useRecurrence != 0u
+    ? spektra_scalar_gaussian_sample_y(source, dims.x, dims.y, gid, sigma)
+    : spektra_rgb_gaussian_sample_y(source, dims.x, dims.y, gid, sigma);
 }
 
 kernel void spektrafilm_print_glare_apply(
@@ -5794,6 +6398,66 @@ static float4 spektra_rgb_gaussian_texture_sample_y(
   return value / max(weightSum, 1.0e-8);
 }
 
+static float4 spektra_rgb_gaussian_texture_sample_x_recurrence(
+  texture2d<float, access::read> source,
+  uint width,
+  uint height,
+  uint2 gid,
+  float sigma
+) {
+  const SpektraGaussianBlurInfo info = spektra_make_gaussian_blur_info(sigma, 256);
+  if (info.active == 0u || info.radius == 0u) {
+    return spektra_texture2d_sample(source, width, height, int(gid.x), int(gid.y));
+  }
+  const int x = int(gid.x);
+  const int y = int(gid.y);
+  const int radius = int(info.radius);
+  const bool interior = x >= radius && x + radius < int(width);
+  float4 value = source.read(gid);
+  float weight = info.firstWeight;
+  float ratio = info.firstRatio;
+  for (int offset = 1; offset <= radius; ++offset) {
+    const float4 samplePair = interior
+      ? source.read(uint2(gid.x - uint(offset), gid.y)) + source.read(uint2(gid.x + uint(offset), gid.y))
+      : spektra_texture2d_sample(source, width, height, x - offset, y) +
+        spektra_texture2d_sample(source, width, height, x + offset, y);
+    value += weight * samplePair;
+    weight *= ratio;
+    ratio *= info.ratioStep;
+  }
+  return value * info.invWeightSum;
+}
+
+static float4 spektra_rgb_gaussian_texture_sample_y_recurrence(
+  texture2d<float, access::read> source,
+  uint width,
+  uint height,
+  uint2 gid,
+  float sigma
+) {
+  const SpektraGaussianBlurInfo info = spektra_make_gaussian_blur_info(sigma, 256);
+  if (info.active == 0u || info.radius == 0u) {
+    return spektra_texture2d_sample(source, width, height, int(gid.x), int(gid.y));
+  }
+  const int x = int(gid.x);
+  const int y = int(gid.y);
+  const int radius = int(info.radius);
+  const bool interior = y >= radius && y + radius < int(height);
+  float4 value = source.read(gid);
+  float weight = info.firstWeight;
+  float ratio = info.firstRatio;
+  for (int offset = 1; offset <= radius; ++offset) {
+    const float4 samplePair = interior
+      ? source.read(uint2(gid.x, gid.y - uint(offset))) + source.read(uint2(gid.x, gid.y + uint(offset)))
+      : spektra_texture2d_sample(source, width, height, x, y - offset) +
+        spektra_texture2d_sample(source, width, height, x, y + offset);
+    value += weight * samplePair;
+    weight *= ratio;
+    ratio *= info.ratioStep;
+  }
+  return value * info.invWeightSum;
+}
+
 kernel void spektrafilm_buffer_to_texture(
   device const float4 *source [[buffer(0)]],
   texture2d<float, access::write> destination [[texture(0)]],
@@ -5825,12 +6489,16 @@ kernel void spektrafilm_scanner_blur_x_texture(
   texture2d<float, access::write> destination [[texture(1)]],
   constant SpektraKernelParams &params [[buffer(0)]],
   constant uint2 &dims [[buffer(1)]],
+  constant uint &useRecurrence [[buffer(2)]],
   uint2 gid [[thread_position_in_grid]]
 ) {
   if (gid.x >= dims.x || gid.y >= dims.y) {
     return;
   }
-  destination.write(spektra_rgb_gaussian_texture_sample_x(source, dims.x, dims.y, gid, max(params.scannerBlurSigmaPx, 0.0)), gid);
+  const float sigma = max(params.scannerBlurSigmaPx, 0.0);
+  destination.write(useRecurrence != 0u
+    ? spektra_rgb_gaussian_texture_sample_x_recurrence(source, dims.x, dims.y, gid, sigma)
+    : spektra_rgb_gaussian_texture_sample_x(source, dims.x, dims.y, gid, sigma), gid);
 }
 
 kernel void spektrafilm_scanner_blur_y_texture(
@@ -5838,12 +6506,16 @@ kernel void spektrafilm_scanner_blur_y_texture(
   texture2d<float, access::write> destination [[texture(1)]],
   constant SpektraKernelParams &params [[buffer(0)]],
   constant uint2 &dims [[buffer(1)]],
+  constant uint &useRecurrence [[buffer(2)]],
   uint2 gid [[thread_position_in_grid]]
 ) {
   if (gid.x >= dims.x || gid.y >= dims.y) {
     return;
   }
-  destination.write(spektra_rgb_gaussian_texture_sample_y(source, dims.x, dims.y, gid, max(params.scannerBlurSigmaPx, 0.0)), gid);
+  const float sigma = max(params.scannerBlurSigmaPx, 0.0);
+  destination.write(useRecurrence != 0u
+    ? spektra_rgb_gaussian_texture_sample_y_recurrence(source, dims.x, dims.y, gid, sigma)
+    : spektra_rgb_gaussian_texture_sample_y(source, dims.x, dims.y, gid, sigma), gid);
 }
 
 kernel void spektrafilm_unsharp_blur_x_texture(
@@ -5851,12 +6523,16 @@ kernel void spektrafilm_unsharp_blur_x_texture(
   texture2d<float, access::write> destination [[texture(1)]],
   constant SpektraKernelParams &params [[buffer(0)]],
   constant uint2 &dims [[buffer(1)]],
+  constant uint &useRecurrence [[buffer(2)]],
   uint2 gid [[thread_position_in_grid]]
 ) {
   if (gid.x >= dims.x || gid.y >= dims.y) {
     return;
   }
-  destination.write(spektra_rgb_gaussian_texture_sample_x(source, dims.x, dims.y, gid, max(params.scannerUnsharpSigmaPx, 0.0)), gid);
+  const float sigma = max(params.scannerUnsharpSigmaPx, 0.0);
+  destination.write(useRecurrence != 0u
+    ? spektra_rgb_gaussian_texture_sample_x_recurrence(source, dims.x, dims.y, gid, sigma)
+    : spektra_rgb_gaussian_texture_sample_x(source, dims.x, dims.y, gid, sigma), gid);
 }
 
 kernel void spektrafilm_unsharp_blur_y_texture(
@@ -5864,12 +6540,16 @@ kernel void spektrafilm_unsharp_blur_y_texture(
   texture2d<float, access::write> destination [[texture(1)]],
   constant SpektraKernelParams &params [[buffer(0)]],
   constant uint2 &dims [[buffer(1)]],
+  constant uint &useRecurrence [[buffer(2)]],
   uint2 gid [[thread_position_in_grid]]
 ) {
   if (gid.x >= dims.x || gid.y >= dims.y) {
     return;
   }
-  destination.write(spektra_rgb_gaussian_texture_sample_y(source, dims.x, dims.y, gid, max(params.scannerUnsharpSigmaPx, 0.0)), gid);
+  const float sigma = max(params.scannerUnsharpSigmaPx, 0.0);
+  destination.write(useRecurrence != 0u
+    ? spektra_rgb_gaussian_texture_sample_y_recurrence(source, dims.x, dims.y, gid, sigma)
+    : spektra_rgb_gaussian_texture_sample_y(source, dims.x, dims.y, gid, sigma), gid);
 }
 
 kernel void spektrafilm_scanner_blur_x(
@@ -5877,13 +6557,17 @@ kernel void spektrafilm_scanner_blur_x(
   device float4 *destination [[buffer(1)]],
   constant SpektraKernelParams &params [[buffer(2)]],
   constant uint2 &dims [[buffer(3)]],
+  constant uint &useRecurrence [[buffer(4)]],
   uint2 gid [[thread_position_in_grid]]
 ) {
   if (gid.x >= dims.x || gid.y >= dims.y) {
     return;
   }
   const uint index = gid.y * dims.x + gid.x;
-  destination[index] = spektra_rgb_gaussian_sample_x(source, dims.x, dims.y, gid, max(params.scannerBlurSigmaPx, 0.0));
+  const float sigma = max(params.scannerBlurSigmaPx, 0.0);
+  destination[index] = useRecurrence != 0u
+    ? spektra_scalar_gaussian_sample_x(source, dims.x, dims.y, gid, sigma)
+    : spektra_rgb_gaussian_sample_x(source, dims.x, dims.y, gid, sigma);
 }
 
 kernel void spektrafilm_scanner_blur_y(
@@ -5891,13 +6575,17 @@ kernel void spektrafilm_scanner_blur_y(
   device float4 *destination [[buffer(1)]],
   constant SpektraKernelParams &params [[buffer(2)]],
   constant uint2 &dims [[buffer(3)]],
+  constant uint &useRecurrence [[buffer(4)]],
   uint2 gid [[thread_position_in_grid]]
 ) {
   if (gid.x >= dims.x || gid.y >= dims.y) {
     return;
   }
   const uint index = gid.y * dims.x + gid.x;
-  destination[index] = spektra_rgb_gaussian_sample_y(source, dims.x, dims.y, gid, max(params.scannerBlurSigmaPx, 0.0));
+  const float sigma = max(params.scannerBlurSigmaPx, 0.0);
+  destination[index] = useRecurrence != 0u
+    ? spektra_scalar_gaussian_sample_y(source, dims.x, dims.y, gid, sigma)
+    : spektra_rgb_gaussian_sample_y(source, dims.x, dims.y, gid, sigma);
 }
 
 kernel void spektrafilm_unsharp_blur_x(
@@ -5905,13 +6593,17 @@ kernel void spektrafilm_unsharp_blur_x(
   device float4 *destination [[buffer(1)]],
   constant SpektraKernelParams &params [[buffer(2)]],
   constant uint2 &dims [[buffer(3)]],
+  constant uint &useRecurrence [[buffer(4)]],
   uint2 gid [[thread_position_in_grid]]
 ) {
   if (gid.x >= dims.x || gid.y >= dims.y) {
     return;
   }
   const uint index = gid.y * dims.x + gid.x;
-  destination[index] = spektra_rgb_gaussian_sample_x(source, dims.x, dims.y, gid, max(params.scannerUnsharpSigmaPx, 0.0));
+  const float sigma = max(params.scannerUnsharpSigmaPx, 0.0);
+  destination[index] = useRecurrence != 0u
+    ? spektra_scalar_gaussian_sample_x(source, dims.x, dims.y, gid, sigma)
+    : spektra_rgb_gaussian_sample_x(source, dims.x, dims.y, gid, sigma);
 }
 
 kernel void spektrafilm_unsharp_blur_y(
@@ -5919,13 +6611,17 @@ kernel void spektrafilm_unsharp_blur_y(
   device float4 *destination [[buffer(1)]],
   constant SpektraKernelParams &params [[buffer(2)]],
   constant uint2 &dims [[buffer(3)]],
+  constant uint &useRecurrence [[buffer(4)]],
   uint2 gid [[thread_position_in_grid]]
 ) {
   if (gid.x >= dims.x || gid.y >= dims.y) {
     return;
   }
   const uint index = gid.y * dims.x + gid.x;
-  destination[index] = spektra_rgb_gaussian_sample_y(source, dims.x, dims.y, gid, max(params.scannerUnsharpSigmaPx, 0.0));
+  const float sigma = max(params.scannerUnsharpSigmaPx, 0.0);
+  destination[index] = useRecurrence != 0u
+    ? spektra_scalar_gaussian_sample_y(source, dims.x, dims.y, gid, sigma)
+    : spektra_rgb_gaussian_sample_y(source, dims.x, dims.y, gid, sigma);
 }
 
 kernel void spektrafilm_scanner_finalize(

@@ -118,6 +118,32 @@ bool envFlagEnabled(const char *name) {
          std::strcmp(value, "ON") == 0;
 }
 
+bool envFlagEnabledOrDefault(const char *name, bool defaultValue) {
+  const char *value = std::getenv(name);
+  if (!value) {
+    return defaultValue;
+  }
+  if (std::strcmp(value, "1") == 0 ||
+      std::strcmp(value, "true") == 0 ||
+      std::strcmp(value, "TRUE") == 0 ||
+      std::strcmp(value, "yes") == 0 ||
+      std::strcmp(value, "YES") == 0 ||
+      std::strcmp(value, "on") == 0 ||
+      std::strcmp(value, "ON") == 0) {
+    return true;
+  }
+  if (std::strcmp(value, "0") == 0 ||
+      std::strcmp(value, "false") == 0 ||
+      std::strcmp(value, "FALSE") == 0 ||
+      std::strcmp(value, "no") == 0 ||
+      std::strcmp(value, "NO") == 0 ||
+      std::strcmp(value, "off") == 0 ||
+      std::strcmp(value, "OFF") == 0) {
+    return false;
+  }
+  return defaultValue;
+}
+
 std::string envString(const char *name, const char *fallback = "") {
   const char *value = std::getenv(name);
   return value ? std::string(value) : std::string(fallback);
@@ -566,6 +592,11 @@ float filmFormatMm(FilmFormat format) {
     default:
       return 35.0f;
   }
+}
+
+float effectiveGrainFinalBlurUm(const RenderParams &params) {
+  const float formatScale = std::pow(std::max(filmFormatMm(params.filmFormat) / 35.0f, 1.0e-6f), 0.62f);
+  return std::max(params.grainFinalBlurUm, 0.0f) * formatScale;
 }
 
 float scannerSigmaUmFromMtf50(float mtf50LpMm) {
@@ -1191,10 +1222,85 @@ void appendDiffusionGroupComponents(
   }
 }
 
+void clusterDiffusionComponents(std::vector<KernelDiffusionComponent> &components, float sigmaRatio) {
+  if (components.size() < 2u || sigmaRatio <= 0.0f) {
+    return;
+  }
+  std::sort(
+    components.begin(),
+    components.end(),
+    [](const KernelDiffusionComponent &a, const KernelDiffusionComponent &b) {
+      return a.sigmaPx < b.sigmaPx;
+    }
+  );
+  std::vector<KernelDiffusionComponent> clustered;
+  clustered.reserve(components.size());
+  for (const KernelDiffusionComponent &component : components) {
+    if (clustered.empty()) {
+      clustered.push_back(component);
+      continue;
+    }
+    KernelDiffusionComponent &last = clustered.back();
+    const float denom = std::max(std::max(last.sigmaPx, component.sigmaPx), 1.0e-6f);
+    if (std::abs(component.sigmaPx - last.sigmaPx) / denom <= sigmaRatio) {
+      const float lastWeight = std::abs(last.weightR) + std::abs(last.weightG) + std::abs(last.weightB);
+      const float componentWeight = std::abs(component.weightR) + std::abs(component.weightG) + std::abs(component.weightB);
+      const float totalWeight = lastWeight + componentWeight;
+      if (totalWeight > 1.0e-8f) {
+        last.sigmaPx = (last.sigmaPx * lastWeight + component.sigmaPx * componentWeight) / totalWeight;
+      }
+      last.weightR += component.weightR;
+      last.weightG += component.weightG;
+      last.weightB += component.weightB;
+    } else {
+      clustered.push_back(component);
+    }
+  }
+  components.swap(clustered);
+}
+
+uint32_t diffusionDownsampleScaleForSigma(const std::string &mode, float sigmaPx) {
+  if (mode == "off") {
+    return 1u;
+  }
+  if (mode == "auto") {
+    if (sigmaPx >= 48.0f) {
+      return 8u;
+    }
+    if (sigmaPx >= 24.0f) {
+      return 4u;
+    }
+    if (sigmaPx >= 12.0f) {
+      return 2u;
+    }
+    return 1u;
+  }
+  if (mode == "8") {
+    return sigmaPx >= 48.0f ? 8u : 1u;
+  }
+  if (mode == "4") {
+    return sigmaPx >= 24.0f ? 4u : 1u;
+  }
+  if (mode == "2") {
+    return sigmaPx >= 12.0f ? 2u : 1u;
+  }
+  return 1u;
+}
+
+bool anyDiffusionComponentDownsamples(const std::vector<KernelDiffusionComponent> &components, const std::string &mode) {
+  for (const KernelDiffusionComponent &component : components) {
+    if (diffusionDownsampleScaleForSigma(mode, component.sigmaPx) > 1u) {
+      return true;
+    }
+  }
+  return false;
+}
+
 std::vector<KernelDiffusionComponent> makeDiffusionComponents(
   const DiffusionSettings &settings,
   float pixelSizeUm,
-  KernelDiffusionInfo &info
+  KernelDiffusionInfo &info,
+  float clusterSigmaRatio = 0.0f
 ) {
   DiffusionFamilyShape shape = diffusionShape(settings.family);
   const float coreIntensity = std::max(settings.coreIntensity, 0.0f);
@@ -1270,6 +1376,7 @@ std::vector<KernelDiffusionComponent> makeDiffusionComponents(
     pixelSizeUm
   );
 
+  clusterDiffusionComponents(components, clusterSigmaRatio);
   info.componentCount = static_cast<uint32_t>(components.size());
   return components;
 }
@@ -1805,7 +1912,8 @@ float measureAutoExposureEv(
   const float *source,
   int32_t width,
   int32_t height,
-  const RenderParams &params
+  const RenderParams &params,
+  std::vector<float> &luminance
 ) {
   if (!source || width <= 0 || height <= 0) {
     return 0.0f;
@@ -1814,7 +1922,7 @@ float measureAutoExposureEv(
   int32_t previewWidth = width;
   int32_t previewHeight = height;
   autoExposurePreviewShape(width, height, previewWidth, previewHeight);
-  std::vector<float> luminance;
+  luminance.clear();
   luminance.reserve(static_cast<size_t>(previewWidth) * static_cast<size_t>(previewHeight));
 
   for (int32_t y = 0; y < previewHeight; ++y) {
@@ -1975,6 +2083,8 @@ struct MetalRenderer::Impl {
   id<MTLComputePipelineState> halationScatterCoreBlurYPipeline = nil;
   id<MTLComputePipelineState> halationScatterTailBlurXPipeline = nil;
   id<MTLComputePipelineState> halationScatterTailBlurYPipeline = nil;
+  id<MTLComputePipelineState> halationScatterTailGroupBlurXPipeline = nil;
+  id<MTLComputePipelineState> halationScatterTailGroupBlurYPipeline = nil;
   id<MTLComputePipelineState> halationScatterResolvePipeline = nil;
   id<MTLComputePipelineState> halationClearPipeline = nil;
   id<MTLComputePipelineState> halationBounceBlurXPipeline = nil;
@@ -1987,6 +2097,19 @@ struct MetalRenderer::Impl {
   id<MTLComputePipelineState> diffusionComponentBlurYAccumulatePipeline = nil;
   id<MTLComputePipelineState> diffusionGroupBlurXPipeline = nil;
   id<MTLComputePipelineState> diffusionGroupBlurYAccumulatePipeline = nil;
+  id<MTLComputePipelineState> diffusionDownsamplePipeline = nil;
+  id<MTLComputePipelineState> diffusionDownsampleBlurXPipeline = nil;
+  id<MTLComputePipelineState> diffusionDownsampleBlurYPipeline = nil;
+  id<MTLComputePipelineState> diffusionDownsampleUpsampleAccumulatePipeline = nil;
+  id<MTLComputePipelineState> diffusionDownsampleGroupBlurXPipeline = nil;
+  id<MTLComputePipelineState> diffusionDownsampleGroupBlurYPipeline = nil;
+  id<MTLComputePipelineState> diffusionDownsampleGroupUpsampleAccumulatePipeline = nil;
+  id<MTLComputePipelineState> diffusionDownsampleBlurXHalfPipeline = nil;
+  id<MTLComputePipelineState> diffusionDownsampleBlurYHalfPipeline = nil;
+  id<MTLComputePipelineState> diffusionDownsampleUpsampleAccumulateHalfPipeline = nil;
+  id<MTLComputePipelineState> diffusionDownsampleGroupBlurXHalfPipeline = nil;
+  id<MTLComputePipelineState> diffusionDownsampleGroupBlurYHalfPipeline = nil;
+  id<MTLComputePipelineState> diffusionDownsampleGroupUpsampleAccumulateHalfPipeline = nil;
   id<MTLComputePipelineState> diffusionResolvePipeline = nil;
   id<MTLComputePipelineState> developFromLogRawPipeline = nil;
   id<MTLComputePipelineState> dirCorrectionFromDensityPipeline = nil;
@@ -2035,6 +2158,7 @@ struct MetalRenderer::Impl {
   id<MTLComputePipelineState> frameConstantsPipeline = nil;
   id<MTLComputePipelineState> finalFromFilmDensityPipeline = nil;
   id<MTLComputePipelineState> printRawFromFilmDensityPipeline = nil;
+  id<MTLComputePipelineState> printDensityFromPrintRawPipeline = nil;
   id<MTLComputePipelineState> finalFromPrintRawPipeline = nil;
   id<MTLComputePipelineState> printGlareGeneratePipeline = nil;
   id<MTLComputePipelineState> printGlareBlurXPipeline = nil;
@@ -2056,6 +2180,7 @@ struct MetalRenderer::Impl {
   StaticProfileResources staticResources;
   std::vector<id<MTLBuffer>> scratchBuffers;
   std::vector<id<MTLTexture>> scratchTextures;
+  std::vector<float> autoExposureLuminance;
   size_t scratchCursor = 0;
   size_t textureScratchCursor = 0;
   KernelSpectralInfo spectralInfo{};
@@ -2065,14 +2190,23 @@ struct MetalRenderer::Impl {
   bool preferPrivateScratch = true;
   bool passGpuTimingEnabled = false;
   bool useScannerTextures = false;
+  bool scannerMps = false;
+  bool halationGroupedTail = false;
+  bool grainBlurRecurrence = true;
   bool useLegacyGrainSynthesis = false;
   GrainSynthesisSamplerMode grainSynthesisSamplerMode = GrainSynthesisSamplerMode::R2;
   GrainSynthesisCellMode grainSynthesisCellMode = GrainSynthesisCellMode::OffsetList;
   GrainSynthesisTargetStorageMode grainSynthesisTargetStorageMode = GrainSynthesisTargetStorageMode::FloatBuffer;
-  DirTailBackend dirTailBackend = DirTailBackend::Fused;
+  DirTailBackend dirTailBackend = DirTailBackend::Mps;
   uint32_t grainSynthesisRadiusLutSize = 512u;
-  uint32_t diffusionGroupSize = 1;
+  uint32_t diffusionGroupSize = 2;
+  float diffusionClusterSigmaRatio = 0.10f;
   std::string passTimingMode = "off";
+  std::string blurBackend = "custom";
+  std::string blurDownsample = "auto";
+  std::string intermediatePrecision = "float";
+  std::string diffusionClusterSigma = "0.10";
+  std::unordered_map<int, MPSImageGaussianBlur *> mpsGaussianBlurCache;
   uint32_t forcedThreadgroupWidth = 0;
   uint32_t forcedThreadgroupHeight = 0;
   std::string threadgroupMode = "auto";
@@ -2166,15 +2300,20 @@ struct MetalRenderer::Impl {
     return scratchBuffer(length, name, preferPrivateScratch ? MTLStorageModePrivate : MTLStorageModeShared);
   }
 
-  id<MTLTexture> gpuScratchTexture(NSUInteger width, NSUInteger height, const char *name) {
+  id<MTLTexture> gpuScratchTexture(
+    NSUInteger width,
+    NSUInteger height,
+    const char *name,
+    MTLPixelFormat pixelFormat = MTLPixelFormatRGBA32Float
+  ) {
     const size_t index = textureScratchCursor++;
     if (index >= scratchTextures.size()) {
       scratchTextures.resize(index + 1u);
     }
     id<MTLTexture> texture = scratchTextures[index];
     if (!texture || [texture width] < width || [texture height] < height ||
-        [texture textureType] != MTLTextureType2D || [texture pixelFormat] != MTLPixelFormatRGBA32Float) {
-      MTLTextureDescriptor *descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float
+        [texture textureType] != MTLTextureType2D || [texture pixelFormat] != pixelFormat) {
+      MTLTextureDescriptor *descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pixelFormat
                                                                                             width:width
                                                                                            height:height
                                                                                         mipmapped:NO];
@@ -2186,7 +2325,8 @@ struct MetalRenderer::Impl {
         return nil;
       }
       scratchTextures[index] = texture;
-      const uint64_t bytes = static_cast<uint64_t>(width) * static_cast<uint64_t>(height) * 4u * sizeof(float);
+      const uint64_t bytesPerPixel = pixelFormat == MTLPixelFormatRGBA16Float ? 4u * sizeof(uint16_t) : 4u * sizeof(float);
+      const uint64_t bytes = static_cast<uint64_t>(width) * static_cast<uint64_t>(height) * bytesPerPixel;
       diagnostics.scratchAllocationBytes += bytes;
       diagnostics.scratchAllocationCount += 1;
       diagnostics.privateScratchAllocationBytes += bytes;
@@ -2226,6 +2366,26 @@ struct MetalRenderer::Impl {
       diagnostics.privateScratchAllocationCount += 1;
     }
     return texture;
+  }
+
+  MPSImageGaussianBlur *cachedMpsGaussianBlur(float sigma) {
+    if (!(sigma > 1.0e-4f)) {
+      return nil;
+    }
+    const int key = std::max(1, static_cast<int>(std::lround(sigma * 1024.0f)));
+    auto existing = mpsGaussianBlurCache.find(key);
+    if (existing != mpsGaussianBlurCache.end()) {
+      return existing->second;
+    }
+    MPSImageGaussianBlur *blur = [[MPSImageGaussianBlur alloc] initWithDevice:device sigma:sigma];
+    if (!blur) {
+      lastError = "Unable to create MPS Gaussian blur.";
+      return nil;
+    }
+    blur.edgeMode = MPSImageEdgeModeClamp;
+    blur.options = MPSKernelOptionsSkipAPIValidation;
+    mpsGaussianBlurCache.emplace(key, blur);
+    return blur;
   }
 
   void beginScratchFrame() {
@@ -2528,10 +2688,36 @@ struct MetalRenderer::Impl {
       }
       passGpuTimingEnabled = passTimingMode != "off";
       useScannerTextures = envString("SPEKTRAFILM_SCANNER_IMAGE_STORAGE", "buffer") == "texture";
-      dirTailBackend = envString("SPEKTRAFILM_DIR_TAIL_BACKEND", "fused") == "mps"
+      blurBackend = envString("SPEKTRAFILM_BLUR_BACKEND", "custom");
+      if (blurBackend != "custom" && blurBackend != "mps" && blurBackend != "auto") {
+        blurBackend = "custom";
+      }
+      blurDownsample = envString("SPEKTRAFILM_BLUR_DOWNSAMPLE", "auto");
+      if (blurDownsample != "off" && blurDownsample != "2" && blurDownsample != "4" &&
+          blurDownsample != "8" && blurDownsample != "auto") {
+        blurDownsample = "off";
+      }
+      intermediatePrecision = envString("SPEKTRAFILM_INTERMEDIATE_PRECISION", "float");
+      if (intermediatePrecision != "float" && intermediatePrecision != "half-blur") {
+        intermediatePrecision = "float";
+      }
+      diffusionClusterSigma = envString("SPEKTRAFILM_DIFFUSION_CLUSTER_SIGMA", "0.10");
+      if (diffusionClusterSigma == "0.05") {
+        diffusionClusterSigmaRatio = 0.05f;
+      } else if (diffusionClusterSigma == "0.10" || diffusionClusterSigma == "0.1") {
+        diffusionClusterSigma = "0.10";
+        diffusionClusterSigmaRatio = 0.10f;
+      } else {
+        diffusionClusterSigma = "off";
+        diffusionClusterSigmaRatio = 0.0f;
+      }
+      halationGroupedTail = envFlagEnabled("SPEKTRAFILM_HALATION_GROUPED_TAIL");
+      scannerMps = envFlagEnabled("SPEKTRAFILM_SCANNER_MPS");
+      grainBlurRecurrence = envFlagEnabledOrDefault("SPEKTRAFILM_GRAIN_BLUR_RECURRENCE", true);
+      dirTailBackend = envString("SPEKTRAFILM_DIR_TAIL_BACKEND", "mps") == "mps"
         ? DirTailBackend::Mps
         : DirTailBackend::Fused;
-      const std::string diffusionGroupSizeText = envString("SPEKTRAFILM_DIFFUSION_GROUP_SIZE", "1");
+      const std::string diffusionGroupSizeText = envString("SPEKTRAFILM_DIFFUSION_GROUP_SIZE", "2");
       if (diffusionGroupSizeText == "1") {
         diffusionGroupSize = 1u;
       } else if (diffusionGroupSizeText == "2") {
@@ -2605,6 +2791,8 @@ struct MetalRenderer::Impl {
       halationScatterCoreBlurYPipeline = makePipeline(@"spektrafilm_halation_scatter_core_blur_y");
       halationScatterTailBlurXPipeline = makePipeline(@"spektrafilm_halation_scatter_tail_blur_x");
       halationScatterTailBlurYPipeline = makePipeline(@"spektrafilm_halation_scatter_tail_blur_y");
+      halationScatterTailGroupBlurXPipeline = makePipeline(@"spektrafilm_halation_scatter_tail_group_blur_x");
+      halationScatterTailGroupBlurYPipeline = makePipeline(@"spektrafilm_halation_scatter_tail_group_blur_y");
       halationScatterResolvePipeline = makePipeline(@"spektrafilm_halation_scatter_resolve");
       halationClearPipeline = makePipeline(@"spektrafilm_halation_clear");
       halationBounceBlurXPipeline = makePipeline(@"spektrafilm_halation_bounce_blur_x");
@@ -2617,6 +2805,19 @@ struct MetalRenderer::Impl {
       diffusionComponentBlurYAccumulatePipeline = makePipeline(@"spektrafilm_diffusion_component_blur_y_accumulate");
       diffusionGroupBlurXPipeline = makePipeline(@"spektrafilm_diffusion_group_blur_x");
       diffusionGroupBlurYAccumulatePipeline = makePipeline(@"spektrafilm_diffusion_group_blur_y_accumulate");
+      diffusionDownsamplePipeline = makePipeline(@"spektrafilm_diffusion_downsample");
+      diffusionDownsampleBlurXPipeline = makePipeline(@"spektrafilm_diffusion_downsample_blur_x");
+      diffusionDownsampleBlurYPipeline = makePipeline(@"spektrafilm_diffusion_downsample_blur_y");
+      diffusionDownsampleUpsampleAccumulatePipeline = makePipeline(@"spektrafilm_diffusion_downsample_upsample_accumulate");
+      diffusionDownsampleGroupBlurXPipeline = makePipeline(@"spektrafilm_diffusion_downsample_group_blur_x");
+      diffusionDownsampleGroupBlurYPipeline = makePipeline(@"spektrafilm_diffusion_downsample_group_blur_y");
+      diffusionDownsampleGroupUpsampleAccumulatePipeline = makePipeline(@"spektrafilm_diffusion_downsample_group_upsample_accumulate");
+      diffusionDownsampleBlurXHalfPipeline = makePipeline(@"spektrafilm_diffusion_downsample_blur_x_half");
+      diffusionDownsampleBlurYHalfPipeline = makePipeline(@"spektrafilm_diffusion_downsample_blur_y_half");
+      diffusionDownsampleUpsampleAccumulateHalfPipeline = makePipeline(@"spektrafilm_diffusion_downsample_upsample_accumulate_half");
+      diffusionDownsampleGroupBlurXHalfPipeline = makePipeline(@"spektrafilm_diffusion_downsample_group_blur_x_half");
+      diffusionDownsampleGroupBlurYHalfPipeline = makePipeline(@"spektrafilm_diffusion_downsample_group_blur_y_half");
+      diffusionDownsampleGroupUpsampleAccumulateHalfPipeline = makePipeline(@"spektrafilm_diffusion_downsample_group_upsample_accumulate_half");
       diffusionResolvePipeline = makePipeline(@"spektrafilm_diffusion_resolve");
       developFromLogRawPipeline = makePipeline(@"spektrafilm_develop_from_log_raw");
       dirCorrectionFromDensityPipeline = makePipeline(@"spektrafilm_dir_correction_from_density");
@@ -2665,6 +2866,7 @@ struct MetalRenderer::Impl {
       frameConstantsPipeline = makePipeline(@"spektrafilm_frame_constants");
       finalFromFilmDensityPipeline = makePipeline(@"spektrafilm_final_from_film_density");
       printRawFromFilmDensityPipeline = makePipeline(@"spektrafilm_print_raw_from_film_density");
+      printDensityFromPrintRawPipeline = makePipeline(@"spektrafilm_print_density_from_print_raw");
       finalFromPrintRawPipeline = makePipeline(@"spektrafilm_final_from_print_raw");
       printGlareGeneratePipeline = makePipeline(@"spektrafilm_print_glare_generate");
       printGlareBlurXPipeline = makePipeline(@"spektrafilm_print_glare_blur_x");
@@ -2686,11 +2888,19 @@ struct MetalRenderer::Impl {
           !grainPipeline || !halationRawExposurePipeline || !halationBoostMaxPipeline ||
           !halationBoostReduceMaxPipeline || !halationBoostApplyPipeline || !halationScatterCoreBlurXPipeline ||
           !halationScatterCoreBlurYPipeline || !halationScatterTailBlurXPipeline || !halationScatterTailBlurYPipeline ||
+          !halationScatterTailGroupBlurXPipeline || !halationScatterTailGroupBlurYPipeline ||
           !halationScatterResolvePipeline || !halationClearPipeline || !halationBounceBlurXPipeline ||
           !halationBounceBlurYAccumulatePipeline || !halationResolveLogRawPipeline || !halationResolveDensityPipeline ||
           !rawToLogRawPipeline || !developFromRawPipeline ||
           !diffusionComponentBlurXPipeline || !diffusionComponentBlurYAccumulatePipeline ||
-          !diffusionGroupBlurXPipeline || !diffusionGroupBlurYAccumulatePipeline || !diffusionResolvePipeline ||
+          !diffusionGroupBlurXPipeline || !diffusionGroupBlurYAccumulatePipeline ||
+          !diffusionDownsamplePipeline || !diffusionDownsampleBlurXPipeline || !diffusionDownsampleBlurYPipeline ||
+          !diffusionDownsampleUpsampleAccumulatePipeline || !diffusionDownsampleGroupBlurXPipeline ||
+          !diffusionDownsampleGroupBlurYPipeline || !diffusionDownsampleGroupUpsampleAccumulatePipeline ||
+          !diffusionDownsampleBlurXHalfPipeline || !diffusionDownsampleBlurYHalfPipeline ||
+          !diffusionDownsampleUpsampleAccumulateHalfPipeline || !diffusionDownsampleGroupBlurXHalfPipeline ||
+          !diffusionDownsampleGroupBlurYHalfPipeline || !diffusionDownsampleGroupUpsampleAccumulateHalfPipeline ||
+          !diffusionResolvePipeline ||
           !developFromLogRawPipeline ||
           !dirCorrectionFromDensityPipeline || !copyBufferPipeline ||
           !halfToFloatBufferPipeline || !floatToHalfBufferPipeline ||
@@ -2757,13 +2967,23 @@ bool MetalRenderer::isAvailable() const {
   return impl_ && impl_->device && impl_->commandQueue && impl_->enlargerResamplePipeline && impl_->grainPipeline &&
     impl_->halationRawExposurePipeline && impl_->halationScatterCoreBlurXPipeline &&
     impl_->halationScatterCoreBlurYPipeline && impl_->halationScatterTailBlurXPipeline &&
-    impl_->halationScatterTailBlurYPipeline && impl_->halationScatterResolvePipeline &&
+    impl_->halationScatterTailBlurYPipeline && impl_->halationScatterTailGroupBlurXPipeline &&
+    impl_->halationScatterTailGroupBlurYPipeline && impl_->halationScatterResolvePipeline &&
     impl_->halationClearPipeline && impl_->halationBounceBlurXPipeline &&
     impl_->halationBounceBlurYAccumulatePipeline && impl_->halationResolveLogRawPipeline &&
     impl_->halationResolveDensityPipeline && impl_->rawToLogRawPipeline && impl_->developFromRawPipeline &&
     impl_->diffusionComponentBlurXPipeline &&
     impl_->diffusionComponentBlurYAccumulatePipeline &&
-    impl_->diffusionGroupBlurXPipeline && impl_->diffusionGroupBlurYAccumulatePipeline && impl_->diffusionResolvePipeline &&
+    impl_->diffusionGroupBlurXPipeline && impl_->diffusionGroupBlurYAccumulatePipeline &&
+    impl_->diffusionDownsamplePipeline && impl_->diffusionDownsampleBlurXPipeline &&
+    impl_->diffusionDownsampleBlurYPipeline && impl_->diffusionDownsampleUpsampleAccumulatePipeline &&
+    impl_->diffusionDownsampleGroupBlurXPipeline && impl_->diffusionDownsampleGroupBlurYPipeline &&
+    impl_->diffusionDownsampleGroupUpsampleAccumulatePipeline &&
+    impl_->diffusionDownsampleBlurXHalfPipeline && impl_->diffusionDownsampleBlurYHalfPipeline &&
+    impl_->diffusionDownsampleUpsampleAccumulateHalfPipeline &&
+    impl_->diffusionDownsampleGroupBlurXHalfPipeline && impl_->diffusionDownsampleGroupBlurYHalfPipeline &&
+    impl_->diffusionDownsampleGroupUpsampleAccumulateHalfPipeline &&
+    impl_->diffusionResolvePipeline &&
     impl_->developFromLogRawPipeline && impl_->dirCorrectionFromDensityPipeline && impl_->copyBufferPipeline &&
     impl_->halfToFloatBufferPipeline && impl_->floatToHalfBufferPipeline &&
     impl_->dirBaselinePipeline && impl_->dirBlurXPipeline && impl_->dirBlurYPipeline &&
@@ -2794,7 +3014,8 @@ bool MetalRenderer::isAvailable() const {
     impl_->grainSynthesisLayersFromTargetDensityNonLayeredTextureFixedRadiusPipeline &&
     impl_->grainSynthesisResolveDensityPipeline &&
     impl_->frameConstantsPipeline && impl_->finalFromFilmDensityPipeline && impl_->printRawFromFilmDensityPipeline &&
-    impl_->finalFromPrintRawPipeline && impl_->scannerBlurXPipeline && impl_->scannerBlurYPipeline &&
+    impl_->printDensityFromPrintRawPipeline && impl_->finalFromPrintRawPipeline &&
+    impl_->scannerBlurXPipeline && impl_->scannerBlurYPipeline &&
     impl_->unsharpBlurXPipeline && impl_->unsharpBlurYPipeline &&
     impl_->bufferToTexturePipeline && impl_->textureToBufferPipeline &&
     impl_->scannerBlurXTexturePipeline && impl_->scannerBlurYTexturePipeline &&
@@ -2847,6 +3068,14 @@ bool MetalRenderer::render(
     impl_->diagnostics.passGpuTimingEnabled = impl_->passGpuTimingEnabled;
     impl_->diagnostics.diffusionGroupSize = impl_->diffusionGroupSize;
     impl_->diagnostics.threadgroupMode = impl_->threadgroupMode;
+    impl_->diagnostics.blurBackend = impl_->blurBackend;
+    impl_->diagnostics.blurDownsample = impl_->blurDownsample;
+    impl_->diagnostics.intermediatePrecision = impl_->intermediatePrecision;
+    impl_->diagnostics.diffusionClusterSigma = impl_->diffusionClusterSigma;
+    impl_->diagnostics.halationGroupedTail = impl_->halationGroupedTail;
+    impl_->diagnostics.scannerMps = impl_->scannerMps;
+    impl_->diagnostics.grainBlurRecurrence = impl_->grainBlurRecurrence;
+    impl_->diagnostics.dirTailBackend = impl_->dirTailBackend == DirTailBackend::Mps ? "mps" : "fused";
     impl_->diagnostics.scannerTextureIntermediates = false;
     impl_->diagnostics.passTimingMode = "off";
     const NSUInteger pixelBytes = sizeof(float) * 4;
@@ -2868,8 +3097,13 @@ bool MetalRenderer::render(
     const NSUInteger densityCurveBytes = static_cast<NSUInteger>(filmCurves->exposureCount) * 3u * sizeof(float);
     const bool densityOutput = params.renderOutput == RenderOutputMode::FilmDensityCmy;
     const bool densityWithGrainOutput = params.renderOutput == RenderOutputMode::FilmDensityCmyWithGrain;
+    const bool filmLogRawOutput = params.renderOutput == RenderOutputMode::FilmLogRaw;
+    const bool printLogRawOutput = params.renderOutput == RenderOutputMode::PrintLogRaw;
+    const bool printDensityOutput = params.renderOutput == RenderOutputMode::PrintDensityCmy;
+    const bool printStageOutput = printLogRawOutput || printDensityOutput;
     const bool finalOutput = params.renderOutput == RenderOutputMode::FinalPreview;
     const bool finalPrintSimulation = finalOutput && params.process == ProcessMode::PrintSimulation;
+    const bool printSimulationPath = finalPrintSimulation || printStageOutput;
     const bool finalScanNegative = finalOutput && params.process == ProcessMode::ScanNegative;
     const bool finalPostProcessPath = finalPrintSimulation || finalScanNegative;
     const bool cameraDiffusionRequested =
@@ -2880,8 +3114,8 @@ bool MetalRenderer::render(
       params.printDiffusionEnabled &&
       params.printDiffusionStrength > 0.0f &&
       params.printDiffusionSpatialScale > 0.0f &&
-      finalPrintSimulation;
-    const bool needsFilmDensityPath = densityOutput || densityWithGrainOutput || finalPrintSimulation || finalScanNegative;
+      printSimulationPath;
+    const bool needsFilmDensityPath = densityOutput || densityWithGrainOutput || printStageOutput || finalPrintSimulation || finalScanNegative;
     const bool needsHalationLogRawPath = true;
     const bool halationScatterPath =
       params.halationEnabled &&
@@ -2910,11 +3144,11 @@ bool MetalRenderer::render(
     const bool productionGrainPath =
       params.grainEnabled &&
       params.grainModel == GrainModel::Production &&
-      (densityWithGrainOutput || finalPrintSimulation || finalScanNegative);
+      (densityWithGrainOutput || printStageOutput || finalPrintSimulation || finalScanNegative);
     const bool grainSynthesisPath =
       params.grainEnabled &&
       params.grainModel == GrainModel::GrainSynthesis &&
-      (densityWithGrainOutput || finalPrintSimulation || finalScanNegative);
+      (densityWithGrainOutput || printStageOutput || finalPrintSimulation || finalScanNegative);
     const bool grainControlsPath =
       (productionGrainPath || grainSynthesisPath) &&
       (std::abs(params.grainAmount - 1.0f) > 1.0e-6f || std::abs(params.grainSaturation - 1.0f) > 1.0e-6f);
@@ -2922,6 +3156,21 @@ bool MetalRenderer::render(
     const NSUInteger dirCorrectionBufferBBytes = dirTailPath && !dirTailMpsPath ? bufferBytes * 3u : bufferBytes;
     const float pixelSizeUm = filmFormatMm(params.filmFormat) * 1000.0f /
       static_cast<float>(std::max(width, height)) / enlargerScale(params);
+    const bool grainLayerBlurPath =
+      (productionGrainPath || grainSynthesisPath) &&
+      params.grainSublayersEnabled &&
+      params.grainBlurDyeCloudsUm > 0.0f;
+    const float grainMicroBlurSigmaPx = std::max(params.grainMicroStructureScale, 0.0f) /
+      std::max(pixelSizeUm, 1.0e-6f);
+    const bool grainMicroBlurPath =
+      (productionGrainPath || grainSynthesisPath) &&
+      params.grainSublayersEnabled &&
+      grainMicroBlurSigmaPx > 0.4f;
+    const float grainFinalBlurSigmaPx = effectiveGrainFinalBlurUm(params) /
+      std::max(pixelSizeUm, 1.0e-6f);
+    const bool grainFinalBlurPath =
+      (productionGrainPath || grainSynthesisPath) &&
+      (grainFinalBlurSigmaPx > 0.0f && (params.grainSublayersEnabled || grainFinalBlurSigmaPx > 0.4f));
     KernelDiffusionInfo cameraDiffusionInfo{};
     KernelDiffusionInfo printDiffusionInfo{};
     const std::vector<KernelDiffusionComponent> cameraDiffusionComponents = cameraDiffusionRequested
@@ -2929,9 +3178,10 @@ bool MetalRenderer::render(
           {params.cameraDiffusionFamily, params.cameraDiffusionStrength, params.cameraDiffusionSpatialScale,
            params.cameraDiffusionHaloWarmth, params.cameraDiffusionCoreIntensity, params.cameraDiffusionCoreSize,
            params.cameraDiffusionHaloIntensity, params.cameraDiffusionHaloSize, params.cameraDiffusionBloomIntensity,
-           params.cameraDiffusionBloomSize},
+          params.cameraDiffusionBloomSize},
           pixelSizeUm,
-          cameraDiffusionInfo
+          cameraDiffusionInfo,
+          impl_->diffusionClusterSigmaRatio
         )
       : std::vector<KernelDiffusionComponent>{};
     const std::vector<KernelDiffusionComponent> printDiffusionComponents = printDiffusionRequested
@@ -2939,9 +3189,10 @@ bool MetalRenderer::render(
           {params.printDiffusionFamily, params.printDiffusionStrength, params.printDiffusionSpatialScale,
            params.printDiffusionHaloWarmth, params.printDiffusionCoreIntensity, params.printDiffusionCoreSize,
            params.printDiffusionHaloIntensity, params.printDiffusionHaloSize, params.printDiffusionBloomIntensity,
-           params.printDiffusionBloomSize},
+          params.printDiffusionBloomSize},
           pixelSizeUm,
-          printDiffusionInfo
+          printDiffusionInfo,
+          impl_->diffusionClusterSigmaRatio
         )
       : std::vector<KernelDiffusionComponent>{};
     const bool cameraDiffusionPath = cameraDiffusionRequested && cameraDiffusionInfo.componentCount > 0u && !cameraDiffusionComponents.empty();
@@ -2949,8 +3200,8 @@ bool MetalRenderer::render(
     const bool sourceTransformPath = enlargerTransformActive(params);
     const bool preExposurePath =
       halationBoostPath || cameraDiffusionPath || halationPath || printDiffusionPath || finalPostProcessPath ||
-      densityOutput || densityWithGrainOutput;
-    const bool directDirBaselinePath = dirPath && !halationBoostPath && !cameraDiffusionPath && !halationPath;
+      densityOutput || densityWithGrainOutput || filmLogRawOutput || printStageOutput;
+    const bool directDirBaselinePath = dirPath && !halationBoostPath && !cameraDiffusionPath && !halationPath && !filmLogRawOutput;
     const bool preExposureBranchPath = preExposurePath && !directDirBaselinePath;
     impl_->diagnostics.halationPath = halationPath;
     impl_->diagnostics.cameraDiffusionPath = cameraDiffusionPath;
@@ -2963,7 +3214,7 @@ bool MetalRenderer::render(
       (dirPath || preExposurePath) &&
       params.grainEnabled &&
       params.grainModel == GrainModel::Preview &&
-      (densityWithGrainOutput || finalPrintSimulation || finalScanNegative);
+      (densityWithGrainOutput || printStageOutput || finalPrintSimulation || finalScanNegative);
     const KernelDirInfo dirInfo = makeDirInfo(*filmCurves, params);
     const std::vector<float> dirCorrectedDensityCurves = dirPath
       ? makeDirCorrectedDensityCurves(*filmCurves, dirInfo)
@@ -3057,11 +3308,27 @@ bool MetalRenderer::render(
     const bool printGlarePath = finalPrintSimulation && params.scannerEnabled && params.glarePercent > 0.0f;
     const bool scannerNeedsBlur = finalPostProcessPath && params.scannerEnabled && params.scannerMtf50LpMm > 0.0f;
     const bool scannerNeedsUnsharp = finalPostProcessPath && params.scannerEnabled && params.scannerUnsharpRadiusUm > 0.0f && params.scannerUnsharpAmount > 0.0f;
-    const bool scannerTexturePath = impl_->useScannerTextures && (scannerNeedsBlur || scannerNeedsUnsharp);
+    const bool scannerMpsPath = (impl_->scannerMps || impl_->blurBackend == "mps" ||
+      (impl_->blurBackend == "auto" && impl_->useScannerTextures)) && (scannerNeedsBlur || scannerNeedsUnsharp);
+    const bool scannerTexturePath = (impl_->useScannerTextures || scannerMpsPath) && (scannerNeedsBlur || scannerNeedsUnsharp);
+    const MTLPixelFormat blurTextureFormat = impl_->intermediatePrecision == "half-blur"
+      ? MTLPixelFormatRGBA16Float
+      : MTLPixelFormatRGBA32Float;
     const bool directFinalEncodePath = finalPostProcessPath && !printGlarePath && !scannerNeedsBlur && !scannerNeedsUnsharp;
     impl_->diagnostics.scannerTextureIntermediates = scannerTexturePath;
     const bool needsFrameConstants = needsFilmDensityPath || printDiffusionPath;
     const NSUInteger diffusionTempBytes = bufferBytes * static_cast<NSUInteger>(std::max(impl_->diffusionGroupSize, 1u));
+    const bool diffusionDownsamplePath = impl_->blurDownsample != "off" &&
+      (anyDiffusionComponentDownsamples(cameraDiffusionComponents, impl_->blurDownsample) ||
+       anyDiffusionComponentDownsamples(printDiffusionComponents, impl_->blurDownsample));
+    const bool diffusionDownsampleHalfPath = diffusionDownsamplePath && impl_->intermediatePrecision == "half-blur";
+    const NSUInteger diffusionDownsampleBufferBytes = static_cast<NSUInteger>((width + 1) / 2) *
+      static_cast<NSUInteger>((height + 1) / 2) * pixelBytes;
+    const NSUInteger diffusionDownsampleIntermediatePlaneBytes = diffusionDownsampleHalfPath
+      ? static_cast<NSUInteger>((width + 1) / 2) * static_cast<NSUInteger>((height + 1) / 2) * 4u * sizeof(uint16_t)
+      : diffusionDownsampleBufferBytes;
+    const NSUInteger diffusionDownsampleGroupBytes =
+      diffusionDownsampleIntermediatePlaneBytes * static_cast<NSUInteger>(std::max(impl_->diffusionGroupSize, 1u));
     constexpr uint32_t kHalationBoostMaxChunkPixels = 256u;
     const uint32_t halationBoostMaxChunkCount = halationBoostPath
       ? static_cast<uint32_t>((static_cast<uint64_t>(width) * static_cast<uint64_t>(height) +
@@ -3071,9 +3338,9 @@ bool MetalRenderer::render(
     id<MTLBuffer> scannerRgbBufferA = (finalPostProcessPath && !directFinalEncodePath) ? impl_->gpuScratchBuffer(bufferBytes, "scanner rgb A") : nil;
     id<MTLBuffer> scannerRgbBufferB = (!scannerTexturePath && (scannerNeedsBlur || scannerNeedsUnsharp)) ? impl_->gpuScratchBuffer(bufferBytes, "scanner rgb B") : nil;
     id<MTLBuffer> scannerRgbBufferC = (!scannerTexturePath && scannerNeedsUnsharp) ? impl_->gpuScratchBuffer(bufferBytes, "scanner rgb C") : nil;
-    id<MTLTexture> scannerTextureA = scannerTexturePath ? impl_->gpuScratchTexture(width, height, "scanner texture A") : nil;
-    id<MTLTexture> scannerTextureB = scannerTexturePath ? impl_->gpuScratchTexture(width, height, "scanner texture B") : nil;
-    id<MTLTexture> scannerTextureC = (scannerTexturePath && scannerNeedsUnsharp) ? impl_->gpuScratchTexture(width, height, "scanner texture C") : nil;
+    id<MTLTexture> scannerTextureA = scannerTexturePath ? impl_->gpuScratchTexture(width, height, "scanner texture A", blurTextureFormat) : nil;
+    id<MTLTexture> scannerTextureB = scannerTexturePath ? impl_->gpuScratchTexture(width, height, "scanner texture B", blurTextureFormat) : nil;
+    id<MTLTexture> scannerTextureC = (scannerTexturePath && scannerNeedsUnsharp) ? impl_->gpuScratchTexture(width, height, "scanner texture C", blurTextureFormat) : nil;
     id<MTLBuffer> printGlareBufferA = printGlarePath ? impl_->gpuScratchBuffer(bufferBytes, "print glare A") : nil;
     id<MTLBuffer> printGlareBufferB = printGlarePath ? impl_->gpuScratchBuffer(bufferBytes, "print glare B") : nil;
     id<MTLBuffer> halationRawBufferA = preExposureBranchPath ? impl_->gpuScratchBuffer(bufferBytes, "pre-exposure raw A") : nil;
@@ -3086,6 +3353,9 @@ bool MetalRenderer::render(
     id<MTLBuffer> halationBoostMaxBuffer = halationBoostPath
       ? impl_->gpuScratchBuffer(static_cast<NSUInteger>(std::max(halationBoostMaxChunkCount, 4u)) * sizeof(float), "halation boost max")
       : nil;
+    id<MTLBuffer> halationScatterTailGroupBuffer = (halationScatterPath && impl_->halationGroupedTail)
+      ? impl_->gpuScratchBuffer(bufferBytes * 3u, "halation scatter grouped tail")
+      : nil;
     id<MTLBuffer> cameraDiffusionInfoBuffer = cameraDiffusionPath ? impl_->sharedScratchBuffer(sizeof(KernelDiffusionInfo), "camera diffusion info") : nil;
     id<MTLBuffer> cameraDiffusionComponentsBuffer = cameraDiffusionPath && !cameraDiffusionComponents.empty()
       ? impl_->sharedScratchBuffer(cameraDiffusionComponents.size() * sizeof(KernelDiffusionComponent), "camera diffusion components")
@@ -3094,7 +3364,16 @@ bool MetalRenderer::render(
     id<MTLBuffer> printDiffusionComponentsBuffer = printDiffusionPath && !printDiffusionComponents.empty()
       ? impl_->sharedScratchBuffer(printDiffusionComponents.size() * sizeof(KernelDiffusionComponent), "print diffusion components")
       : nil;
-    id<MTLBuffer> printRawBufferA = printDiffusionPath ? impl_->gpuScratchBuffer(bufferBytes, "print raw A") : nil;
+    id<MTLBuffer> diffusionDownsampleSourceBuffer = diffusionDownsamplePath
+      ? impl_->gpuScratchBuffer(diffusionDownsampleBufferBytes, "diffusion downsample source")
+      : nil;
+    id<MTLBuffer> diffusionDownsampleTempBuffer = diffusionDownsamplePath
+      ? impl_->gpuScratchBuffer(diffusionDownsampleGroupBytes, "diffusion downsample temp")
+      : nil;
+    id<MTLBuffer> diffusionDownsampleBlurBuffer = diffusionDownsamplePath
+      ? impl_->gpuScratchBuffer(diffusionDownsampleGroupBytes, "diffusion downsample blur")
+      : nil;
+    id<MTLBuffer> printRawBufferA = (printDiffusionPath || printStageOutput) ? impl_->gpuScratchBuffer(bufferBytes, "print raw A") : nil;
     id<MTLBuffer> printRawBufferB = printDiffusionPath ? impl_->gpuScratchBuffer(diffusionTempBytes, "print raw B") : nil;
     id<MTLBuffer> printRawBufferC = printDiffusionPath ? impl_->gpuScratchBuffer(bufferBytes, "print raw C") : nil;
     id<MTLBuffer> dirInfoBuffer = dirPath ? impl_->sharedScratchBuffer(sizeof(KernelDirInfo), "DIR info") : nil;
@@ -3105,20 +3384,27 @@ bool MetalRenderer::render(
     id<MTLBuffer> dirCorrectionBufferA = dirPath ? impl_->gpuScratchBuffer(bufferBytes, "DIR correction A") : nil;
     id<MTLBuffer> dirCorrectionBufferB = dirBlurPath ? impl_->gpuScratchBuffer(dirCorrectionBufferBBytes, "DIR correction B") : nil;
     id<MTLBuffer> dirCorrectionBufferC = dirTailPath ? impl_->gpuScratchBuffer(bufferBytes, "DIR correction C") : nil;
-    id<MTLTexture> dirTailSourceTexture = dirTailMpsPath ? impl_->gpuScratchTexture(width, height, "DIR tail MPS source") : nil;
-    id<MTLTexture> dirTailBlurTexture = dirTailMpsPath ? impl_->gpuScratchTexture(width, height, "DIR tail MPS blur") : nil;
-    id<MTLBuffer> grainLayerBufferA = (productionGrainPath || grainSynthesisPath) ? impl_->gpuScratchBuffer(grainLayerBytes, "grain layer A") : nil;
-    id<MTLBuffer> grainLayerBufferB = (productionGrainPath || grainSynthesisPath) ? impl_->gpuScratchBuffer(grainLayerBytes, "grain layer B") : nil;
-    id<MTLBuffer> grainMicroBufferA = (productionGrainPath || grainSynthesisPath) ? impl_->gpuScratchBuffer(bufferBytes, "grain micro A") : nil;
-    id<MTLBuffer> grainMicroBufferB = (productionGrainPath || grainSynthesisPath) ? impl_->gpuScratchBuffer(bufferBytes, "grain micro B") : nil;
-    id<MTLBuffer> grainDensityBufferA = (productionGrainPath || grainSynthesisPath) ? impl_->gpuScratchBuffer(bufferBytes, "grain density A") : nil;
-    id<MTLBuffer> grainDensityBufferB = (productionGrainPath || grainSynthesisPath) ? impl_->gpuScratchBuffer(bufferBytes, "grain density B") : nil;
-    id<MTLBuffer> grainBaseDensityBuffer = grainControlsPath ? impl_->gpuScratchBuffer(bufferBytes, "grain base density") : nil;
+    id<MTLTexture> dirTailSourceTexture = dirTailMpsPath ? impl_->gpuScratchTexture(width, height, "DIR tail MPS source", blurTextureFormat) : nil;
+    id<MTLTexture> dirTailBlurTexture = dirTailMpsPath ? impl_->gpuScratchTexture(width, height, "DIR tail MPS blur", blurTextureFormat) : nil;
     const bool optimizedGrainSynthesisPath = grainSynthesisPath && !impl_->useLegacyGrainSynthesis;
     const bool halfGrainSynthesisTargetPath = optimizedGrainSynthesisPath &&
       impl_->grainSynthesisTargetStorageMode == GrainSynthesisTargetStorageMode::HalfBuffer;
     const bool textureGrainSynthesisTargetPath = optimizedGrainSynthesisPath &&
       impl_->grainSynthesisTargetStorageMode == GrainSynthesisTargetStorageMode::R16TextureArray;
+    const bool floatGrainSynthesisTargetPath = optimizedGrainSynthesisPath &&
+      !halfGrainSynthesisTargetPath &&
+      !textureGrainSynthesisTargetPath;
+    id<MTLBuffer> grainLayerBufferA = (productionGrainPath || grainSynthesisPath) ? impl_->gpuScratchBuffer(grainLayerBytes, "grain layer A") : nil;
+    id<MTLBuffer> grainLayerBufferB = (grainLayerBlurPath || floatGrainSynthesisTargetPath)
+      ? impl_->gpuScratchBuffer(grainLayerBytes, "grain layer B")
+      : nil;
+    id<MTLBuffer> grainMicroBufferA = (productionGrainPath || grainSynthesisPath) ? impl_->gpuScratchBuffer(bufferBytes, "grain micro A") : nil;
+    id<MTLBuffer> grainMicroBufferB = grainMicroBlurPath ? impl_->gpuScratchBuffer(bufferBytes, "grain micro B") : nil;
+    id<MTLBuffer> grainDensityBufferA = (productionGrainPath || grainSynthesisPath) ? impl_->gpuScratchBuffer(bufferBytes, "grain density A") : nil;
+    id<MTLBuffer> grainDensityBufferB = ((productionGrainPath || grainSynthesisPath) && (grainFinalBlurPath || grainControlsPath))
+      ? impl_->gpuScratchBuffer(bufferBytes, "grain density B")
+      : nil;
+    id<MTLBuffer> grainBaseDensityBuffer = grainControlsPath ? impl_->gpuScratchBuffer(bufferBytes, "grain base density") : nil;
     id<MTLBuffer> grainSynthesisTargetHalfBuffer = halfGrainSynthesisTargetPath
       ? impl_->gpuScratchBuffer(static_cast<NSUInteger>(width) * static_cast<NSUInteger>(height) *
           kGrainSynthesisComponentCount * sizeof(uint16_t), "grain synthesis target half")
@@ -3144,13 +3430,15 @@ bool MetalRenderer::render(
       impl_->lastError = "Unable to allocate Metal staging buffers.";
       return false;
     }
-    if (productionGrainPath && (!grainLayerBufferA || !grainLayerBufferB || !grainMicroBufferA || !grainMicroBufferB ||
-        !grainDensityBufferA || !grainDensityBufferB)) {
+    if (productionGrainPath && (!grainLayerBufferA || (grainLayerBlurPath && !grainLayerBufferB) ||
+        !grainMicroBufferA || (grainMicroBlurPath && !grainMicroBufferB) ||
+        !grainDensityBufferA || ((grainFinalBlurPath || grainControlsPath) && !grainDensityBufferB))) {
       impl_->lastError = "Unable to allocate production grain Metal buffers.";
       return false;
     }
-    if (grainSynthesisPath && (!grainLayerBufferA || !grainLayerBufferB || !grainMicroBufferA || !grainMicroBufferB ||
-        !grainDensityBufferA || !grainDensityBufferB)) {
+    if (grainSynthesisPath && (!grainLayerBufferA || ((grainLayerBlurPath || floatGrainSynthesisTargetPath) && !grainLayerBufferB) ||
+        !grainMicroBufferA || (grainMicroBlurPath && !grainMicroBufferB) ||
+        !grainDensityBufferA || ((grainFinalBlurPath || grainControlsPath) && !grainDensityBufferB))) {
       impl_->lastError = "Unable to allocate grain synthesis Metal buffers.";
       return false;
     }
@@ -3185,8 +3473,21 @@ bool MetalRenderer::render(
       impl_->lastError = "Unable to allocate halation highlight boost Metal buffers.";
       return false;
     }
+    if (halationScatterPath && impl_->halationGroupedTail && !halationScatterTailGroupBuffer) {
+      impl_->lastError = "Unable to allocate grouped halation tail Metal buffers.";
+      return false;
+    }
+    if (diffusionDownsamplePath && (!diffusionDownsampleSourceBuffer || !diffusionDownsampleTempBuffer ||
+        !diffusionDownsampleBlurBuffer)) {
+      impl_->lastError = "Unable to allocate downsampled diffusion Metal buffers.";
+      return false;
+    }
+    if ((printDiffusionPath || printStageOutput) && !printRawBufferA) {
+      impl_->lastError = "Unable to allocate print stage Metal buffers.";
+      return false;
+    }
     if (printDiffusionPath && (!printDiffusionInfoBuffer || !printDiffusionComponentsBuffer ||
-        !printRawBufferA || !printRawBufferB || !printRawBufferC)) {
+        !printRawBufferB || !printRawBufferC)) {
       impl_->lastError = "Unable to allocate print diffusion Metal buffers.";
       return false;
     }
@@ -3226,7 +3527,13 @@ bool MetalRenderer::render(
     );
     const std::array<KernelGaussianBlurInfo, 3> dirTailBlurInfos = makeDirTailBlurInfos(kernelParams);
     if (params.autoExposure) {
-      kernelParams.autoExposureEv = measureAutoExposureEv(static_cast<const float *>([srcBuffer contents]), width, height, params);
+      kernelParams.autoExposureEv = measureAutoExposureEv(
+        static_cast<const float *>([srcBuffer contents]),
+        width,
+        height,
+        params,
+        impl_->autoExposureLuminance
+      );
     }
     std::memcpy([paramBuffer contents], &kernelParams, sizeof(kernelParams));
     impl_->diagnostics.uploadBytes += sizeof(kernelParams);
@@ -3334,6 +3641,7 @@ bool MetalRenderer::render(
       impl_->diagnostics.passTimingMode = "unavailable";
     }
     uint32_t dims[2] = {static_cast<uint32_t>(width), static_cast<uint32_t>(height)};
+    const uint32_t grainBlurRecurrenceFlag = impl_->grainBlurRecurrence ? 1u : 0u;
     double splitCommandMs = 0.0;
 
     auto recordPass = [&](id<MTLComputePipelineState> pipeline, uint32_t depth, NSUInteger tgWidth, NSUInteger tgHeight, uint64_t estimatedBytes) -> size_t {
@@ -3405,6 +3713,38 @@ bool MetalRenderer::render(
       impl_->diagnostics.passCount += 1u;
       finishSplitTimedPass(passIndex, splitPassStart);
     };
+    auto dispatch2DSize = [&](id<MTLComputePipelineState> pipeline, uint32_t dispatchWidth, uint32_t dispatchHeight, uint64_t estimatedBytes = 0u) {
+      if (encodeFailed) {
+        return;
+      }
+      NSUInteger tw = 32;
+      NSUInteger th = 8;
+      if (impl_->forcedThreadgroupWidth > 0u && impl_->forcedThreadgroupHeight > 0u) {
+        tw = impl_->forcedThreadgroupWidth;
+        th = impl_->forcedThreadgroupHeight;
+      }
+      const NSUInteger maxThreadsPerGroup = std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup);
+      tw = std::min<NSUInteger>(tw, maxThreadsPerGroup);
+      if (tw * th > maxThreadsPerGroup) {
+        th = std::max<NSUInteger>(1, maxThreadsPerGroup / tw);
+      }
+      MTLSize threadsPerGroup = MTLSizeMake(tw, th, 1);
+      MTLSize threads = MTLSizeMake(static_cast<NSUInteger>(dispatchWidth), static_cast<NSUInteger>(dispatchHeight), 1);
+      const size_t passIndex = recordPass(
+        pipeline,
+        1u,
+        threadsPerGroup.width,
+        threadsPerGroup.height,
+        estimatedBytes ? estimatedBytes : static_cast<uint64_t>(dispatchWidth) * static_cast<uint64_t>(dispatchHeight) * pixelBytes * 2u
+      );
+      const NSUInteger startSample = static_cast<NSUInteger>(passIndex) * 2u;
+      samplePassCounter(startSample);
+      const auto splitPassStart = useSplitPassTiming ? PerfClock::now() : PerfClock::time_point{};
+      [encoder dispatchThreads:threads threadsPerThreadgroup:threadsPerGroup];
+      samplePassCounter(startSample + 1u);
+      impl_->diagnostics.passCount += 1u;
+      finishSplitTimedPass(passIndex, splitPassStart);
+    };
     auto dispatch3DDepth = [&](id<MTLComputePipelineState> pipeline, uint32_t depth, uint64_t estimatedBytes = 0u) {
       if (encodeFailed) {
         return;
@@ -3444,6 +3784,53 @@ bool MetalRenderer::render(
       samplePassCounter(startSample + 1u);
       impl_->diagnostics.passCount += 1u;
       finishSplitTimedPass(passIndex, splitPassStart);
+    };
+
+    auto encodeMpsTextureBlur = [&](id<MTLTexture> sourceTexture, id<MTLTexture> destinationTexture, float sigma, const char *passName) {
+      if (encodeFailed) {
+        return;
+      }
+      MPSImageGaussianBlur *blur = impl_->cachedMpsGaussianBlur(sigma);
+      if (!blur) {
+        encodeFailed = true;
+        return;
+      }
+      [encoder endEncoding];
+      encoder = nil;
+      const size_t passIndex = impl_->diagnostics.passes.size();
+      MetalPassDiagnostics pass{};
+      pass.name = passName;
+      pass.width = static_cast<uint32_t>(width);
+      pass.height = static_cast<uint32_t>(height);
+      pass.depth = 1u;
+      pass.threadgroupWidth = 0u;
+      pass.threadgroupHeight = 0u;
+      pass.estimatedBytes = static_cast<uint64_t>(bufferBytes) * 2u;
+      impl_->diagnostics.passes.push_back(pass);
+      const auto splitPassStart = useSplitPassTiming ? PerfClock::now() : PerfClock::time_point{};
+      [blur encodeToCommandBuffer:commandBuffer sourceTexture:sourceTexture destinationTexture:destinationTexture];
+      impl_->diagnostics.passCount += 1u;
+      if (useSplitPassTiming) {
+        [commandBuffer commit];
+        [commandBuffer waitUntilCompleted];
+        const double passMs = elapsedMilliseconds(splitPassStart, PerfClock::now());
+        splitCommandMs += passMs;
+        if ([commandBuffer status] == MTLCommandBufferStatusError) {
+          NSError *error = [commandBuffer error];
+          impl_->lastError = error ? [[error localizedDescription] UTF8String] : "Metal command buffer failed.";
+          encodeFailed = true;
+          return;
+        }
+        if (passIndex < impl_->diagnostics.passes.size()) {
+          impl_->diagnostics.passes[passIndex].gpuMs = passMs;
+          impl_->diagnostics.passes[passIndex].gpuTimeAvailable = true;
+        }
+        if (!beginCommandEncoder()) {
+          encodeFailed = true;
+        }
+      } else if (!beginComputeEncoder()) {
+        encodeFailed = true;
+      }
     };
 
     if (sourceHalfWrappedDirectly) {
@@ -3515,6 +3902,7 @@ bool MetalRenderer::render(
         [encoder setBuffer:printGlareBufferB offset:0 atIndex:1];
         [encoder setBuffer:paramBuffer offset:0 atIndex:2];
         [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+        [encoder setBytes:&grainBlurRecurrenceFlag length:sizeof(grainBlurRecurrenceFlag) atIndex:4];
         dispatch2D(impl_->printGlareBlurXPipeline);
 
         [encoder setComputePipelineState:impl_->printGlareBlurYPipeline];
@@ -3522,6 +3910,7 @@ bool MetalRenderer::render(
         [encoder setBuffer:printGlareBufferA offset:0 atIndex:1];
         [encoder setBuffer:paramBuffer offset:0 atIndex:2];
         [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+        [encoder setBytes:&grainBlurRecurrenceFlag length:sizeof(grainBlurRecurrenceFlag) atIndex:4];
         dispatch2D(impl_->printGlareBlurYPipeline);
         amountBuffer = printGlareBufferA;
       }
@@ -3547,38 +3936,74 @@ bool MetalRenderer::render(
 
         id<MTLTexture> currentTexture = scannerTextureA;
         if (params.scannerEnabled && params.scannerMtf50LpMm > 0.0f) {
-          [encoder setComputePipelineState:impl_->scannerBlurXTexturePipeline];
-          [encoder setTexture:currentTexture atIndex:0];
-          [encoder setTexture:scannerTextureB atIndex:1];
-          [encoder setBuffer:paramBuffer offset:0 atIndex:0];
-          [encoder setBytes:dims length:sizeof(dims) atIndex:1];
-          dispatch2D(impl_->scannerBlurXTexturePipeline);
+          if (scannerMpsPath) {
+            const float sigma = std::max(kernelParams.scannerBlurSigmaPx, 0.0f);
+            if (sigma > 1.0e-4f) {
+              encodeMpsTextureBlur(
+                currentTexture,
+                scannerTextureB,
+                sigma,
+                "spektrafilm_scanner_mps_blur"
+              );
+              if (encodeFailed) {
+                return;
+              }
+              currentTexture = scannerTextureB;
+            }
+          } else {
+            [encoder setComputePipelineState:impl_->scannerBlurXTexturePipeline];
+            [encoder setTexture:currentTexture atIndex:0];
+            [encoder setTexture:scannerTextureB atIndex:1];
+            [encoder setBuffer:paramBuffer offset:0 atIndex:0];
+            [encoder setBytes:dims length:sizeof(dims) atIndex:1];
+            [encoder setBytes:&grainBlurRecurrenceFlag length:sizeof(grainBlurRecurrenceFlag) atIndex:2];
+            dispatch2D(impl_->scannerBlurXTexturePipeline);
 
-          [encoder setComputePipelineState:impl_->scannerBlurYTexturePipeline];
-          [encoder setTexture:scannerTextureB atIndex:0];
-          [encoder setTexture:scannerTextureA atIndex:1];
-          [encoder setBuffer:paramBuffer offset:0 atIndex:0];
-          [encoder setBytes:dims length:sizeof(dims) atIndex:1];
-          dispatch2D(impl_->scannerBlurYTexturePipeline);
-          currentTexture = scannerTextureA;
+            [encoder setComputePipelineState:impl_->scannerBlurYTexturePipeline];
+            [encoder setTexture:scannerTextureB atIndex:0];
+            [encoder setTexture:scannerTextureA atIndex:1];
+            [encoder setBuffer:paramBuffer offset:0 atIndex:0];
+            [encoder setBytes:dims length:sizeof(dims) atIndex:1];
+            [encoder setBytes:&grainBlurRecurrenceFlag length:sizeof(grainBlurRecurrenceFlag) atIndex:2];
+            dispatch2D(impl_->scannerBlurYTexturePipeline);
+            currentTexture = scannerTextureA;
+          }
         }
 
         id<MTLTexture> unsharpBlurTexture = currentTexture;
         if (params.scannerEnabled && params.scannerUnsharpRadiusUm > 0.0f && params.scannerUnsharpAmount > 0.0f) {
-          [encoder setComputePipelineState:impl_->unsharpBlurXTexturePipeline];
-          [encoder setTexture:currentTexture atIndex:0];
-          [encoder setTexture:scannerTextureB atIndex:1];
-          [encoder setBuffer:paramBuffer offset:0 atIndex:0];
-          [encoder setBytes:dims length:sizeof(dims) atIndex:1];
-          dispatch2D(impl_->unsharpBlurXTexturePipeline);
+          if (scannerMpsPath) {
+            const float sigma = std::max(kernelParams.scannerUnsharpSigmaPx, 0.0f);
+            if (sigma > 1.0e-4f) {
+              encodeMpsTextureBlur(
+                currentTexture,
+                scannerTextureC,
+                sigma,
+                "spektrafilm_scanner_mps_unsharp_blur"
+              );
+              if (encodeFailed) {
+                return;
+              }
+              unsharpBlurTexture = scannerTextureC;
+            }
+          } else {
+            [encoder setComputePipelineState:impl_->unsharpBlurXTexturePipeline];
+            [encoder setTexture:currentTexture atIndex:0];
+            [encoder setTexture:scannerTextureB atIndex:1];
+            [encoder setBuffer:paramBuffer offset:0 atIndex:0];
+            [encoder setBytes:dims length:sizeof(dims) atIndex:1];
+            [encoder setBytes:&grainBlurRecurrenceFlag length:sizeof(grainBlurRecurrenceFlag) atIndex:2];
+            dispatch2D(impl_->unsharpBlurXTexturePipeline);
 
-          [encoder setComputePipelineState:impl_->unsharpBlurYTexturePipeline];
-          [encoder setTexture:scannerTextureB atIndex:0];
-          [encoder setTexture:scannerTextureC atIndex:1];
-          [encoder setBuffer:paramBuffer offset:0 atIndex:0];
-          [encoder setBytes:dims length:sizeof(dims) atIndex:1];
-          dispatch2D(impl_->unsharpBlurYTexturePipeline);
-          unsharpBlurTexture = scannerTextureC;
+            [encoder setComputePipelineState:impl_->unsharpBlurYTexturePipeline];
+            [encoder setTexture:scannerTextureB atIndex:0];
+            [encoder setTexture:scannerTextureC atIndex:1];
+            [encoder setBuffer:paramBuffer offset:0 atIndex:0];
+            [encoder setBytes:dims length:sizeof(dims) atIndex:1];
+            [encoder setBytes:&grainBlurRecurrenceFlag length:sizeof(grainBlurRecurrenceFlag) atIndex:2];
+            dispatch2D(impl_->unsharpBlurYTexturePipeline);
+            unsharpBlurTexture = scannerTextureC;
+          }
         }
 
         [encoder setComputePipelineState:impl_->scannerFinalizeTexturePipeline];
@@ -3601,6 +4026,7 @@ bool MetalRenderer::render(
         [encoder setBuffer:scannerRgbBufferB offset:0 atIndex:1];
         [encoder setBuffer:paramBuffer offset:0 atIndex:2];
         [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+        [encoder setBytes:&grainBlurRecurrenceFlag length:sizeof(grainBlurRecurrenceFlag) atIndex:4];
         dispatch2D(impl_->scannerBlurXPipeline);
 
         [encoder setComputePipelineState:impl_->scannerBlurYPipeline];
@@ -3608,6 +4034,7 @@ bool MetalRenderer::render(
         [encoder setBuffer:scannerRgbBufferA offset:0 atIndex:1];
         [encoder setBuffer:paramBuffer offset:0 atIndex:2];
         [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+        [encoder setBytes:&grainBlurRecurrenceFlag length:sizeof(grainBlurRecurrenceFlag) atIndex:4];
         dispatch2D(impl_->scannerBlurYPipeline);
         currentBuffer = scannerRgbBufferA;
       }
@@ -3619,6 +4046,7 @@ bool MetalRenderer::render(
         [encoder setBuffer:scannerRgbBufferB offset:0 atIndex:1];
         [encoder setBuffer:paramBuffer offset:0 atIndex:2];
         [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+        [encoder setBytes:&grainBlurRecurrenceFlag length:sizeof(grainBlurRecurrenceFlag) atIndex:4];
         dispatch2D(impl_->unsharpBlurXPipeline);
 
         [encoder setComputePipelineState:impl_->unsharpBlurYPipeline];
@@ -3626,6 +4054,7 @@ bool MetalRenderer::render(
         [encoder setBuffer:scannerRgbBufferC offset:0 atIndex:1];
         [encoder setBuffer:paramBuffer offset:0 atIndex:2];
         [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+        [encoder setBytes:&grainBlurRecurrenceFlag length:sizeof(grainBlurRecurrenceFlag) atIndex:4];
         dispatch2D(impl_->unsharpBlurYPipeline);
         unsharpBlurBuffer = scannerRgbBufferC;
       }
@@ -3716,6 +4145,9 @@ bool MetalRenderer::render(
 
     auto encodeBlurGrainDensity = [&](id<MTLBuffer> densityBuffer) -> id<MTLBuffer> {
       id<MTLBuffer> blurSourceBuffer = encodeApplyGrainControls(densityBuffer);
+      if (!grainFinalBlurPath) {
+        return blurSourceBuffer;
+      }
       id<MTLBuffer> blurXBuffer = blurSourceBuffer == grainDensityBufferA ? grainDensityBufferB : grainDensityBufferA;
       id<MTLBuffer> blurYBuffer = blurXBuffer == grainDensityBufferA ? grainDensityBufferB : grainDensityBufferA;
 
@@ -3724,6 +4156,7 @@ bool MetalRenderer::render(
       [encoder setBuffer:blurXBuffer offset:0 atIndex:1];
       [encoder setBuffer:paramBuffer offset:0 atIndex:2];
       [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+      [encoder setBytes:&grainBlurRecurrenceFlag length:sizeof(grainBlurRecurrenceFlag) atIndex:4];
       dispatch2D(impl_->grainDensityBlurXPipeline);
 
       [encoder setComputePipelineState:impl_->grainDensityBlurYPipeline];
@@ -3731,9 +4164,61 @@ bool MetalRenderer::render(
       [encoder setBuffer:blurYBuffer offset:0 atIndex:1];
       [encoder setBuffer:paramBuffer offset:0 atIndex:2];
       [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+      [encoder setBytes:&grainBlurRecurrenceFlag length:sizeof(grainBlurRecurrenceFlag) atIndex:4];
       dispatch2D(impl_->grainDensityBlurYPipeline);
 
       return blurYBuffer;
+    };
+
+    auto encodeGrainLayerBlur = [&]() {
+      if (grainLayerBlurPath) {
+        [encoder setComputePipelineState:impl_->grainLayerBlurXPipeline];
+        [encoder setBuffer:grainLayerBufferA offset:0 atIndex:0];
+        [encoder setBuffer:grainLayerBufferB offset:0 atIndex:1];
+        [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+        [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+        [encoder setBuffer:curveInfoBuffer offset:0 atIndex:4];
+        [encoder setBuffer:spectralInfoBuffer offset:0 atIndex:5];
+        [encoder setBuffer:paperScanDensityDataBuffer offset:0 atIndex:6];
+        [encoder setBytes:&grainBlurRecurrenceFlag length:sizeof(grainBlurRecurrenceFlag) atIndex:7];
+        dispatch3D(impl_->grainLayerBlurXPipeline);
+
+        [encoder setComputePipelineState:impl_->grainLayerBlurYPipeline];
+        [encoder setBuffer:grainLayerBufferB offset:0 atIndex:0];
+        [encoder setBuffer:grainLayerBufferA offset:0 atIndex:1];
+        [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+        [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+        [encoder setBuffer:curveInfoBuffer offset:0 atIndex:4];
+        [encoder setBuffer:spectralInfoBuffer offset:0 atIndex:5];
+        [encoder setBuffer:paperScanDensityDataBuffer offset:0 atIndex:6];
+        [encoder setBytes:&grainBlurRecurrenceFlag length:sizeof(grainBlurRecurrenceFlag) atIndex:7];
+        dispatch3D(impl_->grainLayerBlurYPipeline);
+      }
+    };
+
+    auto encodeGrainMicrostructure = [&]() {
+      [encoder setComputePipelineState:impl_->grainMicroSourcePipeline];
+      [encoder setBuffer:grainMicroBufferA offset:0 atIndex:0];
+      [encoder setBuffer:paramBuffer offset:0 atIndex:1];
+      [encoder setBytes:dims length:sizeof(dims) atIndex:2];
+      dispatch2D(impl_->grainMicroSourcePipeline);
+      if (grainMicroBlurPath) {
+        [encoder setComputePipelineState:impl_->grainMicroBlurXPipeline];
+        [encoder setBuffer:grainMicroBufferA offset:0 atIndex:0];
+        [encoder setBuffer:grainMicroBufferB offset:0 atIndex:1];
+        [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+        [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+        [encoder setBytes:&grainBlurRecurrenceFlag length:sizeof(grainBlurRecurrenceFlag) atIndex:4];
+        dispatch2D(impl_->grainMicroBlurXPipeline);
+
+        [encoder setComputePipelineState:impl_->grainMicroBlurYPipeline];
+        [encoder setBuffer:grainMicroBufferB offset:0 atIndex:0];
+        [encoder setBuffer:grainMicroBufferA offset:0 atIndex:1];
+        [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+        [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+        [encoder setBytes:&grainBlurRecurrenceFlag length:sizeof(grainBlurRecurrenceFlag) atIndex:4];
+        dispatch2D(impl_->grainMicroBlurYPipeline);
+      }
     };
 
     auto encodeDirCorrectionBlur = [&](id<MTLBuffer> correctionBuffer) -> id<MTLBuffer> {
@@ -3782,14 +4267,12 @@ bool MetalRenderer::render(
             pass.estimatedBytes = static_cast<uint64_t>(bufferBytes) * 2u;
             impl_->diagnostics.passes.push_back(pass);
             const auto splitPassStart = useSplitPassTiming ? PerfClock::now() : PerfClock::time_point{};
-            MPSImageGaussianBlur *blur = [[MPSImageGaussianBlur alloc] initWithDevice:impl_->device sigma:sigma];
+            MPSImageGaussianBlur *blur = impl_->cachedMpsGaussianBlur(sigma);
             if (!blur) {
               impl_->lastError = "Unable to create MPS DIR tail Gaussian blur.";
               encodeFailed = true;
               return;
             }
-            blur.edgeMode = MPSImageEdgeModeClamp;
-            blur.options = MPSKernelOptionsSkipAPIValidation;
             [blur encodeToCommandBuffer:commandBuffer sourceTexture:dirTailSourceTexture destinationTexture:dirTailBlurTexture];
             impl_->diagnostics.passCount += 1u;
             if (useSplitPassTiming) {
@@ -4023,17 +4506,17 @@ bool MetalRenderer::render(
     auto encodeDiffusion = [&](id<MTLBuffer> sourceBuffer, id<MTLBuffer> destinationBuffer,
                                id<MTLBuffer> tempBuffer, id<MTLBuffer> accumBuffer,
                                id<MTLBuffer> infoBuffer, id<MTLBuffer> componentsBuffer,
-                               uint32_t componentCount) {
+                               const std::vector<KernelDiffusionComponent> &components) {
       [encoder setComputePipelineState:impl_->halationClearPipeline];
       [encoder setBuffer:sourceBuffer offset:0 atIndex:0];
       [encoder setBuffer:accumBuffer offset:0 atIndex:1];
       [encoder setBytes:dims length:sizeof(dims) atIndex:2];
       dispatch2D(impl_->halationClearPipeline);
 
-      const uint32_t groupSize = std::max(impl_->diffusionGroupSize, 1u);
-      for (uint32_t component = 0; component < componentCount; component += groupSize) {
-        const uint32_t groupCount = std::min(groupSize, componentCount - component);
-        if (groupSize == 1u) {
+      const uint32_t componentCount = static_cast<uint32_t>(components.size());
+      const uint32_t maxDiffusionGroupSize = std::min(std::max(impl_->diffusionGroupSize, 1u), 4u);
+      auto encodeFullResDiffusionRange = [&](uint32_t component, uint32_t groupCount) {
+        if (groupCount <= 1u) {
           [encoder setComputePipelineState:impl_->diffusionComponentBlurXPipeline];
           [encoder setBuffer:sourceBuffer offset:0 atIndex:0];
           [encoder setBuffer:tempBuffer offset:0 atIndex:1];
@@ -4049,23 +4532,154 @@ bool MetalRenderer::render(
           [encoder setBytes:dims length:sizeof(dims) atIndex:3];
           [encoder setBytes:&component length:sizeof(component) atIndex:4];
           dispatch2D(impl_->diffusionComponentBlurYAccumulatePipeline);
-        } else {
-          const uint32_t componentRange[2] = {component, groupCount};
-          [encoder setComputePipelineState:impl_->diffusionGroupBlurXPipeline];
-          [encoder setBuffer:sourceBuffer offset:0 atIndex:0];
-          [encoder setBuffer:tempBuffer offset:0 atIndex:1];
-          [encoder setBuffer:componentsBuffer offset:0 atIndex:2];
-          [encoder setBytes:dims length:sizeof(dims) atIndex:3];
-          [encoder setBytes:componentRange length:sizeof(componentRange) atIndex:4];
-          dispatch2D(impl_->diffusionGroupBlurXPipeline, static_cast<uint64_t>(bufferBytes) * (groupCount + 1u));
+          return;
+        }
 
-          [encoder setComputePipelineState:impl_->diffusionGroupBlurYAccumulatePipeline];
-          [encoder setBuffer:tempBuffer offset:0 atIndex:0];
+        const uint32_t componentRange[2] = {component, groupCount};
+        [encoder setComputePipelineState:impl_->diffusionGroupBlurXPipeline];
+        [encoder setBuffer:sourceBuffer offset:0 atIndex:0];
+        [encoder setBuffer:tempBuffer offset:0 atIndex:1];
+        [encoder setBuffer:componentsBuffer offset:0 atIndex:2];
+        [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+        [encoder setBytes:componentRange length:sizeof(componentRange) atIndex:4];
+        dispatch2D(impl_->diffusionGroupBlurXPipeline, static_cast<uint64_t>(bufferBytes) * (groupCount + 1u));
+
+        [encoder setComputePipelineState:impl_->diffusionGroupBlurYAccumulatePipeline];
+        [encoder setBuffer:tempBuffer offset:0 atIndex:0];
+        [encoder setBuffer:accumBuffer offset:0 atIndex:1];
+        [encoder setBuffer:componentsBuffer offset:0 atIndex:2];
+        [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+        [encoder setBytes:componentRange length:sizeof(componentRange) atIndex:4];
+        dispatch2D(impl_->diffusionGroupBlurYAccumulatePipeline, static_cast<uint64_t>(bufferBytes) * (groupCount + 1u));
+      };
+
+      auto encodeDownsampleDiffusionRange = [&](uint32_t component, uint32_t groupCount, uint32_t downsampleScale) {
+        const uint32_t reducedDims[2] = {
+          static_cast<uint32_t>((width + static_cast<int32_t>(downsampleScale) - 1) / static_cast<int32_t>(downsampleScale)),
+          static_cast<uint32_t>((height + static_cast<int32_t>(downsampleScale) - 1) / static_cast<int32_t>(downsampleScale)),
+        };
+        const uint64_t reducedBytes = static_cast<uint64_t>(reducedDims[0]) *
+          static_cast<uint64_t>(reducedDims[1]) * pixelBytes;
+        const uint64_t reducedIntermediateBytes = diffusionDownsampleHalfPath
+          ? static_cast<uint64_t>(reducedDims[0]) * static_cast<uint64_t>(reducedDims[1]) * 4u * sizeof(uint16_t)
+          : reducedBytes;
+        const float sigmaScale = 1.0f / static_cast<float>(downsampleScale);
+
+        [encoder setComputePipelineState:impl_->diffusionDownsamplePipeline];
+        [encoder setBuffer:sourceBuffer offset:0 atIndex:0];
+        [encoder setBuffer:diffusionDownsampleSourceBuffer offset:0 atIndex:1];
+        [encoder setBytes:dims length:sizeof(dims) atIndex:2];
+        [encoder setBytes:reducedDims length:sizeof(reducedDims) atIndex:3];
+        [encoder setBytes:&downsampleScale length:sizeof(downsampleScale) atIndex:4];
+        dispatch2DSize(
+          impl_->diffusionDownsamplePipeline,
+          reducedDims[0],
+          reducedDims[1],
+          static_cast<uint64_t>(width) * static_cast<uint64_t>(height) * pixelBytes + reducedBytes
+        );
+
+        if (groupCount <= 1u) {
+          id<MTLComputePipelineState> blurXPipeline = diffusionDownsampleHalfPath
+            ? impl_->diffusionDownsampleBlurXHalfPipeline
+            : impl_->diffusionDownsampleBlurXPipeline;
+          id<MTLComputePipelineState> blurYPipeline = diffusionDownsampleHalfPath
+            ? impl_->diffusionDownsampleBlurYHalfPipeline
+            : impl_->diffusionDownsampleBlurYPipeline;
+          id<MTLComputePipelineState> upsamplePipeline = diffusionDownsampleHalfPath
+            ? impl_->diffusionDownsampleUpsampleAccumulateHalfPipeline
+            : impl_->diffusionDownsampleUpsampleAccumulatePipeline;
+
+          [encoder setComputePipelineState:blurXPipeline];
+          [encoder setBuffer:diffusionDownsampleSourceBuffer offset:0 atIndex:0];
+          [encoder setBuffer:diffusionDownsampleTempBuffer offset:0 atIndex:1];
+          [encoder setBuffer:componentsBuffer offset:0 atIndex:2];
+          [encoder setBytes:reducedDims length:sizeof(reducedDims) atIndex:3];
+          [encoder setBytes:&component length:sizeof(component) atIndex:4];
+          [encoder setBytes:&sigmaScale length:sizeof(sigmaScale) atIndex:5];
+          dispatch2DSize(blurXPipeline, reducedDims[0], reducedDims[1], reducedBytes + reducedIntermediateBytes);
+
+          [encoder setComputePipelineState:blurYPipeline];
+          [encoder setBuffer:diffusionDownsampleTempBuffer offset:0 atIndex:0];
+          [encoder setBuffer:diffusionDownsampleBlurBuffer offset:0 atIndex:1];
+          [encoder setBuffer:componentsBuffer offset:0 atIndex:2];
+          [encoder setBytes:reducedDims length:sizeof(reducedDims) atIndex:3];
+          [encoder setBytes:&component length:sizeof(component) atIndex:4];
+          [encoder setBytes:&sigmaScale length:sizeof(sigmaScale) atIndex:5];
+          dispatch2DSize(blurYPipeline, reducedDims[0], reducedDims[1], reducedIntermediateBytes * 2u);
+
+          [encoder setComputePipelineState:upsamplePipeline];
+          [encoder setBuffer:diffusionDownsampleBlurBuffer offset:0 atIndex:0];
           [encoder setBuffer:accumBuffer offset:0 atIndex:1];
           [encoder setBuffer:componentsBuffer offset:0 atIndex:2];
           [encoder setBytes:dims length:sizeof(dims) atIndex:3];
-          [encoder setBytes:componentRange length:sizeof(componentRange) atIndex:4];
-          dispatch2D(impl_->diffusionGroupBlurYAccumulatePipeline, static_cast<uint64_t>(bufferBytes) * (groupCount + 1u));
+          [encoder setBytes:reducedDims length:sizeof(reducedDims) atIndex:4];
+          [encoder setBytes:&component length:sizeof(component) atIndex:5];
+          [encoder setBytes:&downsampleScale length:sizeof(downsampleScale) atIndex:6];
+          dispatch2D(upsamplePipeline, static_cast<uint64_t>(bufferBytes) + reducedIntermediateBytes);
+          return;
+        }
+
+        const uint32_t componentRange[2] = {component, groupCount};
+        id<MTLComputePipelineState> groupBlurXPipeline = diffusionDownsampleHalfPath
+          ? impl_->diffusionDownsampleGroupBlurXHalfPipeline
+          : impl_->diffusionDownsampleGroupBlurXPipeline;
+        id<MTLComputePipelineState> groupBlurYPipeline = diffusionDownsampleHalfPath
+          ? impl_->diffusionDownsampleGroupBlurYHalfPipeline
+          : impl_->diffusionDownsampleGroupBlurYPipeline;
+        id<MTLComputePipelineState> groupUpsamplePipeline = diffusionDownsampleHalfPath
+          ? impl_->diffusionDownsampleGroupUpsampleAccumulateHalfPipeline
+          : impl_->diffusionDownsampleGroupUpsampleAccumulatePipeline;
+
+        [encoder setComputePipelineState:groupBlurXPipeline];
+        [encoder setBuffer:diffusionDownsampleSourceBuffer offset:0 atIndex:0];
+        [encoder setBuffer:diffusionDownsampleTempBuffer offset:0 atIndex:1];
+        [encoder setBuffer:componentsBuffer offset:0 atIndex:2];
+        [encoder setBytes:reducedDims length:sizeof(reducedDims) atIndex:3];
+        [encoder setBytes:componentRange length:sizeof(componentRange) atIndex:4];
+        [encoder setBytes:&sigmaScale length:sizeof(sigmaScale) atIndex:5];
+        dispatch2DSize(groupBlurXPipeline, reducedDims[0], reducedDims[1], reducedBytes + reducedIntermediateBytes * groupCount);
+
+        [encoder setComputePipelineState:groupBlurYPipeline];
+        [encoder setBuffer:diffusionDownsampleTempBuffer offset:0 atIndex:0];
+        [encoder setBuffer:diffusionDownsampleBlurBuffer offset:0 atIndex:1];
+        [encoder setBuffer:componentsBuffer offset:0 atIndex:2];
+        [encoder setBytes:reducedDims length:sizeof(reducedDims) atIndex:3];
+        [encoder setBytes:componentRange length:sizeof(componentRange) atIndex:4];
+        [encoder setBytes:&sigmaScale length:sizeof(sigmaScale) atIndex:5];
+        dispatch2DSize(groupBlurYPipeline, reducedDims[0], reducedDims[1], reducedIntermediateBytes * groupCount * 2u);
+
+        [encoder setComputePipelineState:groupUpsamplePipeline];
+        [encoder setBuffer:diffusionDownsampleBlurBuffer offset:0 atIndex:0];
+        [encoder setBuffer:accumBuffer offset:0 atIndex:1];
+        [encoder setBuffer:componentsBuffer offset:0 atIndex:2];
+        [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+        [encoder setBytes:reducedDims length:sizeof(reducedDims) atIndex:4];
+        [encoder setBytes:componentRange length:sizeof(componentRange) atIndex:5];
+        [encoder setBytes:&downsampleScale length:sizeof(downsampleScale) atIndex:6];
+        dispatch2D(groupUpsamplePipeline, static_cast<uint64_t>(bufferBytes) + reducedIntermediateBytes * groupCount);
+      };
+
+      if (diffusionDownsamplePath && diffusionDownsampleSourceBuffer && diffusionDownsampleTempBuffer && diffusionDownsampleBlurBuffer) {
+        for (uint32_t component = 0; component < componentCount;) {
+          const uint32_t downsampleScale = diffusionDownsampleScaleForSigma(impl_->blurDownsample, components[component].sigmaPx);
+          uint32_t groupCount = 1u;
+          while (component + groupCount < componentCount && groupCount < maxDiffusionGroupSize &&
+                 diffusionDownsampleScaleForSigma(impl_->blurDownsample, components[component + groupCount].sigmaPx) == downsampleScale) {
+            ++groupCount;
+          }
+          if (downsampleScale <= 1u) {
+            encodeFullResDiffusionRange(component, groupCount);
+            component += groupCount;
+            continue;
+          }
+
+          encodeDownsampleDiffusionRange(component, groupCount, downsampleScale);
+          component += groupCount;
+        }
+      } else {
+        for (uint32_t component = 0; component < componentCount; component += maxDiffusionGroupSize) {
+          const uint32_t groupCount = std::min(maxDiffusionGroupSize, componentCount - component);
+          encodeFullResDiffusionRange(component, groupCount);
         }
       }
 
@@ -4118,10 +4732,10 @@ bool MetalRenderer::render(
       }
     };
 
-    auto encodePrintDiffusionFromFilmDensity = [&](id<MTLBuffer> filmDensityBuffer) {
+    auto encodePrintRawFromFilmDensity = [&](id<MTLBuffer> filmDensityBuffer, id<MTLBuffer> printRawBuffer) {
       [encoder setComputePipelineState:impl_->printRawFromFilmDensityPipeline];
       [encoder setBuffer:filmDensityBuffer offset:0 atIndex:0];
-      [encoder setBuffer:printRawBufferA offset:0 atIndex:1];
+      [encoder setBuffer:printRawBuffer offset:0 atIndex:1];
       [encoder setBuffer:paramBuffer offset:0 atIndex:2];
       [encoder setBytes:dims length:sizeof(dims) atIndex:3];
       [encoder setBuffer:curveInfoBuffer offset:0 atIndex:4];
@@ -4143,7 +4757,37 @@ bool MetalRenderer::render(
       [encoder setBuffer:academyPrinterDensityDataBuffer offset:0 atIndex:20];
       [encoder setBuffer:frameConstantsBuffer offset:0 atIndex:21];
       dispatch2D(impl_->printRawFromFilmDensityPipeline);
+    };
 
+    auto encodePrintDensityFromPrintRaw = [&](id<MTLBuffer> printRawBuffer, id<MTLBuffer> destinationBuffer) {
+      [encoder setComputePipelineState:impl_->printDensityFromPrintRawPipeline];
+      [encoder setBuffer:printRawBuffer offset:0 atIndex:0];
+      [encoder setBuffer:destinationBuffer offset:0 atIndex:1];
+      [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+      [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+      [encoder setBuffer:paperCurveInfoBuffer offset:0 atIndex:4];
+      [encoder setBuffer:paperLogExposureBuffer offset:0 atIndex:5];
+      [encoder setBuffer:paperDensityCurvesBuffer offset:0 atIndex:6];
+      [encoder setBuffer:spectralInfoBuffer offset:0 atIndex:7];
+      dispatch2D(impl_->printDensityFromPrintRawPipeline);
+    };
+
+    auto encodePrintStageOutputFromRaw = [&](id<MTLBuffer> printRawBuffer) {
+      if (printLogRawOutput) {
+        [encoder setComputePipelineState:impl_->rawToLogRawPipeline];
+        [encoder setBuffer:printRawBuffer offset:0 atIndex:0];
+        [encoder setBuffer:dstBuffer offset:0 atIndex:1];
+        [encoder setBytes:dims length:sizeof(dims) atIndex:2];
+        dispatch2D(impl_->rawToLogRawPipeline);
+      } else if (printDensityOutput) {
+        encodePrintDensityFromPrintRaw(printRawBuffer, dstBuffer);
+      } else {
+        encodeFinalFromPrintRaw(printRawBuffer);
+      }
+    };
+
+    auto encodePrintDiffusionFromFilmDensity = [&](id<MTLBuffer> filmDensityBuffer) {
+      encodePrintRawFromFilmDensity(filmDensityBuffer, printRawBufferA);
       encodeDiffusion(
         printRawBufferA,
         printRawBufferB,
@@ -4151,9 +4795,9 @@ bool MetalRenderer::render(
         printRawBufferC,
         printDiffusionInfoBuffer,
         printDiffusionComponentsBuffer,
-        printDiffusionInfo.componentCount
+        printDiffusionComponents
       );
-      encodeFinalFromPrintRaw(printRawBufferB);
+      encodePrintStageOutputFromRaw(printRawBufferB);
     };
 
     auto encodeFinalFilmDensityOrPrintDiffusion = [&](id<MTLBuffer> filmDensityBuffer) {
@@ -4161,6 +4805,9 @@ bool MetalRenderer::render(
         encodeCopyBufferToDestination(filmDensityBuffer);
       } else if (printDiffusionPath) {
         encodePrintDiffusionFromFilmDensity(filmDensityBuffer);
+      } else if (printStageOutput) {
+        encodePrintRawFromFilmDensity(filmDensityBuffer, printRawBufferA);
+        encodePrintStageOutputFromRaw(printRawBufferA);
       } else {
         encodeFinalFromFilmDensity(filmDensityBuffer);
       }
@@ -4222,7 +4869,7 @@ bool MetalRenderer::render(
           halationRawBufferD,
           cameraDiffusionInfoBuffer,
           cameraDiffusionComponentsBuffer,
-          cameraDiffusionInfo.componentCount
+          cameraDiffusionComponents
         );
         currentRawBuffer = diffusionDestinationBuffer;
       }
@@ -4253,22 +4900,38 @@ bool MetalRenderer::render(
         [encoder setBytes:dims length:sizeof(dims) atIndex:2];
         dispatch2D(impl_->halationClearPipeline);
 
-        for (uint32_t component = 0; component < 3u; ++component) {
-          [encoder setComputePipelineState:impl_->halationScatterTailBlurXPipeline];
+        if (impl_->halationGroupedTail && halationScatterTailGroupBuffer) {
+          [encoder setComputePipelineState:impl_->halationScatterTailGroupBlurXPipeline];
           [encoder setBuffer:currentRawBuffer offset:0 atIndex:0];
-          [encoder setBuffer:scatterTempBuffer offset:0 atIndex:1];
+          [encoder setBuffer:halationScatterTailGroupBuffer offset:0 atIndex:1];
           [encoder setBuffer:paramBuffer offset:0 atIndex:2];
           [encoder setBytes:dims length:sizeof(dims) atIndex:3];
-          [encoder setBytes:&component length:sizeof(component) atIndex:4];
-          dispatch2D(impl_->halationScatterTailBlurXPipeline);
+          dispatch2D(impl_->halationScatterTailGroupBlurXPipeline, static_cast<uint64_t>(bufferBytes) * 4u);
 
-          [encoder setComputePipelineState:impl_->halationScatterTailBlurYPipeline];
-          [encoder setBuffer:scatterTempBuffer offset:0 atIndex:0];
+          [encoder setComputePipelineState:impl_->halationScatterTailGroupBlurYPipeline];
+          [encoder setBuffer:halationScatterTailGroupBuffer offset:0 atIndex:0];
           [encoder setBuffer:scatterAccumBuffer offset:0 atIndex:1];
           [encoder setBuffer:paramBuffer offset:0 atIndex:2];
           [encoder setBytes:dims length:sizeof(dims) atIndex:3];
-          [encoder setBytes:&component length:sizeof(component) atIndex:4];
-          dispatch2D(impl_->halationScatterTailBlurYPipeline);
+          dispatch2D(impl_->halationScatterTailGroupBlurYPipeline, static_cast<uint64_t>(bufferBytes) * 4u);
+        } else {
+          for (uint32_t component = 0; component < 3u; ++component) {
+            [encoder setComputePipelineState:impl_->halationScatterTailBlurXPipeline];
+            [encoder setBuffer:currentRawBuffer offset:0 atIndex:0];
+            [encoder setBuffer:scatterTempBuffer offset:0 atIndex:1];
+            [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+            [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+            [encoder setBytes:&component length:sizeof(component) atIndex:4];
+            dispatch2D(impl_->halationScatterTailBlurXPipeline);
+
+            [encoder setComputePipelineState:impl_->halationScatterTailBlurYPipeline];
+            [encoder setBuffer:scatterTempBuffer offset:0 atIndex:0];
+            [encoder setBuffer:scatterAccumBuffer offset:0 atIndex:1];
+            [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+            [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+            [encoder setBytes:&component length:sizeof(component) atIndex:4];
+            dispatch2D(impl_->halationScatterTailBlurYPipeline);
+          }
         }
 
         [encoder setComputePipelineState:impl_->halationScatterResolvePipeline];
@@ -4282,7 +4945,7 @@ bool MetalRenderer::render(
         currentRawBuffer = scatterResolvedBuffer;
       }
 
-      const bool needsPreExposureLogRaw = dirPath;
+      const bool needsPreExposureLogRaw = dirPath || filmLogRawOutput;
       bool preExposureDensityReady = false;
       if (halationBouncePath) {
         id<MTLBuffer> bounceAccumBuffer = currentRawBuffer == halationRawBufferA ? halationRawBufferB : halationRawBufferA;
@@ -4335,10 +4998,13 @@ bool MetalRenderer::render(
         }
       }
 
-      if (!preExposureDensityReady) {
-        encodeDevelopFromLogRaw(halationLogRawBuffer, halationDensityBufferA);
-      }
-      if (dirPath) {
+      if (filmLogRawOutput) {
+        encodeCopyBufferToDestination(halationLogRawBuffer);
+      } else {
+        if (!preExposureDensityReady) {
+          encodeDevelopFromLogRaw(halationLogRawBuffer, halationDensityBufferA);
+        }
+        if (dirPath) {
           [encoder setComputePipelineState:impl_->dirCorrectionFromDensityPipeline];
           [encoder setBuffer:halationDensityBufferA offset:0 atIndex:0];
           [encoder setBuffer:dirCorrectionBufferA offset:0 atIndex:1];
@@ -4361,24 +5027,25 @@ bool MetalRenderer::render(
           dispatch2D(impl_->dirRedevelopPipeline);
         }
 
-      if (productionGrainPath) {
-        encodeProductionGrainLayersFromDensity(halationDensityBufferA);
-        encodeSaveGrainBaseDensity(halationDensityBufferA);
-      } else if (grainSynthesisPath) {
-        encodeSelectedGrainSynthesisLayersFromDensity(halationDensityBufferA);
-        encodeSaveGrainBaseDensity(halationDensityBufferA);
-      } else if (previewGrainFromDensityPath) {
-        [encoder setComputePipelineState:impl_->previewGrainFromDensityPipeline];
-        [encoder setBuffer:halationDensityBufferA offset:0 atIndex:0];
-        [encoder setBuffer:halationDensityBufferB offset:0 atIndex:1];
-        [encoder setBuffer:paramBuffer offset:0 atIndex:2];
-        [encoder setBytes:dims length:sizeof(dims) atIndex:3];
-        [encoder setBuffer:curveInfoBuffer offset:0 atIndex:4];
-        [encoder setBuffer:densityCurvesBuffer offset:0 atIndex:5];
-        dispatch2D(impl_->previewGrainFromDensityPipeline);
-        encodeFinalFilmDensityOrPrintDiffusion(halationDensityBufferB);
-      } else {
-        encodeFinalFilmDensityOrPrintDiffusion(halationDensityBufferA);
+        if (productionGrainPath) {
+          encodeProductionGrainLayersFromDensity(halationDensityBufferA);
+          encodeSaveGrainBaseDensity(halationDensityBufferA);
+        } else if (grainSynthesisPath) {
+          encodeSelectedGrainSynthesisLayersFromDensity(halationDensityBufferA);
+          encodeSaveGrainBaseDensity(halationDensityBufferA);
+        } else if (previewGrainFromDensityPath) {
+          [encoder setComputePipelineState:impl_->previewGrainFromDensityPipeline];
+          [encoder setBuffer:halationDensityBufferA offset:0 atIndex:0];
+          [encoder setBuffer:halationDensityBufferB offset:0 atIndex:1];
+          [encoder setBuffer:paramBuffer offset:0 atIndex:2];
+          [encoder setBytes:dims length:sizeof(dims) atIndex:3];
+          [encoder setBuffer:curveInfoBuffer offset:0 atIndex:4];
+          [encoder setBuffer:densityCurvesBuffer offset:0 atIndex:5];
+          dispatch2D(impl_->previewGrainFromDensityPipeline);
+          encodeFinalFilmDensityOrPrintDiffusion(halationDensityBufferB);
+        } else {
+          encodeFinalFilmDensityOrPrintDiffusion(halationDensityBufferA);
+        }
       }
     } else if (dirPath) {
       [encoder setComputePipelineState:impl_->dirBaselinePipeline];
@@ -4474,45 +5141,8 @@ bool MetalRenderer::render(
         encodeSaveGrainBaseDensity(grainMicroBufferA);
       }
 
-      [encoder setComputePipelineState:impl_->grainLayerBlurXPipeline];
-      [encoder setBuffer:grainLayerBufferA offset:0 atIndex:0];
-      [encoder setBuffer:grainLayerBufferB offset:0 atIndex:1];
-      [encoder setBuffer:paramBuffer offset:0 atIndex:2];
-      [encoder setBytes:dims length:sizeof(dims) atIndex:3];
-      [encoder setBuffer:curveInfoBuffer offset:0 atIndex:4];
-      [encoder setBuffer:spectralInfoBuffer offset:0 atIndex:5];
-      [encoder setBuffer:paperScanDensityDataBuffer offset:0 atIndex:6];
-      dispatch3D(impl_->grainLayerBlurXPipeline);
-
-      [encoder setComputePipelineState:impl_->grainLayerBlurYPipeline];
-      [encoder setBuffer:grainLayerBufferB offset:0 atIndex:0];
-      [encoder setBuffer:grainLayerBufferA offset:0 atIndex:1];
-      [encoder setBuffer:paramBuffer offset:0 atIndex:2];
-      [encoder setBytes:dims length:sizeof(dims) atIndex:3];
-      [encoder setBuffer:curveInfoBuffer offset:0 atIndex:4];
-      [encoder setBuffer:spectralInfoBuffer offset:0 atIndex:5];
-      [encoder setBuffer:paperScanDensityDataBuffer offset:0 atIndex:6];
-      dispatch3D(impl_->grainLayerBlurYPipeline);
-
-      [encoder setComputePipelineState:impl_->grainMicroSourcePipeline];
-      [encoder setBuffer:grainMicroBufferA offset:0 atIndex:0];
-      [encoder setBuffer:paramBuffer offset:0 atIndex:1];
-      [encoder setBytes:dims length:sizeof(dims) atIndex:2];
-      dispatch2D(impl_->grainMicroSourcePipeline);
-
-      [encoder setComputePipelineState:impl_->grainMicroBlurXPipeline];
-      [encoder setBuffer:grainMicroBufferA offset:0 atIndex:0];
-      [encoder setBuffer:grainMicroBufferB offset:0 atIndex:1];
-      [encoder setBuffer:paramBuffer offset:0 atIndex:2];
-      [encoder setBytes:dims length:sizeof(dims) atIndex:3];
-      dispatch2D(impl_->grainMicroBlurXPipeline);
-
-      [encoder setComputePipelineState:impl_->grainMicroBlurYPipeline];
-      [encoder setBuffer:grainMicroBufferB offset:0 atIndex:0];
-      [encoder setBuffer:grainMicroBufferA offset:0 atIndex:1];
-      [encoder setBuffer:paramBuffer offset:0 atIndex:2];
-      [encoder setBytes:dims length:sizeof(dims) atIndex:3];
-      dispatch2D(impl_->grainMicroBlurYPipeline);
+      encodeGrainLayerBlur();
+      encodeGrainMicrostructure();
 
       [encoder setComputePipelineState:impl_->grainResolveDensityPipeline];
       [encoder setBuffer:grainLayerBufferA offset:0 atIndex:0];
@@ -4548,45 +5178,8 @@ bool MetalRenderer::render(
         encodeSaveGrainBaseDensity(grainDensityBufferB);
       }
 
-      [encoder setComputePipelineState:impl_->grainLayerBlurXPipeline];
-      [encoder setBuffer:grainLayerBufferA offset:0 atIndex:0];
-      [encoder setBuffer:grainLayerBufferB offset:0 atIndex:1];
-      [encoder setBuffer:paramBuffer offset:0 atIndex:2];
-      [encoder setBytes:dims length:sizeof(dims) atIndex:3];
-      [encoder setBuffer:curveInfoBuffer offset:0 atIndex:4];
-      [encoder setBuffer:spectralInfoBuffer offset:0 atIndex:5];
-      [encoder setBuffer:paperScanDensityDataBuffer offset:0 atIndex:6];
-      dispatch3D(impl_->grainLayerBlurXPipeline);
-
-      [encoder setComputePipelineState:impl_->grainLayerBlurYPipeline];
-      [encoder setBuffer:grainLayerBufferB offset:0 atIndex:0];
-      [encoder setBuffer:grainLayerBufferA offset:0 atIndex:1];
-      [encoder setBuffer:paramBuffer offset:0 atIndex:2];
-      [encoder setBytes:dims length:sizeof(dims) atIndex:3];
-      [encoder setBuffer:curveInfoBuffer offset:0 atIndex:4];
-      [encoder setBuffer:spectralInfoBuffer offset:0 atIndex:5];
-      [encoder setBuffer:paperScanDensityDataBuffer offset:0 atIndex:6];
-      dispatch3D(impl_->grainLayerBlurYPipeline);
-
-      [encoder setComputePipelineState:impl_->grainMicroSourcePipeline];
-      [encoder setBuffer:grainMicroBufferA offset:0 atIndex:0];
-      [encoder setBuffer:paramBuffer offset:0 atIndex:1];
-      [encoder setBytes:dims length:sizeof(dims) atIndex:2];
-      dispatch2D(impl_->grainMicroSourcePipeline);
-
-      [encoder setComputePipelineState:impl_->grainMicroBlurXPipeline];
-      [encoder setBuffer:grainMicroBufferA offset:0 atIndex:0];
-      [encoder setBuffer:grainMicroBufferB offset:0 atIndex:1];
-      [encoder setBuffer:paramBuffer offset:0 atIndex:2];
-      [encoder setBytes:dims length:sizeof(dims) atIndex:3];
-      dispatch2D(impl_->grainMicroBlurXPipeline);
-
-      [encoder setComputePipelineState:impl_->grainMicroBlurYPipeline];
-      [encoder setBuffer:grainMicroBufferB offset:0 atIndex:0];
-      [encoder setBuffer:grainMicroBufferA offset:0 atIndex:1];
-      [encoder setBuffer:paramBuffer offset:0 atIndex:2];
-      [encoder setBytes:dims length:sizeof(dims) atIndex:3];
-      dispatch2D(impl_->grainMicroBlurYPipeline);
+      encodeGrainLayerBlur();
+      encodeGrainMicrostructure();
 
       [encoder setComputePipelineState:impl_->grainSynthesisResolveDensityPipeline];
       [encoder setBuffer:grainLayerBufferA offset:0 atIndex:0];

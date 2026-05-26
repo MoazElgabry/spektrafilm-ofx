@@ -50,9 +50,17 @@ struct RendererDiagnostics {
   bool grainSynthesisPath = false;
   bool finalPostProcessPath = false;
   bool scannerTextureIntermediates = false;
-  uint32_t diffusionGroupSize = 1;
-  std::string threadgroupMode;
+  bool halationGroupedTail = false;
+  bool scannerMps = false;
+  bool grainBlurRecurrence = true;
+  uint32_t diffusionGroupSize = 2;
+  std::string threadgroupMode = "auto";
   std::string passTimingMode;
+  std::string blurBackend = "custom";
+  std::string blurDownsample = "auto";
+  std::string intermediatePrecision = "float";
+  std::string diffusionClusterSigma = "0.10";
+  std::string dirTailBackend = "mps";
   std::vector<RendererPassDiagnostics> passes;
 };
 

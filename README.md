@@ -1,11 +1,12 @@
 # spektrafilm OFX
 
-spektrafilm OFX is a native macOS OpenFX plugin project built from the
-`spektrafilm` film-simulation codebase. It is intended for host applications
-such as DaVinci Resolve and provides Metal-accelerated film, print, scan, grain,
-halation, diffusion, color-management, and LUT-export workflows inside an OFX
-plugin. The project tries to match Andrea Volpato's original implementation as 
-closely as possible and uses the python codebase as scientific reference as best as possible.
+spektrafilm OFX is a native OpenFX plugin project built from the `spektrafilm`
+film-simulation codebase. It is intended for host applications such as DaVinci
+Resolve and provides Metal-accelerated film, print, scan, grain, halation,
+diffusion, color-management, and LUT-export workflows on macOS, with an early
+Vulkan compute backend for Windows bring-up. The project tries to match Andrea
+Volpato's original implementation as closely as possible and uses the python
+codebase as scientific reference as best as possible.
 
 ## Relationship to Andrea Volpato's spektrafilm
 
@@ -21,7 +22,7 @@ for video applications. The main goals are:
 2. Expand upon the controls for photochemical developemnt simulation (e.g. adding push/pull)
 3. Make the pipeline usable in professional video and finishing workflows.
 4. Keep spacial effects resolution-independant (1080p and 2160p sample the same virtual film negative, just at different densities)
-5. Leverage Apple's Metal GPU stack for performance-sensitive stages (and CUDA for future Windows workflows).
+5. Leverage Apple's Metal GPU stack on macOS and Vulkan compute for Windows workflows.
 6. Provide ready to use OFX binaries for non developers.
 7. Keep tools in active development and research controls in a separate dev
    build.
@@ -51,11 +52,19 @@ custom resources, or local experimental builds.
 
 ## Current Platform Status
 
-The project currently targets macOS only.
+The project has a production macOS Metal renderer and an early Windows Vulkan
+backend. The Windows build now creates OpenFX bundles and initializes a Vulkan
+compute renderer. The Windows renderer now enters the Vulkan core graph by
+default, while `SPEKTRAFILM_VULKAN_COPY_PASS=1` still runs the copy-validation
+pass for host/image-I/O debugging. The ported print/scan, halation, diffusion,
+DIR, scanner-post, preview-grain, and production-grain paths are parameter
+controlled by default; their `SPEKTRAFILM_VULKAN_*_PASS` environment variables
+remain explicit harness/debug overrides. Display Out HDR, Scene Handoff,
+Experimental film push/pull, Halation Boost, and the direct Grain Synthesis
+path are wired into the Vulkan graph. The Metal optimized Grain Synthesis
+table/texture path has not been ported yet.
 
-The renderer is Metal-first, and the build requires Apple's Metal toolchain.
-Windows and Linux builds are not currently supported by this OFX project, however
-they are in early stages of development and scheduled for a future release.
+Linux builds are not currently supported.
 
 ## Main Features
 
@@ -150,6 +159,8 @@ Important paths in this directory:
 | `src/SpektraFilmPlugin.cpp` | OFX entry points, parameter definitions, flavor visibility, render dispatch, defaults, clipboard handling, and LUT export wiring. |
 | `src/SpektraMetalRenderer.mm` | Objective-C++ Metal renderer implementation and CPU-side render orchestration. |
 | `src/SpektraMetalRenderer.h` | Renderer API used by the OFX host side and the local harnesses. |
+| `src/SpektraVulkanRenderer.cpp` | Early Windows Vulkan compute backend and copy-validation image I/O path. |
+| `src/SpektraVulkanRenderer.h` | Vulkan renderer declaration behind the shared renderer interface. |
 | `src/SpektraParameters.h` | Shared render parameter types and enums. |
 | `src/SpektraProfileCurves.h` | Declarations for generated stock/profile tables. |
 | `src/SpektraTooltips.h` | User-facing control help text. |
@@ -166,6 +177,7 @@ Important paths in this directory:
 | `tools/export_reference_cases.py` | Exports reference cases from the Python model for comparison work. |
 | `tools/SpektraMetalPerfHarness.mm` | Synthetic Metal performance harness for debugging and performance hunting. |
 | `tools/SpektraMetalEvaluationHarness.mm` | Native evaluation harness. |
+| `tools/SpektraVulkanCopyHarness.cpp` | Windows Vulkan copy-validation smoke harness. |
 | `tools/SpektraVariantGenerator.mm` | Generates rendered variants for stock/look inspection (used for generating images of stocks for product website). |
 | `tests/` | Python tests for build wiring, resource generation, parameter metadata, and source invariants. |
 | `third_party/openfx/` | Vendored OpenFX SDK headers and support code. (OFX_Release_1.5.1)|
@@ -174,19 +186,32 @@ Important paths in this directory:
 
 ## Build Requirements
 
-The source build expects:
+The macOS source build expects:
 
 1. macOS.
 2. Xcode Command Line Tools or Xcode.
 3. Apple's Metal toolchain available through `xcrun`.
 4. CMake `3.24` or newer.
-5. Python `3.13` with the repository's Python dependencies installed.
+5. Python with the OFX build-time table generation dependencies installed:
+   `numpy`, `scipy`, and `colour-science`.
 6. libpng discoverable by CMake for the variant generator target.
 7. OpenFX SDK headers (OFX_Release_1.5.1).
 
+The Windows source build expects:
+
+1. Windows 10 or newer.
+2. Visual Studio 2022 C++ build tools, Ninja, or another CMake-supported C++17 toolchain.
+3. Vulkan SDK with the Vulkan loader, headers, and `glslc` or `glslangValidator`.
+4. CMake `3.24` or newer.
+5. Python with the OFX build-time table generation dependencies installed:
+   `numpy`, `scipy`, and `colour-science`.
+6. OpenFX SDK headers (OFX_Release_1.5.1).
+
 The OFX build prefers the repository virtual environment at `../../.venv/bin/python`
-when it exists. Otherwise CMake falls back to the Python interpreter found by
-`find_package(Python3)`.
+on Unix-like platforms and `../../.venv/Scripts/python.exe` on Windows when it
+exists. Otherwise CMake falls back to the Python interpreter found by
+`find_package(Python3)`. CMake checks for the build-time Python packages during
+configure and prints the matching `pip install` command if they are missing.
 
 ## Setup From a Fresh Checkout
 For ease of use, I developed this project from within Andrea's spektrafilm repository root. To follow the below instructions, pull the latest version of spektrafilm and place the contents of this repo at OFX/SpektraFilm.
@@ -206,6 +231,12 @@ Or with a manually managed Python 3.13 environment:
 python -m pip install -e ".[dev]"
 ```
 
+For an OFX-only build environment, the full GUI/image stack is not required:
+
+```sh
+python -m pip install numpy scipy colour-science
+```
+
 Then build the OFX project:
 
 ```sh
@@ -215,6 +246,29 @@ cd OFX/SpektraFilm
 
 The script configures CMake, builds the plugin targets, and produces ZIP
 packages for `spektrafilm flow` and `spektrafilm`.
+
+On Windows, run the PowerShell build script instead:
+
+```powershell
+cd OFX\SpektraFilm
+.\build_windows.ps1
+```
+
+The Windows script builds `Contents\Win64` OFX bundles and creates Windows ZIP
+packages for `spektrafilm flow` and `spektrafilm`.
+
+The Windows build also emits `SpektraVulkanCopyHarness.exe`, a standalone smoke
+test for the Vulkan copy-validation and physical bootstrap paths. Run it
+from the build directory after building to verify Vulkan device setup, shader
+resource lookup, row-stride image I/O, and scratch-buffer reuse outside an OFX
+host, or pass harness switches such as `-RunCopyHarness`,
+`-RunCoreHarness`, `-RunPrintScanHarness`, `-RunHalationHarness`,
+`-RunDiffusionHarness`, `-RunDirHarness`, `-RunScannerPostHarness`,
+`-RunPreviewGrainHarness`, or `-RunProductionGrainHarness` to the
+PowerShell build script. Set `SPEKTRAFILM_VULKAN_DEVICE_INDEX` to force a
+specific Vulkan physical device while testing multi-GPU systems. With the
+default iteration count, the harness fails if the final iteration reallocates
+scratch buffers.
 
 ## Manual CMake Build
 
@@ -238,10 +292,11 @@ To install the built OFX bundles into the system OFX plugin directory:
 cmake --install build
 ```
 
-The install destination is:
+The default install destinations are:
 
 ```text
-/Library/OFX/Plugins
+macOS:   /Library/OFX/Plugins
+Windows: C:/Program Files/Common Files/OFX/Plugins
 ```
 
 Depending on your system permissions, installation may require elevated rights.
@@ -259,6 +314,8 @@ The ZIP targets write:
 ```text
 website/public/downloads/spektrafilm_flow-OFX-macOS.zip
 website/public/downloads/spektrafilm-OFX-macOS.zip
+website/public/downloads/spektrafilm_flow-OFX-Windows.zip
+website/public/downloads/spektrafilm-OFX-Windows.zip
 ```
 
 Each ZIP contains the OFX bundle, `install_instructions.txt`, a root-level
@@ -282,6 +339,7 @@ Generated resources include:
 | `SpektraHanatos2025Spectra.f32` | `Resources/data/luts/spectral_upsampling/irradiance_xy_tc.npy`. |
 | `SpektraFilmData.spkdata` | Compiled profile/resource payload generated by `tools/compile_ofx_data.py`. |
 | `SpektraFilm.metallib` | Compiled Metal kernels from `shaders/SpektraFilm.metal`. |
+| `Spektra*.comp.spv` | Windows Vulkan compute shaders compiled from `shaders/vulkan/*.comp`. |
 
 ## Plugin Flavors
 

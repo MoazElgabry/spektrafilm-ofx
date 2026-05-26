@@ -14,6 +14,9 @@ enum class RenderOutputMode : int32_t {
   FinalPreview = 0,
   FilmDensityCmy = 1,
   FilmDensityCmyWithGrain = 2,
+  FilmLogRaw = 3,
+  PrintLogRaw = 4,
+  PrintDensityCmy = 5,
 };
 
 enum class RgbToRawMethod : int32_t {
@@ -136,7 +139,7 @@ struct RenderParams {
   float filmExposureEv = 0.0f;
   bool autoExposure = false;
   AutoExposureMethod autoExposureMethod = AutoExposureMethod::CenterWeighted;
-  float printExposureEv = 1.0f;
+  float printExposureEv = 0.0f;
   PushPullMode filmPushPullMode = PushPullMode::Standard;
   float filmPushPullStops = 0.0f;
   float printPushPullStops = 0.0f;

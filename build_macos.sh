@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 BUILD_DIR="${1:-${SCRIPT_DIR}/build}"
+BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}"
 
 if ! command -v cmake >/dev/null 2>&1; then
   echo "cmake is required. Install it with Homebrew or from https://cmake.org/download/." >&2
@@ -16,13 +17,13 @@ if ! xcrun -sdk macosx metal -v >/dev/null 2>&1; then
   exit 1
 fi
 
-cmake -S "${SCRIPT_DIR}" -B "${BUILD_DIR}"
+cmake -S "${SCRIPT_DIR}" -B "${BUILD_DIR}" -DCMAKE_BUILD_TYPE="${BUILD_TYPE}"
 cmake --build "${BUILD_DIR}" --parallel
 cmake --build "${BUILD_DIR}" \
   --target spektrafilmDownloadZip spektrafilm_flowDownloadZip \
   --parallel
 
-echo "Built spektrafilm flow, spektrafilm, and spektrafilm dev OFX bundles in ${BUILD_DIR}"
+echo "Built spektrafilm flow, spektrafilm, and spektrafilm dev OFX bundles in ${BUILD_DIR} (${BUILD_TYPE})"
 echo "Packaged website downloads:"
 echo "  ${REPO_ROOT}/website/public/downloads/spektrafilm_flow-OFX-macOS.zip"
 echo "  ${REPO_ROOT}/website/public/downloads/spektrafilm-OFX-macOS.zip"

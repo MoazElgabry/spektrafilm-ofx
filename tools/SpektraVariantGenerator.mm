@@ -28,7 +28,7 @@ struct Options {
   std::string inputColorSpaceTag;
   std::string resourceDir;
   float filmExposureEv = 0.0f;
-  float printExposureEv = 1.0f;
+  float printExposureEv = 0.0f;
   int maxLongEdge = 1280;
   bool diagnostics = false;
   bool emitRec709 = false;

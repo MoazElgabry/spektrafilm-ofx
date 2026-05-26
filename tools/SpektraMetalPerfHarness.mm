@@ -1,4 +1,5 @@
 #include "SpektraMetalRenderer.h"
+#include "SpektraHarnessHostIO.h"
 
 #import <Foundation/Foundation.h>
 
@@ -30,8 +31,19 @@ struct Options {
   std::string scratchStorage = "private";
   std::string threadgroup = "auto";
   std::string passTiming = "off";
-  std::string diffusionGroupSize = "1";
+  std::string diffusionGroupSize = "2";
   std::string scannerImageStorage = "buffer";
+  std::string blurBackend = "custom";
+  std::string blurDownsample = "auto";
+  std::string intermediatePrecision = "float";
+  std::string diffusionClusterSigma = "0.10";
+  std::string halationGroupedTail = "0";
+  std::string scannerMps = "0";
+  std::string grainBlurRecurrence = "1";
+  std::string dirTailBackend = "mps";
+  std::string sourceFormat = "float";
+  std::string destinationFormat = "float";
+  std::string hostLayout = "contiguous";
   bool detail = false;
   bool passCounters = false;
   bool passTimingExplicit = false;
@@ -51,11 +63,17 @@ struct Options {
 void printUsage(const char *name) {
   std::cerr
     << "Usage: " << name << " [--width N] [--height N] [--iterations N] [--warmup N]\n"
-    << "       [--case default-final|production-grain|enlarged-production-grain|grain-synthesis|grain-synthesis-hq|halation-only|halation-boost|diffusion-only|scanner-only|scanner-glare|all-effects|all]\n"
+    << "       [--case default-final|production-grain|enlarged-production-grain|production-grain-no-sublayers|production-grain-no-blur|auto-exposure|halation-only|halation-boost|camera-diffusion-only|diffusion-only|print-diffusion-only|dir-only|scanner-only|scanner-glare|all-effects|all]\n"
     << "       [--resource-dir PATH] [--scratch-storage private|shared]\n"
     << "       [--threadgroup auto|16x16|32x8|8x32|64x4]\n"
     << "       [--scanner-image-storage buffer|texture]\n"
+    << "       [--source-format float|half] [--destination-format float|half]\n"
+    << "       [--host-layout contiguous|strided|offset]\n"
     << "       [--diffusion-group-size 1|2|4] [--pass-timing off|auto|counter|split]\n"
+    << "       [--blur-backend custom|mps|auto] [--blur-downsample off|2|4|8|auto]\n"
+    << "       [--intermediate-precision float|half-blur] [--diffusion-cluster-sigma off|0.05|0.10]\n"
+    << "       [--halation-grouped-tail 0|1] [--scanner-mps 0|1] [--grain-blur-recurrence 0|1]\n"
+    << "       [--dir-tail-backend fused|mps]\n"
     << "       [--grain-synthesis-samples N] [--grain-synthesis-layered on|off]\n"
     << "       [--grain-synthesis-radius-stddev X] [--grain-synthesis-observation-sigma-um X]\n"
     << "       [--grain-synthesis-sampler r2|antithetic|sobol-blue]\n"
@@ -69,6 +87,16 @@ bool parseInt(const char *text, int &out) {
   char *end = nullptr;
   const long value = std::strtol(text, &end, 10);
   if (!end || *end != '\0' || value <= 0 || value > 32768) {
+    return false;
+  }
+  out = static_cast<int>(value);
+  return true;
+}
+
+bool parseNonNegativeInt(const char *text, int &out) {
+  char *end = nullptr;
+  const long value = std::strtol(text, &end, 10);
+  if (!end || *end != '\0' || value < 0 || value > 32768) {
     return false;
   }
   out = static_cast<int>(value);
@@ -129,7 +157,7 @@ bool parseArgs(int argc, const char **argv, Options &options) {
       }
     } else if (arg == "--warmup") {
       const char *value = requireValue("--warmup");
-      if (!value || !parseInt(value, options.warmup)) {
+      if (!value || !parseNonNegativeInt(value, options.warmup)) {
         return false;
       }
     } else if (arg == "--case") {
@@ -172,6 +200,27 @@ bool parseArgs(int argc, const char **argv, Options &options) {
         return false;
       }
       options.scannerImageStorage = mode;
+    } else if (arg == "--source-format") {
+      const char *value = requireValue("--source-format");
+      spektrafilm_harness::HostPixelFormat format;
+      if (!value || !spektrafilm_harness::parseHostPixelFormat(value, format)) {
+        return false;
+      }
+      options.sourceFormat = spektrafilm_harness::hostPixelFormatName(format);
+    } else if (arg == "--destination-format") {
+      const char *value = requireValue("--destination-format");
+      spektrafilm_harness::HostPixelFormat format;
+      if (!value || !spektrafilm_harness::parseHostPixelFormat(value, format)) {
+        return false;
+      }
+      options.destinationFormat = spektrafilm_harness::hostPixelFormatName(format);
+    } else if (arg == "--host-layout") {
+      const char *value = requireValue("--host-layout");
+      spektrafilm_harness::HostLayout layout;
+      if (!value || !spektrafilm_harness::parseHostLayout(value, layout)) {
+        return false;
+      }
+      options.hostLayout = spektrafilm_harness::hostLayoutName(layout);
     } else if (arg == "--diffusion-group-size") {
       const char *value = requireValue("--diffusion-group-size");
       const std::string size = value ? std::string(value) : "";
@@ -179,6 +228,62 @@ bool parseArgs(int argc, const char **argv, Options &options) {
         return false;
       }
       options.diffusionGroupSize = size;
+    } else if (arg == "--blur-backend") {
+      const char *value = requireValue("--blur-backend");
+      const std::string mode = value ? std::string(value) : "";
+      if (mode != "custom" && mode != "mps" && mode != "auto") {
+        return false;
+      }
+      options.blurBackend = mode;
+    } else if (arg == "--blur-downsample") {
+      const char *value = requireValue("--blur-downsample");
+      const std::string mode = value ? std::string(value) : "";
+      if (mode != "off" && mode != "2" && mode != "4" && mode != "8" && mode != "auto") {
+        return false;
+      }
+      options.blurDownsample = mode;
+    } else if (arg == "--intermediate-precision") {
+      const char *value = requireValue("--intermediate-precision");
+      const std::string mode = value ? std::string(value) : "";
+      if (mode != "float" && mode != "half-blur") {
+        return false;
+      }
+      options.intermediatePrecision = mode;
+    } else if (arg == "--diffusion-cluster-sigma") {
+      const char *value = requireValue("--diffusion-cluster-sigma");
+      const std::string mode = value ? std::string(value) : "";
+      if (mode != "off" && mode != "0.05" && mode != "0.10") {
+        return false;
+      }
+      options.diffusionClusterSigma = mode;
+    } else if (arg == "--halation-grouped-tail") {
+      const char *value = requireValue("--halation-grouped-tail");
+      bool parsed = false;
+      if (!value || !parseBool(value, parsed)) {
+        return false;
+      }
+      options.halationGroupedTail = parsed ? "1" : "0";
+    } else if (arg == "--scanner-mps") {
+      const char *value = requireValue("--scanner-mps");
+      bool parsed = false;
+      if (!value || !parseBool(value, parsed)) {
+        return false;
+      }
+      options.scannerMps = parsed ? "1" : "0";
+    } else if (arg == "--grain-blur-recurrence") {
+      const char *value = requireValue("--grain-blur-recurrence");
+      bool parsed = false;
+      if (!value || !parseBool(value, parsed)) {
+        return false;
+      }
+      options.grainBlurRecurrence = parsed ? "1" : "0";
+    } else if (arg == "--dir-tail-backend") {
+      const char *value = requireValue("--dir-tail-backend");
+      const std::string mode = value ? std::string(value) : "";
+      if (mode != "fused" && mode != "mps") {
+        return false;
+      }
+      options.dirTailBackend = mode;
     } else if (arg == "--detail") {
       options.detail = true;
     } else if (arg == "--pass-counters") {
@@ -299,6 +404,36 @@ spektrafilm::RenderParams paramsForCase(const std::string &caseName) {
     params.grainSynthesisMaxGrainsPerCell = 64;
     return params;
   }
+  if (caseName == "grain-synthesis-nonlayered") {
+    params.grainModel = spektrafilm::GrainModel::GrainSynthesis;
+    params.grainSynthesisSamples = 64;
+    params.grainSynthesisRadiusStdDevRatio = 0.0f;
+    params.grainSynthesisLayered = false;
+    return params;
+  }
+  if (caseName == "production-grain-no-sublayers") {
+    params.grainModel = spektrafilm::GrainModel::Production;
+    params.grainSublayersEnabled = false;
+    return params;
+  }
+  if (caseName == "production-grain-no-blur") {
+    params.grainModel = spektrafilm::GrainModel::Production;
+    params.grainFinalBlurUm = 0.0f;
+    params.grainBlurDyeCloudsUm = 0.0f;
+    params.grainMicroStructureScale = 0.0f;
+    return params;
+  }
+  if (caseName == "auto-exposure") {
+    params.autoExposure = true;
+    params.autoExposureMethod = spektrafilm::AutoExposureMethod::Median;
+    params.grainEnabled = false;
+    params.halationEnabled = false;
+    params.cameraDiffusionEnabled = false;
+    params.printDiffusionEnabled = false;
+    params.scannerEnabled = false;
+    params.dirCouplersAmount = 0.0f;
+    return params;
+  }
   if (caseName == "halation-only") {
     params.grainEnabled = false;
     params.cameraDiffusionEnabled = false;
@@ -322,7 +457,7 @@ spektrafilm::RenderParams paramsForCase(const std::string &caseName) {
     params.halationBoostEv = 1.0f;
     return params;
   }
-  if (caseName == "diffusion-only") {
+  if (caseName == "camera-diffusion-only" || caseName == "diffusion-only") {
     params.grainEnabled = false;
     params.halationEnabled = false;
     params.cameraDiffusionEnabled = true;
@@ -330,6 +465,25 @@ spektrafilm::RenderParams paramsForCase(const std::string &caseName) {
     params.printDiffusionEnabled = false;
     params.scannerEnabled = false;
     params.dirCouplersAmount = 0.0f;
+    return params;
+  }
+  if (caseName == "print-diffusion-only") {
+    params.grainEnabled = false;
+    params.halationEnabled = false;
+    params.cameraDiffusionEnabled = false;
+    params.printDiffusionEnabled = true;
+    params.printDiffusionStrength = 0.5f;
+    params.scannerEnabled = false;
+    params.dirCouplersAmount = 0.0f;
+    return params;
+  }
+  if (caseName == "dir-only") {
+    params.grainEnabled = false;
+    params.halationEnabled = false;
+    params.cameraDiffusionEnabled = false;
+    params.printDiffusionEnabled = false;
+    params.scannerEnabled = false;
+    params.dirCouplersAmount = 0.6f;
     return params;
   }
   if (caseName == "scanner-only") {
@@ -367,8 +521,8 @@ spektrafilm::RenderParams paramsForCase(const std::string &caseName) {
     params.dirCouplersAmount = 0.6f;
     params.cameraDiffusionEnabled = true;
     params.cameraDiffusionStrength = 0.7f;
-    params.printDiffusionEnabled = true;
-    params.printDiffusionStrength = 0.5f;
+    params.printDiffusionEnabled = false;
+    params.printDiffusionStrength = 0.0f;
     params.scannerEnabled = true;
     params.scannerMtf50LpMm = 60.0f;
     params.scannerUnsharpRadiusUm = 5.0f;
@@ -384,11 +538,14 @@ std::vector<std::string> selectedCases(const std::string &caseName) {
     "default-final",
     "production-grain",
     "enlarged-production-grain",
-    "grain-synthesis",
-    "grain-synthesis-hq",
+    "production-grain-no-sublayers",
+    "production-grain-no-blur",
+    "auto-exposure",
     "halation-only",
     "halation-boost",
-    "diffusion-only",
+    "camera-diffusion-only",
+    "print-diffusion-only",
+    "dir-only",
     "scanner-only",
     "scanner-glare",
     "all-effects",
@@ -396,7 +553,12 @@ std::vector<std::string> selectedCases(const std::string &caseName) {
   if (caseName == "all") {
     return allCases;
   }
-  if (std::find(allCases.begin(), allCases.end(), caseName) == allCases.end()) {
+  const std::vector<std::string> aliasCases = {
+    "diffusion-only",
+  };
+  const bool knownCase = std::find(allCases.begin(), allCases.end(), caseName) != allCases.end() ||
+                         std::find(aliasCases.begin(), aliasCases.end(), caseName) != aliasCases.end();
+  if (!knownCase) {
     return {};
   }
   return {caseName};
@@ -431,6 +593,14 @@ int main(int argc, const char **argv) {
     setenv("SPEKTRAFILM_THREADGROUP", options.threadgroup.c_str(), 1);
     setenv("SPEKTRAFILM_SCANNER_IMAGE_STORAGE", options.scannerImageStorage.c_str(), 1);
     setenv("SPEKTRAFILM_DIFFUSION_GROUP_SIZE", options.diffusionGroupSize.c_str(), 1);
+    setenv("SPEKTRAFILM_BLUR_BACKEND", options.blurBackend.c_str(), 1);
+    setenv("SPEKTRAFILM_BLUR_DOWNSAMPLE", options.blurDownsample.c_str(), 1);
+    setenv("SPEKTRAFILM_INTERMEDIATE_PRECISION", options.intermediatePrecision.c_str(), 1);
+    setenv("SPEKTRAFILM_DIFFUSION_CLUSTER_SIGMA", options.diffusionClusterSigma.c_str(), 1);
+    setenv("SPEKTRAFILM_HALATION_GROUPED_TAIL", options.halationGroupedTail.c_str(), 1);
+    setenv("SPEKTRAFILM_SCANNER_MPS", options.scannerMps.c_str(), 1);
+    setenv("SPEKTRAFILM_GRAIN_BLUR_RECURRENCE", options.grainBlurRecurrence.c_str(), 1);
+    setenv("SPEKTRAFILM_DIR_TAIL_BACKEND", options.dirTailBackend.c_str(), 1);
     setenv("SPEKTRAFILM_PASS_TIMING", options.passTiming.c_str(), 1);
     setenv("SPEKTRAFILM_GRAIN_SYNTHESIS_SAMPLER", options.grainSynthesisSampler.c_str(), 1);
     setenv("SPEKTRAFILM_GRAIN_SYNTHESIS_RADIUS_LUT", options.grainSynthesisRadiusLut.c_str(), 1);
@@ -453,29 +623,32 @@ int main(int argc, const char **argv) {
       return 1;
     }
 
-    std::vector<float> source = makeSyntheticFrame(options.width, options.height);
-    std::vector<float> destination(static_cast<size_t>(options.width) * static_cast<size_t>(options.height) * 4u, 0.0f);
-    const spektrafilm::ImageView sourceView{
-      source.data(),
-      0,
-      0,
+    spektrafilm_harness::HostPixelFormat sourceFormat;
+    spektrafilm_harness::HostPixelFormat destinationFormat;
+    spektrafilm_harness::HostLayout hostLayout;
+    if (!spektrafilm_harness::parseHostPixelFormat(options.sourceFormat, sourceFormat) ||
+        !spektrafilm_harness::parseHostPixelFormat(options.destinationFormat, destinationFormat) ||
+        !spektrafilm_harness::parseHostLayout(options.hostLayout, hostLayout)) {
+      std::cerr << "Invalid host I/O configuration.\n";
+      return 2;
+    }
+    std::vector<float> sourcePixels = makeSyntheticFrame(options.width, options.height);
+    spektrafilm_harness::HostRgbaBuffer source = spektrafilm_harness::makeSourceHostRgba(
+      sourcePixels,
       options.width,
       options.height,
-      options.width * static_cast<int>(4 * sizeof(float)),
-      4,
-      4,
-    };
-    spektrafilm::MutableImageView destinationView{
-      destination.data(),
-      0,
-      0,
+      sourceFormat,
+      hostLayout
+    );
+    spektrafilm_harness::HostRgbaBuffer destination = spektrafilm_harness::makeDestinationHostRgba(
       options.width,
       options.height,
-      options.width * static_cast<int>(4 * sizeof(float)),
-      4,
-      4,
-    };
-    const spektrafilm::RenderWindow window{0, 0, options.width, options.height};
+      destinationFormat,
+      hostLayout
+    );
+    const spektrafilm::ImageView sourceView = spektrafilm_harness::imageView(source);
+    spektrafilm::MutableImageView destinationView = spektrafilm_harness::mutableImageView(destination);
+    const spektrafilm::RenderWindow window = spektrafilm_harness::renderWindowForLayout(hostLayout, options.width, options.height);
 
     std::cout
       << "case,width,height,iterations,avg_wall_ms,avg_fps,avg_cpu_setup_ms,avg_source_copy_ms,"
@@ -484,7 +657,8 @@ int main(int argc, const char **argv) {
       << "avg_shared_scratch_alloc_bytes,avg_shared_scratch_alloc_count,"
       << "avg_private_scratch_alloc_bytes,avg_private_scratch_alloc_count,avg_upload_bytes,"
       << "source_no_copy,destination_no_copy,private_scratch,pass_gpu_timing,pass_timing_mode,threadgroup,diffusion_group_size,"
-      << "scanner_image_storage,grain_synthesis_sampler,grain_synthesis_radius_lut,grain_synthesis_target_storage,"
+      << "scanner_image_storage,blur_backend,blur_downsample,intermediate_precision,diffusion_cluster_sigma,halation_grouped_tail,"
+      << "scanner_mps,grain_blur_recurrence,dir_tail_backend,source_format,destination_format,host_layout,grain_synthesis_sampler,grain_synthesis_radius_lut,grain_synthesis_target_storage,"
       << "grain_synthesis_cell_mode,halation,camera_diffusion,print_diffusion,dir,production_grain,final_post_process,mean_luma\n";
     std::vector<std::string> detailRows;
 
@@ -537,8 +711,16 @@ int main(int argc, const char **argv) {
       bool productionGrain = false;
       bool finalPostProcess = false;
       bool scannerTextureIntermediates = false;
-      uint32_t diffusionGroupSize = 1u;
+      bool halationGroupedTail = false;
+      bool scannerMps = false;
+      bool grainBlurRecurrence = false;
+      uint32_t diffusionGroupSize = 2u;
       std::string threadgroupMode = "auto";
+      std::string blurBackend = "custom";
+      std::string blurDownsample = "auto";
+      std::string intermediatePrecision = "float";
+      std::string diffusionClusterSigma = "0.10";
+      std::string dirTailBackend = "mps";
 
       for (int i = 0; i < options.iterations; ++i) {
         const auto start = Clock::now();
@@ -574,8 +756,16 @@ int main(int argc, const char **argv) {
         productionGrain = diag.productionGrainPath;
         finalPostProcess = diag.finalPostProcessPath;
         scannerTextureIntermediates = diag.scannerTextureIntermediates;
+        halationGroupedTail = diag.halationGroupedTail;
+        scannerMps = diag.scannerMps;
+        grainBlurRecurrence = diag.grainBlurRecurrence;
         diffusionGroupSize = diag.diffusionGroupSize;
         threadgroupMode = diag.threadgroupMode;
+        blurBackend = diag.blurBackend.empty() ? options.blurBackend : diag.blurBackend;
+        blurDownsample = diag.blurDownsample.empty() ? options.blurDownsample : diag.blurDownsample;
+        intermediatePrecision = diag.intermediatePrecision.empty() ? options.intermediatePrecision : diag.intermediatePrecision;
+        diffusionClusterSigma = diag.diffusionClusterSigma.empty() ? options.diffusionClusterSigma : diag.diffusionClusterSigma;
+        dirTailBackend = diag.dirTailBackend.empty() ? options.dirTailBackend : diag.dirTailBackend;
         if (options.detail) {
           for (size_t passIndex = 0; passIndex < diag.passes.size(); ++passIndex) {
             const spektrafilm::MetalPassDiagnostics &pass = diag.passes[passIndex];
@@ -630,6 +820,17 @@ int main(int argc, const char **argv) {
                 << threadgroupMode << ','
                 << diffusionGroupSize << ','
                 << (scannerTextureIntermediates ? "texture" : "buffer") << ','
+                << blurBackend << ','
+                << blurDownsample << ','
+                << intermediatePrecision << ','
+                << diffusionClusterSigma << ','
+                << (halationGroupedTail ? 1 : 0) << ','
+                << (scannerMps ? 1 : 0) << ','
+                << (grainBlurRecurrence ? 1 : 0) << ','
+                << dirTailBackend << ','
+                << options.sourceFormat << ','
+                << options.destinationFormat << ','
+                << options.hostLayout << ','
                 << options.grainSynthesisSampler << ','
                 << options.grainSynthesisRadiusLut << ','
                 << options.grainSynthesisTargetStorage << ','
@@ -640,7 +841,7 @@ int main(int argc, const char **argv) {
                 << (dir ? 1 : 0) << ','
                 << (productionGrain ? 1 : 0) << ','
                 << (finalPostProcess ? 1 : 0) << ','
-                << averageLuma(destination)
+                << spektrafilm_harness::averageWindowLuma(destination)
                 << '\n';
     }
     if (options.detail) {

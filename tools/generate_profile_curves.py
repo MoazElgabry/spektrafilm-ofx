@@ -12,19 +12,15 @@ import warnings
 from pathlib import Path
 
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
 OFX_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = Path(os.environ.get("SPEKTRAFILM_DATA_DIR", OFX_ROOT / "Resources" / "data"))
 os.environ.setdefault("SPEKTRAFILM_DATA_DIR", str(DATA_DIR))
-PROFILE_DIR = DATA_DIR / "profiles"
-ARCHIVE_PROFILE_DIR = PROFILE_DIR / "archive"
+PROFILE_DIR = Path(os.environ.get("SPEKTRAFILM_PROFILE_DIR", DATA_DIR / "profiles"))
+ARCHIVE_PROFILE_DIR = Path(os.environ.get("SPEKTRAFILM_ARCHIVE_PROFILE_DIR", DATA_DIR / "profiles" / "archive"))
 ST2065_2_DIR = DATA_DIR / "standards" / "smpte_st_2065_2"
 ST2065_2_APD_RESPONSIVITIES_CSV = "st2065-2a-2020.csv"
 ST2065_2_INFLUX_SPECTRUM_CSV = "st2065-2b-2020.csv"
 HANATOS_LUT_PATH = DATA_DIR / "luts" / "spectral_upsampling" / "irradiance_xy_tc.npy"
-SRC_DIR = REPO_ROOT / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
 TOOLS_DIR = Path(__file__).resolve().parent
 if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
@@ -33,12 +29,13 @@ os.environ.setdefault("XDG_CACHE_HOME", "/private/tmp/spektrafilm-xdg-cache")
 
 import numpy as np
 import colour
-from spektrafilm.config import SPECTRAL_SHAPE, STANDARD_OBSERVER_CMFS
-from spektrafilm.model.color_filters import custom_dichroic_filters
-from spektrafilm.model.illuminants import standard_illuminant
-from spektrafilm.utils.io import read_neutral_print_filters
-from spektrafilm.utils.spectral_upsampling import MALLETT2019_BASIS, _illuminant_to_xy
+import scipy.interpolate
+import scipy.special
 from ofx_stock_lists import DEFAULT_FILM_INDEX, DEFAULT_PAPER_INDEX, FILMS, PAPERS
+
+SPECTRAL_SHAPE = colour.SpectralShape(380, 780, 5)
+STANDARD_OBSERVER_CMFS = colour.MSDS_CMFS["CIE 1931 2 Degree Standard Observer"].copy().align(SPECTRAL_SHAPE)
+MALLETT2019_BASIS = colour.recovery.MSDS_BASIS_FUNCTIONS_sRGB_MALLETT2019.copy().align(SPECTRAL_SHAPE)
 
 COLOR_DECODE_MIN = -0.125
 COLOR_DECODE_MAX = 1.5
@@ -48,6 +45,111 @@ COLOR_LUT_SIZE = 4096
 
 TRANSFER_LINEAR = 0
 TRANSFER_LUT = 1
+
+
+def _unique_numeric_csv(path: Path) -> np.ndarray:
+    data = np.loadtxt(path, delimiter=",")
+    unique_index = np.unique(data[:, 0], return_index=True)[1]
+    return data[unique_index, :]
+
+
+def _load_dichroic_filters(wavelengths: np.ndarray, brand: str = "thorlabs") -> np.ndarray:
+    filters = np.zeros((np.size(wavelengths), 3))
+    for index, channel in enumerate(("c", "m", "y")):
+        path = DATA_DIR / "filters" / "dichroics" / brand / f"filter_{channel}.csv"
+        data = _unique_numeric_csv(path)
+        filters[:, index] = scipy.interpolate.Akima1DInterpolator(data[:, 0], data[:, 1] / 100.0)(wavelengths)
+    return filters
+
+
+def _load_filter(
+    wavelengths: np.ndarray,
+    name: str = "KG3",
+    brand: str = "schott",
+    filter_type: str = "heat_absorbing",
+    percent_transmittance: bool = False,
+) -> np.ndarray:
+    path = DATA_DIR / "filters" / filter_type / brand / f"{name}.csv"
+    data = _unique_numeric_csv(path)
+    scale = 100.0 if percent_transmittance else 1.0
+    return scipy.interpolate.Akima1DInterpolator(data[:, 0], data[:, 1] / scale)(wavelengths)
+
+
+def read_neutral_print_filters() -> dict:
+    with (DATA_DIR / "filters" / "neutral_print_filters.json").open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _create_combined_dichroic_filter(
+    wavelengths: np.ndarray,
+    transitions: tuple[float, float, float, float] = (12.0, 8.0, 8.0, 8.0),
+    edges: tuple[float, float, float, float] = (516.0, 500.0, 610.0, 607.0),
+) -> np.ndarray:
+    filters = np.zeros((np.size(wavelengths), 3))
+    filters[:, 2] = scipy.special.erf((wavelengths - edges[0]) / transitions[0])
+    filters[:, 1][wavelengths <= 550] = -scipy.special.erf((wavelengths[wavelengths <= 550] - edges[1]) / transitions[1])
+    filters[:, 1][wavelengths > 550] = scipy.special.erf((wavelengths[wavelengths > 550] - edges[2]) / transitions[2])
+    filters[:, 0] = -scipy.special.erf((wavelengths - edges[3]) / transitions[3])
+    return filters * 0.5 + 0.5
+
+
+class _FilterSet:
+    def __init__(self, filters: np.ndarray):
+        self.filters = filters
+
+
+_SPECTRAL_WAVELENGTHS = np.asarray(SPECTRAL_SHAPE.wavelengths, dtype=float)
+custom_dichroic_filters = _FilterSet(_create_combined_dichroic_filter(_SPECTRAL_WAVELENGTHS))
+_SCHOTT_KG3_HEAT_FILTER = _load_filter(_SPECTRAL_WAVELENGTHS, name="KG3", filter_type="heat_absorbing", brand="schott")
+_GENERIC_LENS_TRANSMISSION = _load_filter(
+    _SPECTRAL_WAVELENGTHS,
+    name="canon_24_f28_is",
+    filter_type="lens_transmission",
+    brand="canon",
+    percent_transmittance=True,
+)
+
+
+def _apply_filter(illuminant: np.ndarray, transmittance: np.ndarray, value: float = 1.0) -> np.ndarray:
+    return illuminant * (1.0 - (1.0 - transmittance) * value)
+
+
+def _black_body_spectrum(temperature: float) -> colour.SpectralDistribution:
+    values = colour.colorimetry.blackbody_spectral_radiance(SPECTRAL_SHAPE.wavelengths * 1e-9, temperature)
+    return colour.SpectralDistribution(values, domain=SPECTRAL_SHAPE)
+
+
+def standard_illuminant(illuminant_type: str = "D65", return_class: bool = False):
+    if illuminant_type.startswith("BB"):
+        spectral_intensity = _black_body_spectrum(float(illuminant_type[2:]))
+    elif illuminant_type == "T":
+        spectral_intensity = colour.SDS_LIGHT_SOURCES["Incandescent"].copy().align(SPECTRAL_SHAPE)
+    elif illuminant_type == "K75P":
+        spectral_intensity = colour.SDS_LIGHT_SOURCES["Kinoton 75P"].copy().align(SPECTRAL_SHAPE)
+    elif illuminant_type == "TH-KG3":
+        spectral_intensity = _black_body_spectrum(3400)
+        spectral_intensity.values = _apply_filter(spectral_intensity.values, _SCHOTT_KG3_HEAT_FILTER)
+    elif illuminant_type == "TH-KG3-L":
+        spectral_intensity = _black_body_spectrum(3400)
+        spectral_intensity.values = _apply_filter(spectral_intensity.values, _SCHOTT_KG3_HEAT_FILTER)
+        spectral_intensity.values = _apply_filter(spectral_intensity.values, _GENERIC_LENS_TRANSMISSION)
+    else:
+        spectral_intensity = colour.SDS_ILLUMINANTS[illuminant_type].copy().align(SPECTRAL_SHAPE)
+
+    spectral_intensity.name = illuminant_type
+    normalization = np.sum(spectral_intensity.values) / np.size(SPECTRAL_SHAPE.wavelengths)
+    spectral_intensity.values = spectral_intensity.values / normalization
+    return spectral_intensity if return_class else spectral_intensity[:]
+
+
+def _illuminant_to_xy(illuminant_label: str) -> np.ndarray:
+    illuminant = standard_illuminant(illuminant_label)
+    xyz = np.zeros(3)
+    cmfs = STANDARD_OBSERVER_CMFS[:]
+    for index in range(3):
+        xyz[index] = np.sum(illuminant * cmfs[:, index])
+    return xyz[0:2] / np.sum(xyz)
+
 
 HALATION_PRESETS = {
     ("still", "strong"): {"sigma_h": (65.0, 65.0, 65.0), "strength": (0.015, 0.005, 0.0)},
