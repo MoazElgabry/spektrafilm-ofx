@@ -127,7 +127,7 @@ struct RenderParams {
   bool scanNegativeInvert = false;
   RenderOutputMode renderOutput = RenderOutputMode::FinalPreview;
   RgbToRawMethod rgbToRawMethod = RgbToRawMethod::Hanatos2026;
-  ColorSpace inputColorSpace = ColorSpace::ArriLogC4;
+  ColorSpace inputColorSpace = ColorSpace::DavinciIntermediateWideGamut;
   ColorSpace outputColorSpace = ColorSpace::Rec709Gamma24;
   OutputRole outputRole = OutputRole::DisplaySdr;
   HdrPreset hdrPreset = HdrPreset::Pq1000;
@@ -315,6 +315,11 @@ inline uint32_t colorAdaptationFlags(const RenderParams &params) {
   return flags;
 }
 
+enum class ImageMemoryDomain : int32_t {
+  Host = 0,
+  CudaDevice = 1,
+};
+
 struct ImageView {
   const void *data = nullptr;
   int32_t x1 = 0;
@@ -324,6 +329,7 @@ struct ImageView {
   int32_t rowBytes = 0;
   int32_t components = 4;
   int32_t bytesPerComponent = 4;
+  ImageMemoryDomain memoryDomain = ImageMemoryDomain::Host;
 };
 
 struct MutableImageView {
@@ -335,6 +341,7 @@ struct MutableImageView {
   int32_t rowBytes = 0;
   int32_t components = 4;
   int32_t bytesPerComponent = 4;
+  ImageMemoryDomain memoryDomain = ImageMemoryDomain::Host;
 };
 
 struct RenderWindow {

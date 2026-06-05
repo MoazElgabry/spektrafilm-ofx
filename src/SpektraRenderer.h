@@ -40,16 +40,23 @@ struct RendererTileDiagnostics {
 };
 
 struct RendererDiagnostics {
+  std::string backendName;
+  std::string backendFallbackReason;
   double cpuSetupMs = 0.0;
   double sourceCopyMs = 0.0;
   double commandEncodingMs = 0.0;
   double commandBufferMs = 0.0;
   double gpuCommandBufferMs = 0.0;
   double outputCopyMs = 0.0;
+  double cudaHostToDeviceMs = 0.0;
+  double cudaDeviceToHostMs = 0.0;
+  double cudaKernelMs = 0.0;
   uint64_t staticAllocationBytes = 0;
   uint64_t staticAllocationCount = 0;
   uint64_t scratchAllocationBytes = 0;
   uint64_t scratchAllocationCount = 0;
+  uint64_t cudaPinnedStagingBytes = 0;
+  uint64_t cudaDeviceScratchBytes = 0;
   uint64_t sharedScratchAllocationBytes = 0;
   uint64_t sharedScratchAllocationCount = 0;
   uint64_t privateScratchAllocationBytes = 0;
@@ -69,6 +76,8 @@ struct RendererDiagnostics {
   bool passStageCounterSamplingSupported = false;
   bool sourceNoCopy = false;
   bool destinationNoCopy = false;
+  bool cudaMappedHostMemory = false;
+  bool cudaGraphEnabled = false;
   bool passGpuTimingEnabled = false;
   bool passGpuTimingAvailable = false;
   bool privateScratchEnabled = false;
@@ -100,6 +109,10 @@ struct RendererDiagnostics {
   std::string densityCurveLookup = "binary";
   std::string spectralTransmittance = "pow";
   std::string finalCoreMode = "fused";
+  std::string deviceName;
+  std::string cudaTransferMode;
+  int cudaComputeCapabilityMajor = 0;
+  int cudaComputeCapabilityMinor = 0;
   std::vector<RendererPassDiagnostics> passes;
   std::vector<RendererTileDiagnostics> tiles;
 };
