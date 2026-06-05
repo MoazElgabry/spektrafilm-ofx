@@ -59,6 +59,8 @@ constexpr ColorSpaceEntry kColorSpaces[] = {
   {"panasonic_vlog_vgamut", "Panasonic V-Log V-Gamut", spektrafilm::ColorSpace::PanasonicVLogVGamut},
   {"aces2065_1", "ACES2065-1", spektrafilm::ColorSpace::Aces2065_1},
   {"acescg", "ACEScg", spektrafilm::ColorSpace::AcesCg},
+  {"acescct", "ACEScct", spektrafilm::ColorSpace::AcesCct},
+  {"acescc", "ACEScc", spektrafilm::ColorSpace::AcesCc},
   {"linear_rec2020", "Linear Rec.2020", spektrafilm::ColorSpace::LinearRec2020},
   {"linear_rec709", "Linear Rec.709", spektrafilm::ColorSpace::LinearRec709},
   {"linear_p3_d65", "Linear P3-D65", spektrafilm::ColorSpace::LinearP3D65},

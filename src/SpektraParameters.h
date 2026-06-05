@@ -100,18 +100,20 @@ enum class ColorSpace : int32_t {
   PanasonicVLogVGamut = 9,
   Aces2065_1 = 10,
   AcesCg = 11,
-  LinearRec2020 = 12,
-  LinearRec709 = 13,
-  LinearP3D65 = 14,
-  Srgb = 15,
-  DisplayP3 = 16,
-  ProPhotoRgb = 17,
-  AdobeRgb1998 = 18,
-  DciP3 = 19,
-  P3D65Gamma22 = 20,
-  P3D65Gamma26 = 21,
-  Rec709Gamma22 = 22,
-  Rec709Gamma24 = 23,
+  AcesCct = 12,
+  AcesCc = 13,
+  LinearRec2020 = 14,
+  LinearRec709 = 15,
+  LinearP3D65 = 16,
+  Srgb = 17,
+  DisplayP3 = 18,
+  ProPhotoRgb = 19,
+  AdobeRgb1998 = 20,
+  DciP3 = 21,
+  P3D65Gamma22 = 22,
+  P3D65Gamma26 = 23,
+  Rec709Gamma22 = 24,
+  Rec709Gamma24 = 25,
 };
 
 struct RenderParams {
@@ -127,6 +129,7 @@ struct RenderParams {
   float hdrPeakNits = 1000.0f;
   float hdrExposureEv = 0.0f;
   HdrToneMapping hdrToneMapping = HdrToneMapping::HardClip;
+  bool colorAdaptation = false;
   int32_t film = 2;
   int32_t paper = 3;
   PrintTimingMode printTiming = PrintTimingMode::FilteredEnlarger;

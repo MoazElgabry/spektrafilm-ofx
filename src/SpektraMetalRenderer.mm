@@ -161,7 +161,7 @@ struct KernelParams {
   float hdrPeakNits;
   float hdrExposureEv;
   int32_t hdrToneMapping;
-  uint32_t _padColor0;
+  uint32_t colorAdaptationEnabled;
   int32_t film;
   int32_t paper;
   int32_t printTiming;
@@ -904,6 +904,7 @@ KernelParams toKernelParams(const RenderParams &params, double time, int32_t wid
   out.hdrPeakNits = params.hdrPeakNits;
   out.hdrExposureEv = params.hdrExposureEv;
   out.hdrToneMapping = static_cast<int32_t>(params.hdrToneMapping);
+  out.colorAdaptationEnabled = params.colorAdaptation ? 1u : 0u;
   out.film = params.film;
   out.paper = params.paper;
   out.printTiming = static_cast<int32_t>(params.printTiming);
@@ -1591,6 +1592,193 @@ std::vector<float> makeHanatosRawResponse(
   return response;
 }
 
+float reinhardKnee(float value, float threshold, float limit, float power) {
+  if (!std::isfinite(value) || value <= threshold) {
+    return value;
+  }
+  const float scale = std::max(limit - threshold, 1.0e-12f);
+  const float x = (value - threshold) / scale;
+  const float y = x / std::pow(1.0f + std::pow(x, power), 1.0f / power);
+  return threshold + scale * y;
+}
+
+std::array<float, 2> filmReferenceIlluminantXy(const ProfileCurveSet &filmCurves) {
+  const float *cmfs = standardObserverCmfs();
+  if (!filmCurves.referenceIlluminantSpectrum || !cmfs || filmCurves.wavelengthCount == 0) {
+    return {1.0f / 3.0f, 1.0f / 3.0f};
+  }
+  std::array<float, 3> xyz = {0.0f, 0.0f, 0.0f};
+  for (uint32_t wavelength = 0; wavelength < filmCurves.wavelengthCount; ++wavelength) {
+    const float illuminant = filmCurves.referenceIlluminantSpectrum[wavelength];
+    const uint32_t offset = wavelength * 3u;
+    xyz[0] += illuminant * cmfs[offset];
+    xyz[1] += illuminant * cmfs[offset + 1u];
+    xyz[2] += illuminant * cmfs[offset + 2u];
+  }
+  const float sum = xyz[0] + xyz[1] + xyz[2];
+  if (!(sum > 1.0e-12f) || !std::isfinite(sum)) {
+    return {1.0f / 3.0f, 1.0f / 3.0f};
+  }
+  return {xyz[0] / sum, xyz[1] / sum};
+}
+
+std::vector<std::array<float, 2>> spectralLocusXy(const ProfileCurveSet &filmCurves) {
+  std::vector<std::array<float, 2>> locus;
+  const float *cmfs = standardObserverCmfs();
+  if (!filmCurves.wavelengths || !cmfs) {
+    return locus;
+  }
+  for (uint32_t wavelength = 0; wavelength < filmCurves.wavelengthCount; ++wavelength) {
+    if (filmCurves.wavelengths[wavelength] > 700.0f + 1.0e-4f) {
+      continue;
+    }
+    const uint32_t offset = wavelength * 3u;
+    const float x = cmfs[offset];
+    const float y = cmfs[offset + 1u];
+    const float z = cmfs[offset + 2u];
+    const float sum = x + y + z;
+    if (sum > 1.0e-12f && std::isfinite(sum)) {
+      locus.push_back({x / sum, y / sum});
+    }
+  }
+  if (!locus.empty()) {
+    locus.push_back(locus.front());
+  }
+  return locus;
+}
+
+float rayPolygonDistance(
+  std::array<float, 2> origin,
+  std::array<float, 2> direction,
+  const std::vector<std::array<float, 2>> &polygon
+) {
+  float tMin = INFINITY;
+  for (size_t edgeIndex = 0; edgeIndex + 1u < polygon.size(); ++edgeIndex) {
+    const float ax = polygon[edgeIndex][0];
+    const float ay = polygon[edgeIndex][1];
+    const float ex = polygon[edgeIndex + 1u][0] - ax;
+    const float ey = polygon[edgeIndex + 1u][1] - ay;
+    const float denom = direction[0] * ey - direction[1] * ex;
+    if (std::abs(denom) <= 1.0e-12f) {
+      continue;
+    }
+    const float ox = origin[0] - ax;
+    const float oy = origin[1] - ay;
+    const float t = (-ox * ey + oy * ex) / denom;
+    const float s = (-ox * direction[1] + oy * direction[0]) / denom;
+    if (t > 1.0e-9f && s >= 0.0f && s <= 1.0f && t < tMin) {
+      tMin = t;
+    }
+  }
+  return tMin;
+}
+
+std::array<float, 2> compressXyRadial(
+  std::array<float, 2> xy,
+  std::array<float, 2> whiteXy,
+  const std::vector<std::array<float, 2>> &locus
+) {
+  const float dx = xy[0] - whiteXy[0];
+  const float dy = xy[1] - whiteXy[1];
+  const float distance = std::sqrt(dx * dx + dy * dy);
+  if (!(distance > 1.0e-9f) || locus.size() < 4u) {
+    return xy;
+  }
+  const std::array<float, 2> direction = {dx / distance, dy / distance};
+  const float boundary = rayPolygonDistance(whiteXy, direction, locus);
+  if (!(boundary > 1.0e-12f) || !std::isfinite(boundary)) {
+    return xy;
+  }
+  const float normalized = distance / boundary;
+  const float compressed = reinhardKnee(normalized, 0.0f, 1.0f, 6.0f);
+  const float newDistance = compressed * boundary;
+  return {whiteXy[0] + direction[0] * newDistance, whiteXy[1] + direction[1] * newDistance};
+}
+
+std::array<float, 3> sampleHanatosResponseBilinear(
+  const std::vector<float> &response,
+  const HanatosSpectraLutInfo &hanatos,
+  float x,
+  float y
+) {
+  x = std::clamp(x, 0.0f, static_cast<float>(hanatos.width - 1u));
+  y = std::clamp(y, 0.0f, static_cast<float>(hanatos.height - 1u));
+  const uint32_t x0 = static_cast<uint32_t>(std::floor(x));
+  const uint32_t y0 = static_cast<uint32_t>(std::floor(y));
+  const uint32_t x1 = std::min(x0 + 1u, hanatos.width - 1u);
+  const uint32_t y1 = std::min(y0 + 1u, hanatos.height - 1u);
+  const float tx = x - static_cast<float>(x0);
+  const float ty = y - static_cast<float>(y0);
+  const auto valueAt = [&](uint32_t xi, uint32_t yi) -> std::array<float, 3> {
+    const size_t offset = (static_cast<size_t>(xi) * hanatos.height + yi) * 3u;
+    return {response[offset], response[offset + 1u], response[offset + 2u]};
+  };
+  const std::array<float, 3> v00 = valueAt(x0, y0);
+  const std::array<float, 3> v10 = valueAt(x1, y0);
+  const std::array<float, 3> v01 = valueAt(x0, y1);
+  const std::array<float, 3> v11 = valueAt(x1, y1);
+  std::array<float, 3> out{};
+  for (uint32_t channel = 0; channel < 3u; ++channel) {
+    const float a = v00[channel] + (v10[channel] - v00[channel]) * tx;
+    const float b = v01[channel] + (v11[channel] - v01[channel]) * tx;
+    out[channel] = a + (b - a) * ty;
+  }
+  return out;
+}
+
+std::vector<float> remapHanatosResponseForInputGamutCompression(
+  const ProfileCurveSet &filmCurves,
+  const std::vector<float> &baseResponse,
+  const HanatosSpectraLutInfo &hanatos
+) {
+  std::vector<float> remapped(baseResponse.size(), 0.0f);
+  if (hanatos.width < 2u || hanatos.height < 2u || baseResponse.size() < static_cast<size_t>(hanatos.width) * hanatos.height * 3u) {
+    return remapped;
+  }
+  const std::array<float, 2> whiteXy = filmReferenceIlluminantXy(filmCurves);
+  const std::vector<std::array<float, 2>> locus = spectralLocusXy(filmCurves);
+  if (locus.size() < 4u) {
+    return baseResponse;
+  }
+  for (uint32_t x = 0; x < hanatos.width; ++x) {
+    const float tx = static_cast<float>(x) / static_cast<float>(hanatos.width - 1u);
+    const float rootTx = std::sqrt(std::max(tx, 0.0f));
+    for (uint32_t y = 0; y < hanatos.height; ++y) {
+      const float ty = static_cast<float>(y) / static_cast<float>(hanatos.height - 1u);
+      const std::array<float, 2> xy = {1.0f - rootTx, ty * rootTx};
+      const std::array<float, 2> compressedXy = compressXyRadial(xy, whiteXy, locus);
+      const float oneMinusX = std::max(1.0f - compressedXy[0], 1.0e-10f);
+      const float sampleTx = std::clamp(oneMinusX * oneMinusX, 0.0f, 1.0f);
+      const float sampleTy = std::clamp(compressedXy[1] / oneMinusX, 0.0f, 1.0f);
+      const std::array<float, 3> sampled = sampleHanatosResponseBilinear(
+        baseResponse,
+        hanatos,
+        sampleTx * static_cast<float>(hanatos.width - 1u),
+        sampleTy * static_cast<float>(hanatos.height - 1u)
+      );
+      const size_t offset = (static_cast<size_t>(x) * hanatos.height + y) * 3u;
+      remapped[offset] = sampled[0];
+      remapped[offset + 1u] = sampled[1];
+      remapped[offset + 2u] = sampled[2];
+    }
+  }
+  return remapped;
+}
+
+std::vector<float> makeHanatosRawResponsePair(
+  const ProfileCurveSet &filmCurves,
+  const std::vector<float> &linearSensitivity,
+  const std::vector<float> &hanatosSpectra,
+  const HanatosSpectraLutInfo &hanatos,
+  RgbToRawMethod method
+) {
+  std::vector<float> response = makeHanatosRawResponse(filmCurves, linearSensitivity, hanatosSpectra, hanatos, method);
+  std::vector<float> compressed = remapHanatosResponseForInputGamutCompression(filmCurves, response, hanatos);
+  response.reserve(response.size() + compressed.size());
+  response.insert(response.end(), compressed.begin(), compressed.end());
+  return response;
+}
+
 float interpLinear(const std::vector<float> &x, const float *y, uint32_t channel, float target) {
   if (x.empty()) {
     return 0.0f;
@@ -2083,6 +2271,93 @@ void *contiguousHalfWindowPointer(
   return base + static_cast<size_t>(destinationY) * view.rowBytes;
 }
 
+struct HostBufferLayout {
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint32_t rowBytes = 0;
+  uint32_t startByteOffset = 0;
+};
+
+struct ExternalMetalBufferContext {
+  id<MTLBuffer> sourceBuffer = nil;
+  id<MTLBuffer> destinationBuffer = nil;
+  id<MTLCommandQueue> commandQueue = nil;
+  MetalBufferImageView source{};
+  MetalBufferImageView destination{};
+  HostBufferLayout sourceLayout{};
+  HostBufferLayout destinationLayout{};
+  bool active = false;
+  bool sourceCompactFloat = false;
+  bool sourceCompactHalf = false;
+  bool destinationCompactFloat = false;
+  bool destinationCompactHalf = false;
+  bool sourceStridedFloat = false;
+  bool sourceStridedHalf = false;
+  bool destinationStridedFloat = false;
+  bool destinationStridedHalf = false;
+};
+
+thread_local ExternalMetalBufferContext *gExternalMetalBufferContext = nullptr;
+
+bool configureExternalMetalBufferLayout(
+  const MetalBufferImageView &view,
+  const RenderWindow &window,
+  int32_t width,
+  int32_t height,
+  HostBufferLayout &layout,
+  bool &compactFloat,
+  bool &compactHalf,
+  bool &stridedFloat,
+  bool &stridedHalf,
+  std::string &error
+) {
+  compactFloat = false;
+  compactHalf = false;
+  stridedFloat = false;
+  stridedHalf = false;
+  if (!view.buffer || view.components != 4 || (view.bytesPerComponent != 2 && view.bytesPerComponent != 4)) {
+    error = "OFX Metal buffers must be RGBA half or RGBA float.";
+    return false;
+  }
+  const int32_t startX = window.x1 - view.x1;
+  const int32_t startY = window.y1 - view.y1;
+  if (width <= 0 || height <= 0 ||
+      startX < 0 || startY < 0 ||
+      startX + width > view.width ||
+      startY + height > view.height) {
+    error = "OFX Metal render window is outside the supplied image buffer bounds.";
+    return false;
+  }
+  const int32_t pixelBytes = view.components * view.bytesPerComponent;
+  const int64_t minimumRowBytes = static_cast<int64_t>(startX + width) * pixelBytes;
+  if (view.rowBytes < minimumRowBytes) {
+    error = "OFX Metal image row bytes are smaller than the requested render window.";
+    return false;
+  }
+  const int64_t startByteOffset64 =
+    static_cast<int64_t>(startY) * view.rowBytes +
+    static_cast<int64_t>(startX) * pixelBytes;
+  if (startByteOffset64 < 0 || startByteOffset64 > std::numeric_limits<uint32_t>::max()) {
+    error = "OFX Metal image buffer layout exceeds the supported 32-bit staging offset range.";
+    return false;
+  }
+
+  layout.width = static_cast<uint32_t>(width);
+  layout.height = static_cast<uint32_t>(height);
+  layout.rowBytes = static_cast<uint32_t>(view.rowBytes);
+  layout.startByteOffset = static_cast<uint32_t>(startByteOffset64);
+
+  const bool compact = layout.startByteOffset == 0u && view.rowBytes == width * pixelBytes;
+  if (view.bytesPerComponent == 4) {
+    compactFloat = compact;
+    stridedFloat = !compact;
+  } else {
+    compactHalf = compact;
+    stridedHalf = !compact;
+  }
+  return true;
+}
+
 } // namespace
 
 struct MetalRenderer::Impl {
@@ -2131,6 +2406,10 @@ struct MetalRenderer::Impl {
   id<MTLComputePipelineState> copyBufferPipeline = nil;
   id<MTLComputePipelineState> halfToFloatBufferPipeline = nil;
   id<MTLComputePipelineState> floatToHalfBufferPipeline = nil;
+  id<MTLComputePipelineState> stridedFloatToFloatBufferPipeline = nil;
+  id<MTLComputePipelineState> stridedHalfToFloatBufferPipeline = nil;
+  id<MTLComputePipelineState> floatToStridedFloatBufferPipeline = nil;
+  id<MTLComputePipelineState> floatToStridedHalfBufferPipeline = nil;
   id<MTLComputePipelineState> dirBaselinePipeline = nil;
   id<MTLComputePipelineState> dirBlurXPipeline = nil;
   id<MTLComputePipelineState> dirBlurYPipeline = nil;
@@ -2192,6 +2471,7 @@ struct MetalRenderer::Impl {
   id<MTLComputePipelineState> scannerFinalizePipeline = nil;
   id<MTLComputePipelineState> scannerFinalizeTexturePipeline = nil;
   std::vector<float> hanatosSpectraData;
+  std::vector<float> outputGamutCompressionData;
   StaticProfileResources staticResources;
   std::vector<id<MTLBuffer>> scratchBuffers;
   std::vector<id<MTLTexture>> scratchTextures;
@@ -2319,6 +2599,36 @@ struct MetalRenderer::Impl {
     return scratchBuffer(length, name, preferPrivateScratch ? MTLStorageModePrivate : MTLStorageModeShared);
   }
 
+  void retainScratchResourcesUntilCompleted(id<MTLCommandBuffer> commandBuffer) {
+    if (!commandBuffer) {
+      return;
+    }
+    NSMutableArray<id<MTLBuffer>> *buffers = [NSMutableArray array];
+    const size_t usedBufferCount = std::min(scratchCursor, scratchBuffers.size());
+    for (size_t i = 0; i < usedBufferCount; ++i) {
+      id<MTLBuffer> buffer = scratchBuffers[i];
+      if (buffer) {
+        [buffers addObject:buffer];
+        scratchBuffers[i] = nil;
+      }
+    }
+
+    NSMutableArray<id<MTLTexture>> *textures = [NSMutableArray array];
+    const size_t usedTextureCount = std::min(textureScratchCursor, scratchTextures.size());
+    for (size_t i = 0; i < usedTextureCount; ++i) {
+      id<MTLTexture> texture = scratchTextures[i];
+      if (texture) {
+        [textures addObject:texture];
+        scratchTextures[i] = nil;
+      }
+    }
+
+    [commandBuffer addCompletedHandler:^(__unused id<MTLCommandBuffer> completedCommandBuffer) {
+      (void)buffers;
+      (void)textures;
+    }];
+  }
+
   id<MTLTexture> gpuScratchTexture(
     NSUInteger width,
     NSUInteger height,
@@ -2408,6 +2718,17 @@ struct MetalRenderer::Impl {
   }
 
   void beginScratchFrame() {
+    scratchCursor = 0;
+    textureScratchCursor = 0;
+  }
+
+  void releaseTransientResources() {
+    scratchBuffers.clear();
+    scratchBuffers.shrink_to_fit();
+    scratchTextures.clear();
+    scratchTextures.shrink_to_fit();
+    autoExposureLuminance.clear();
+    autoExposureLuminance.shrink_to_fit();
     scratchCursor = 0;
     textureScratchCursor = 0;
   }
@@ -2514,7 +2835,8 @@ struct MetalRenderer::Impl {
       lastError = "Unable to locate generated print exposure data.";
       return false;
     }
-    if (!colorDecodeLuts() || !colorEncodeLuts() || !colorTransferKinds() || !inputMeterXyzMatrices()) {
+    if (!colorDecodeLuts() || !colorEncodeLuts() || !colorTransferKinds() || !colorTransferParams() || !inputMeterXyzMatrices() ||
+        outputGamutCompressionData.size() != kSpektraOutputGamutCompressionElementCount) {
       lastError = "Unable to locate generated color transform data.";
       return false;
     }
@@ -2572,6 +2894,27 @@ struct MetalRenderer::Impl {
     const NSUInteger inputMatrixBytes = static_cast<NSUInteger>(kSpektraColorSpaceCount) * 9u * sizeof(float);
     const NSUInteger transferLutBytes = static_cast<NSUInteger>(kSpektraColorSpaceCount) * static_cast<NSUInteger>(kSpektraColorTransferLutSize) * sizeof(float);
     const NSUInteger transferKindBytes = static_cast<NSUInteger>(kSpektraColorSpaceCount) * sizeof(uint32_t);
+    std::vector<float> colorEncodeAndGamutData;
+    colorEncodeAndGamutData.reserve(
+      static_cast<size_t>(kSpektraColorSpaceCount) * static_cast<size_t>(kSpektraColorTransferLutSize) +
+      outputGamutCompressionData.size() +
+      static_cast<size_t>(kSpektraColorSpaceCount)
+    );
+    colorEncodeAndGamutData.insert(
+      colorEncodeAndGamutData.end(),
+      colorEncodeLuts(),
+      colorEncodeLuts() + static_cast<size_t>(kSpektraColorSpaceCount) * static_cast<size_t>(kSpektraColorTransferLutSize)
+    );
+    colorEncodeAndGamutData.insert(
+      colorEncodeAndGamutData.end(),
+      outputGamutCompressionData.begin(),
+      outputGamutCompressionData.end()
+    );
+    colorEncodeAndGamutData.insert(
+      colorEncodeAndGamutData.end(),
+      colorTransferParams(),
+      colorTransferParams() + static_cast<size_t>(kSpektraColorSpaceCount)
+    );
 
     const std::vector<float> baseFilmSensitivityLinear = makeLinearSensitivity(filmCurves->logSensitivity, filmCurves->wavelengthCount);
     const std::vector<float> filmSensitivityLinear = applyCameraBandPass(*filmCurves, baseFilmSensitivityLinear, params);
@@ -2580,7 +2923,7 @@ struct MetalRenderer::Impl {
       *filmCurves,
       filmSensitivityLinear
     );
-    const std::vector<float> hanatosRawResponse = makeHanatosRawResponse(
+    const std::vector<float> hanatosRawResponse = makeHanatosRawResponsePair(
       *filmCurves,
       filmSensitivityLinear,
       hanatosSpectraData,
@@ -2648,7 +2991,7 @@ struct MetalRenderer::Impl {
     next.paperScanDensityDataBuffer = newStaticBuffer(paperScanDensityData.data(), paperScanDensityData.size() * sizeof(float), "paper scan density data");
     next.scanIlluminantsAndCmfsBuffer = newStaticBuffer(scanIlluminantsAndCmfs.data(), scanIlluminantsAndCmfs.size() * sizeof(float), "scan illuminants and CMFs");
     next.scanToOutputRgbDataBuffer = newStaticBuffer(scanToOutputRgbData.data(), scanToOutputRgbData.size() * sizeof(float), "scan output matrices");
-    next.colorEncodeLutBuffer = newStaticBuffer(colorEncodeLuts(), transferLutBytes, "color encode LUT");
+    next.colorEncodeLutBuffer = newStaticBuffer(colorEncodeAndGamutData.data(), colorEncodeAndGamutData.size() * sizeof(float), "color encode LUT and output gamut compression");
 
     if (!next.validFor(params)) {
       if (lastError.empty()) {
@@ -2864,6 +3207,10 @@ struct MetalRenderer::Impl {
       copyBufferPipeline = makePipeline(@"spektrafilm_copy_buffer");
       halfToFloatBufferPipeline = makePipeline(@"spektrafilm_half_to_float_buffer");
       floatToHalfBufferPipeline = makePipeline(@"spektrafilm_float_to_half_buffer");
+      stridedFloatToFloatBufferPipeline = makePipeline(@"spektrafilm_strided_float_to_float_buffer");
+      stridedHalfToFloatBufferPipeline = makePipeline(@"spektrafilm_strided_half_to_float_buffer");
+      floatToStridedFloatBufferPipeline = makePipeline(@"spektrafilm_float_to_strided_float_buffer");
+      floatToStridedHalfBufferPipeline = makePipeline(@"spektrafilm_float_to_strided_half_buffer");
       dirBaselinePipeline = makePipeline(@"spektrafilm_dir_baseline");
       dirBlurXPipeline = makePipeline(@"spektrafilm_dir_blur_x");
       dirBlurYPipeline = makePipeline(@"spektrafilm_dir_blur_y");
@@ -2944,6 +3291,8 @@ struct MetalRenderer::Impl {
           !developFromLogRawPipeline ||
           !dirCorrectionFromDensityPipeline || !copyBufferPipeline ||
           !halfToFloatBufferPipeline || !floatToHalfBufferPipeline ||
+          !stridedFloatToFloatBufferPipeline || !stridedHalfToFloatBufferPipeline ||
+          !floatToStridedFloatBufferPipeline || !floatToStridedHalfBufferPipeline ||
           !dirBaselinePipeline || !dirBlurXPipeline || !dirBlurYPipeline ||
           !dirTailBlurXPipeline || !dirTailBlurYAccumulatePipeline || !dirTailMpsAccumulatePipeline ||
           !dirRedevelopPipeline ||
@@ -2995,6 +3344,24 @@ struct MetalRenderer::Impl {
       spectralInfo.hanatosWidth = hanatos.width;
       spectralInfo.hanatosHeight = hanatos.height;
       spectralInfo.hanatosWavelengthCount = hanatos.wavelengthCount;
+
+      NSURL *outputGamutURL = findBundleResourceURL(@"SpektraOutputGamutCompression", @"f32");
+      if (!outputGamutURL) {
+        lastError = "Unable to locate SpektraOutputGamutCompression.f32 in bundle resources.";
+        return;
+      }
+      NSData *outputGamutData = [NSData dataWithContentsOfURL:outputGamutURL options:NSDataReadingMappedIfSafe error:&error];
+      const NSUInteger expectedOutputGamutBytes =
+        static_cast<NSUInteger>(kSpektraOutputGamutCompressionElementCount) * sizeof(float);
+      if (!outputGamutData || [outputGamutData length] != expectedOutputGamutBytes) {
+        lastError = error ? [[error localizedDescription] UTF8String] : "Unable to load output gamut compression resource.";
+        return;
+      }
+      const float *outputGamutFloats = static_cast<const float *>([outputGamutData bytes]);
+      outputGamutCompressionData.assign(
+        outputGamutFloats,
+        outputGamutFloats + kSpektraOutputGamutCompressionElementCount
+      );
     }
   }
 };
@@ -3026,6 +3393,8 @@ bool MetalRenderer::isAvailable() const {
     impl_->diffusionResolvePipeline &&
     impl_->developFromLogRawPipeline && impl_->dirCorrectionFromDensityPipeline && impl_->copyBufferPipeline &&
     impl_->halfToFloatBufferPipeline && impl_->floatToHalfBufferPipeline &&
+    impl_->stridedFloatToFloatBufferPipeline && impl_->stridedHalfToFloatBufferPipeline &&
+    impl_->floatToStridedFloatBufferPipeline && impl_->floatToStridedHalfBufferPipeline &&
     impl_->dirBaselinePipeline && impl_->dirBlurXPipeline && impl_->dirBlurYPipeline &&
     impl_->dirTailBlurXPipeline && impl_->dirTailBlurYAccumulatePipeline &&
     impl_->dirTailMpsAccumulatePipeline && impl_->dirRedevelopPipeline &&
@@ -3072,6 +3441,16 @@ const std::string &MetalRenderer::lastError() const {
 const MetalRenderDiagnostics &MetalRenderer::lastDiagnostics() const {
   static const MetalRenderDiagnostics empty;
   return impl_ ? impl_->diagnostics : empty;
+}
+
+void MetalRenderer::releaseTransientResources() {
+  if (!impl_) {
+    return;
+  }
+  std::lock_guard<std::mutex> renderLock(impl_->renderMutex);
+  @autoreleasepool {
+    impl_->releaseTransientResources();
+  }
 }
 
 std::unique_ptr<Renderer> createNativeRenderer() {
@@ -3122,6 +3501,23 @@ bool MetalRenderer::render(
     impl_->diagnostics.passTimingMode = "off";
     const NSUInteger pixelBytes = sizeof(float) * 4;
     const NSUInteger bufferBytes = static_cast<NSUInteger>(width) * static_cast<NSUInteger>(height) * pixelBytes;
+    ExternalMetalBufferContext *externalMetal = gExternalMetalBufferContext && gExternalMetalBufferContext->active
+      ? gExternalMetalBufferContext
+      : nullptr;
+    if (externalMetal) {
+      if (!externalMetal->commandQueue || !externalMetal->sourceBuffer || !externalMetal->destinationBuffer) {
+        impl_->lastError = "OFX Metal render did not provide a command queue and source/destination buffers.";
+        return false;
+      }
+      if ([externalMetal->commandQueue device] != impl_->device) {
+        impl_->lastError = "OFX Metal command queue uses a different Metal device than the SpektraFilm renderer.";
+        return false;
+      }
+      if (params.autoExposure) {
+        impl_->lastError = "OFX Metal GPU buffers are not implemented for auto-exposure renders yet.";
+        return false;
+      }
+    }
     impl_->beginScratchFrame();
     if (!impl_->prepareStaticResources(params)) {
       return false;
@@ -3144,9 +3540,12 @@ bool MetalRenderer::render(
     const bool printDensityOutput = params.renderOutput == RenderOutputMode::PrintDensityCmy;
     const bool printStageOutput = printLogRawOutput || printDensityOutput;
     const bool finalOutput = params.renderOutput == RenderOutputMode::FinalPreview;
-    const bool finalPrintSimulation = finalOutput && params.process == ProcessMode::PrintSimulation;
+    const bool sceneHandoffOutput = finalOutput && params.outputRole == OutputRole::SceneHandoff;
+    const bool finalPrintSimulation =
+      finalOutput && !sceneHandoffOutput && params.process == ProcessMode::PrintSimulation;
     const bool printSimulationPath = finalPrintSimulation || printStageOutput;
-    const bool finalScanNegative = finalOutput && params.process == ProcessMode::ScanNegative;
+    const bool finalScanNegative =
+      finalOutput && (params.process == ProcessMode::ScanNegative || sceneHandoffOutput);
     const bool finalPostProcessPath = finalPrintSimulation || finalScanNegative;
     const bool cameraDiffusionRequested =
       params.cameraDiffusionEnabled &&
@@ -3298,7 +3697,15 @@ bool MetalRenderer::render(
     bool destinationWrappedDirectly = false;
     bool sourceHalfWrappedDirectly = false;
     bool destinationHalfWrappedDirectly = false;
-    if (const void *directSource = contiguousFloatWindowPointer(source, window, width, height)) {
+    if (externalMetal) {
+      if (externalMetal->sourceCompactFloat) {
+        srcBuffer = externalMetal->sourceBuffer;
+        sourceWrappedDirectly = true;
+      } else if (externalMetal->sourceCompactHalf) {
+        sourceHalfBuffer = externalMetal->sourceBuffer;
+        sourceHalfWrappedDirectly = true;
+      }
+    } else if (const void *directSource = contiguousFloatWindowPointer(source, window, width, height)) {
       srcBuffer = [impl_->device newBufferWithBytesNoCopy:const_cast<void *>(directSource)
                                                    length:bufferBytes
                                                   options:MTLResourceStorageModeShared
@@ -3316,11 +3723,19 @@ bool MetalRenderer::render(
       }
     }
     if (!srcBuffer) {
-      srcBuffer = sourceHalfWrappedDirectly
+      srcBuffer = (externalMetal || sourceHalfWrappedDirectly)
         ? impl_->gpuScratchBuffer(bufferBytes, "source float staging")
         : impl_->sharedScratchBuffer(bufferBytes, "source staging");
     }
-    if (void *directDestination = contiguousFloatWindowPointer(destination, window, width, height)) {
+    if (externalMetal) {
+      if (externalMetal->destinationCompactFloat) {
+        dstBuffer = externalMetal->destinationBuffer;
+        destinationWrappedDirectly = true;
+      } else if (externalMetal->destinationCompactHalf) {
+        destinationHalfBuffer = externalMetal->destinationBuffer;
+        destinationHalfWrappedDirectly = true;
+      }
+    } else if (void *directDestination = contiguousFloatWindowPointer(destination, window, width, height)) {
       dstBuffer = [impl_->device newBufferWithBytesNoCopy:directDestination
                                                    length:bufferBytes
                                                   options:MTLResourceStorageModeShared
@@ -3340,16 +3755,20 @@ bool MetalRenderer::render(
     impl_->diagnostics.sourceNoCopy = sourceWrappedDirectly || sourceHalfWrappedDirectly;
     impl_->diagnostics.destinationNoCopy = destinationWrappedDirectly || destinationHalfWrappedDirectly;
     if (!dstBuffer) {
-      dstBuffer = destinationHalfWrappedDirectly
+      dstBuffer = (externalMetal || destinationHalfWrappedDirectly)
         ? impl_->gpuScratchBuffer(bufferBytes, "destination float staging")
         : impl_->sharedScratchBuffer(bufferBytes, "destination staging");
     }
     id<MTLBuffer> paramBuffer = impl_->sharedScratchBuffer(sizeof(KernelParams), "kernel params");
     id<MTLBuffer> enlargedSourceBuffer = sourceTransformPath ? impl_->gpuScratchBuffer(bufferBytes, "enlarger source") : nil;
 
-    const bool printGlarePath = finalPrintSimulation && params.scannerEnabled && params.glarePercent > 0.0f;
-    const bool scannerNeedsBlur = finalPostProcessPath && params.scannerEnabled && params.scannerMtf50LpMm > 0.0f;
-    const bool scannerNeedsUnsharp = finalPostProcessPath && params.scannerEnabled && params.scannerUnsharpRadiusUm > 0.0f && params.scannerUnsharpAmount > 0.0f;
+    const bool printGlarePath =
+      finalPrintSimulation && !sceneHandoffOutput && params.scannerEnabled && params.glarePercent > 0.0f;
+    const bool scannerNeedsBlur =
+      finalPostProcessPath && !sceneHandoffOutput && params.scannerEnabled && params.scannerMtf50LpMm > 0.0f;
+    const bool scannerNeedsUnsharp =
+      finalPostProcessPath && !sceneHandoffOutput && params.scannerEnabled &&
+      params.scannerUnsharpRadiusUm > 0.0f && params.scannerUnsharpAmount > 0.0f;
     const bool scannerMpsPath = (impl_->scannerMps || impl_->blurBackend == "mps" ||
       (impl_->blurBackend == "auto" && impl_->useScannerTextures)) && (scannerNeedsBlur || scannerNeedsUnsharp);
     const bool scannerTexturePath = (impl_->useScannerTextures || scannerMpsPath) && (scannerNeedsBlur || scannerNeedsUnsharp);
@@ -3554,7 +3973,7 @@ bool MetalRenderer::render(
       return false;
     }
 
-    if (!sourceWrappedDirectly && !sourceHalfWrappedDirectly) {
+    if (!externalMetal && !sourceWrappedDirectly && !sourceHalfWrappedDirectly) {
       const auto sourceCopyStart = PerfClock::now();
       copySourceToFloatStaging(source, window, width, height, static_cast<float *>([srcBuffer contents]));
       impl_->diagnostics.sourceCopyMs += elapsedMilliseconds(sourceCopyStart, PerfClock::now());
@@ -3640,7 +4059,8 @@ bool MetalRenderer::render(
       return true;
     };
     auto beginCommandEncoder = [&]() -> bool {
-      commandBuffer = [impl_->commandQueue commandBuffer];
+      id<MTLCommandQueue> queue = externalMetal ? externalMetal->commandQueue : impl_->commandQueue;
+      commandBuffer = [queue commandBuffer];
       if (!commandBuffer) {
         impl_->lastError = "Unable to create Metal command buffer.";
         return false;
@@ -3653,7 +4073,7 @@ bool MetalRenderer::render(
 
     constexpr NSUInteger kMaxCounterSamples = 2048u;
     id<MTLCounterSampleBuffer> passCounterBuffer = nil;
-    const std::string requestedPassTiming = impl_->passTimingMode;
+    const std::string requestedPassTiming = externalMetal ? std::string("off") : impl_->passTimingMode;
     const bool counterTimingRequested =
       requestedPassTiming == "auto" || requestedPassTiming == "counter";
     bool useSplitPassTiming = requestedPassTiming == "split";
@@ -3876,6 +4296,26 @@ bool MetalRenderer::render(
         encodeFailed = true;
       }
     };
+
+    if (externalMetal && externalMetal->sourceStridedFloat) {
+      [encoder setComputePipelineState:impl_->stridedFloatToFloatBufferPipeline];
+      [encoder setBuffer:externalMetal->sourceBuffer offset:0 atIndex:0];
+      [encoder setBuffer:srcBuffer offset:0 atIndex:1];
+      [encoder setBytes:&externalMetal->sourceLayout length:sizeof(externalMetal->sourceLayout) atIndex:2];
+      dispatch2D(
+        impl_->stridedFloatToFloatBufferPipeline,
+        static_cast<uint64_t>(width) * static_cast<uint64_t>(height) * (sizeof(float) * 8u)
+      );
+    } else if (externalMetal && externalMetal->sourceStridedHalf) {
+      [encoder setComputePipelineState:impl_->stridedHalfToFloatBufferPipeline];
+      [encoder setBuffer:externalMetal->sourceBuffer offset:0 atIndex:0];
+      [encoder setBuffer:srcBuffer offset:0 atIndex:1];
+      [encoder setBytes:&externalMetal->sourceLayout length:sizeof(externalMetal->sourceLayout) atIndex:2];
+      dispatch2D(
+        impl_->stridedHalfToFloatBufferPipeline,
+        static_cast<uint64_t>(width) * static_cast<uint64_t>(height) * (sizeof(uint16_t) * 4u + sizeof(float) * 4u)
+      );
+    }
 
     if (sourceHalfWrappedDirectly) {
       [encoder setComputePipelineState:impl_->halfToFloatBufferPipeline];
@@ -4116,7 +4556,7 @@ bool MetalRenderer::render(
     };
 
     auto encodeFinalFromFilmDensity = [&](id<MTLBuffer> filmDensityBuffer) {
-      const uint32_t encodeOutput = directFinalEncodePath ? 1u : 0u;
+      const uint32_t encodeOutput = (directFinalEncodePath || !finalPostProcessPath) ? 1u : 0u;
       [encoder setComputePipelineState:impl_->finalFromFilmDensityPipeline];
       [encoder setBuffer:filmDensityBuffer offset:0 atIndex:0];
       [encoder setBuffer:(directFinalEncodePath || !finalPostProcessPath ? dstBuffer : scannerRgbBufferA) offset:0 atIndex:1];
@@ -5270,6 +5710,25 @@ bool MetalRenderer::render(
       [encoder setBuffer:colorEncodeLutBuffer offset:0 atIndex:30];
       dispatch2D(impl_->grainPipeline);
     }
+    if (externalMetal && externalMetal->destinationStridedFloat) {
+      [encoder setComputePipelineState:impl_->floatToStridedFloatBufferPipeline];
+      [encoder setBuffer:dstBuffer offset:0 atIndex:0];
+      [encoder setBuffer:externalMetal->destinationBuffer offset:0 atIndex:1];
+      [encoder setBytes:&externalMetal->destinationLayout length:sizeof(externalMetal->destinationLayout) atIndex:2];
+      dispatch2D(
+        impl_->floatToStridedFloatBufferPipeline,
+        static_cast<uint64_t>(width) * static_cast<uint64_t>(height) * (sizeof(float) * 8u)
+      );
+    } else if (externalMetal && externalMetal->destinationStridedHalf) {
+      [encoder setComputePipelineState:impl_->floatToStridedHalfBufferPipeline];
+      [encoder setBuffer:dstBuffer offset:0 atIndex:0];
+      [encoder setBuffer:externalMetal->destinationBuffer offset:0 atIndex:1];
+      [encoder setBytes:&externalMetal->destinationLayout length:sizeof(externalMetal->destinationLayout) atIndex:2];
+      dispatch2D(
+        impl_->floatToStridedHalfBufferPipeline,
+        static_cast<uint64_t>(width) * static_cast<uint64_t>(height) * (sizeof(float) * 4u + sizeof(uint16_t) * 4u)
+      );
+    }
     if (destinationHalfWrappedDirectly) {
       [encoder setComputePipelineState:impl_->floatToHalfBufferPipeline];
       [encoder setBuffer:dstBuffer offset:0 atIndex:0];
@@ -5294,14 +5753,21 @@ bool MetalRenderer::render(
       const auto commandStart = PerfClock::now();
       impl_->diagnostics.cpuSetupMs = std::max(0.0, elapsedMilliseconds(renderStart, commandStart) - impl_->diagnostics.sourceCopyMs);
       [encoder endEncoding];
+      if (externalMetal) {
+        impl_->retainScratchResourcesUntilCompleted(commandBuffer);
+      }
       [commandBuffer commit];
-      [commandBuffer waitUntilCompleted];
-      impl_->diagnostics.commandBufferMs = elapsedMilliseconds(commandStart, PerfClock::now());
+      if (externalMetal) {
+        impl_->diagnostics.commandBufferMs = 0.0;
+      } else {
+        [commandBuffer waitUntilCompleted];
+        impl_->diagnostics.commandBufferMs = elapsedMilliseconds(commandStart, PerfClock::now());
 
-      if ([commandBuffer status] == MTLCommandBufferStatusError) {
-        NSError *error = [commandBuffer error];
-        impl_->lastError = error ? [[error localizedDescription] UTF8String] : "Metal command buffer failed.";
-        return false;
+        if ([commandBuffer status] == MTLCommandBufferStatusError) {
+          NSError *error = [commandBuffer error];
+          impl_->lastError = error ? [[error localizedDescription] UTF8String] : "Metal command buffer failed.";
+          return false;
+        }
       }
     }
 
@@ -5325,13 +5791,98 @@ bool MetalRenderer::render(
       }
     }
 
-    if (!destinationWrappedDirectly && !destinationHalfWrappedDirectly) {
+    if (!externalMetal && !destinationWrappedDirectly && !destinationHalfWrappedDirectly) {
       const auto outputCopyStart = PerfClock::now();
       copyFloatStagingToDestination(static_cast<const float *>([dstBuffer contents]), destination, window, width, height);
       impl_->diagnostics.outputCopyMs += elapsedMilliseconds(outputCopyStart, PerfClock::now());
     }
   }
   return true;
+}
+
+bool MetalRenderer::renderMetalBuffers(
+  const MetalBufferImageView &source,
+  const MetalBufferImageView &destination,
+  const RenderWindow &window,
+  const RenderParams &params,
+  double time,
+  void *commandQueue
+) {
+  if (!isAvailable()) {
+    return false;
+  }
+  const int32_t width = window.x2 - window.x1;
+  const int32_t height = window.y2 - window.y1;
+  if (width <= 0 || height <= 0) {
+    return true;
+  }
+  if (!commandQueue) {
+    impl_->lastError = "OFX Metal render did not provide a host command queue.";
+    return false;
+  }
+
+  ExternalMetalBufferContext context{};
+  context.active = true;
+  context.source = source;
+  context.destination = destination;
+  context.sourceBuffer = (__bridge id<MTLBuffer>)source.buffer;
+  context.destinationBuffer = (__bridge id<MTLBuffer>)destination.buffer;
+  context.commandQueue = (__bridge id<MTLCommandQueue>)commandQueue;
+
+  std::string layoutError;
+  if (!configureExternalMetalBufferLayout(
+        source,
+        window,
+        width,
+        height,
+        context.sourceLayout,
+        context.sourceCompactFloat,
+        context.sourceCompactHalf,
+        context.sourceStridedFloat,
+        context.sourceStridedHalf,
+        layoutError)) {
+    impl_->lastError = layoutError;
+    return false;
+  }
+  if (!configureExternalMetalBufferLayout(
+        destination,
+        window,
+        width,
+        height,
+        context.destinationLayout,
+        context.destinationCompactFloat,
+        context.destinationCompactHalf,
+        context.destinationStridedFloat,
+        context.destinationStridedHalf,
+        layoutError)) {
+    impl_->lastError = layoutError;
+    return false;
+  }
+
+  ImageView sourceView{};
+  sourceView.data = source.buffer;
+  sourceView.x1 = source.x1;
+  sourceView.y1 = source.y1;
+  sourceView.width = source.width;
+  sourceView.height = source.height;
+  sourceView.rowBytes = source.rowBytes;
+  sourceView.components = source.components;
+  sourceView.bytesPerComponent = source.bytesPerComponent;
+
+  MutableImageView destinationView{};
+  destinationView.data = destination.buffer;
+  destinationView.x1 = destination.x1;
+  destinationView.y1 = destination.y1;
+  destinationView.width = destination.width;
+  destinationView.height = destination.height;
+  destinationView.rowBytes = destination.rowBytes;
+  destinationView.components = destination.components;
+  destinationView.bytesPerComponent = destination.bytesPerComponent;
+
+  gExternalMetalBufferContext = &context;
+  const bool ok = render(sourceView, destinationView, window, params, time);
+  gExternalMetalBufferContext = nullptr;
+  return ok;
 }
 
 } // namespace spektrafilm

@@ -36,6 +36,7 @@ inline constexpr TooltipEntry kTooltipEntries[] = {
   {"hdrPeakNits", "HDR peak luminance used for tone mapping and PQ/HLG scaling, in nits."},
   {"hdrExposureEv", "Post-scan brightness trim for Display Out HDR. +1 doubles mapped luminance."},
   {"hdrToneMapping", "Highlight handling above reference white. Soft Rolloff gives a gentler shoulder; Hard Clip preserves calibrated headroom to peak."},
+  {"colorAdaptation", "Experimental visible-locus input compression for Hanatos and analytical perceptual output gamut compression for SDR/HDR display output. Off preserves the legacy SDR color pipeline."},
   {"cameraUvFilterEnabled", "Apply a camera-side UV cut before film exposure."},
   {"cameraUvCutNm", "Center wavelength of the UV cut transition. Lower values preserve more violet light, in nm."},
   {"cameraIrFilterEnabled", "Apply a camera-side IR cut before film exposure."},

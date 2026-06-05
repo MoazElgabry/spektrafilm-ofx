@@ -1,6 +1,9 @@
 #include "SpektraParameters.h"
 #include "SpektraProfileCurves.h"
 #include "SpektraRenderer.h"
+#if defined __APPLE__
+#  include "SpektraMetalRenderer.h"
+#endif
 #include "SpektraTooltips.h"
 
 #include "ofxImageEffect.h"
@@ -9,6 +12,7 @@
 #include "ofxMessage.h"
 #include "ofxMultiThread.h"
 #include "ofxParam.h"
+#include "ofxGPURender.h"
 
 #if defined __APPLE__
 #  include <ApplicationServices/ApplicationServices.h>
@@ -22,6 +26,9 @@
 #  endif
 #  include <windows.h>
 #  include <shellapi.h>
+#elif defined __linux__
+#  include <dlfcn.h>
+#  include <unistd.h>
 #endif
 
 #include <algorithm>
@@ -37,6 +44,7 @@
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <random>
 #include <sstream>
@@ -59,7 +67,7 @@
 #endif
 
 #ifndef SPEKTRAFILM_VERSION_STRING
-#  define SPEKTRAFILM_VERSION_STRING "0.2.0"
+#  define SPEKTRAFILM_VERSION_STRING "0.2.1"
 #endif
 
 #ifndef SPEKTRAFILM_PLUGIN_IDENTIFIER
@@ -72,6 +80,10 @@
 
 #ifndef SPEKTRAFILM_PLUGIN_FLAVOR
 #  define SPEKTRAFILM_PLUGIN_FLAVOR 2
+#endif
+
+#ifndef SPEKTRAFILM_OFX_METAL_GPU_BUFFERS
+#  define SPEKTRAFILM_OFX_METAL_GPU_BUFFERS 0
 #endif
 
 namespace {
@@ -156,6 +168,7 @@ inline constexpr ParamMetadata kParamMetadata[] = {
   {"hdrPeakNits", "colorGroup", flow()},
   {"hdrExposureEv", "colorGroup", flow()},
   {"hdrToneMapping", "colorGroup", flow()},
+  {"colorAdaptation", "colorGroup", flow()},
 
   {"cameraUvFilterEnabled", "filteringGroup", kParamTagNone},
   {"cameraUvCutNm", "filteringGroup", kParamTagNone},
@@ -185,9 +198,9 @@ inline constexpr ParamMetadata kParamMetadata[] = {
   {"filterC", "printGroup", flow()},
   {"filterMShift", "printGroup", flow()},
   {"filterYShift", "printGroup", flow()},
-  {"preflashExposure", "printGroup", kParamTagNone},
-  {"preflashMFilterShift", "printGroup", kParamTagNone},
-  {"preflashYFilterShift", "printGroup", kParamTagNone},
+  {"preflashExposure", "printGroup", flow()},
+  {"preflashMFilterShift", "printGroup", flow()},
+  {"preflashYFilterShift", "printGroup", flow()},
   {"printerLightsGang", "printGroup", flow()},
   {"printerLightsGroup", "printGroup", flow()},
   {"printerLightR", "printGroup", flow()},
@@ -413,6 +426,10 @@ constexpr ParamDefault double3DDefault(const char *name, double x, double y, dou
   return {name, ParamValueKind::Double3D, 0, {x, y, z}};
 }
 
+constexpr const char *kGrainSeedParamName = "grainSeed";
+constexpr int kGrainSeedMin = 0;
+constexpr int kGrainSeedMax = 1000000;
+
 inline constexpr ParamDefault kParamDefaults[] = {
   intDefault("process", 0),
   intDefault("inputColorSpace", 0),
@@ -425,6 +442,7 @@ inline constexpr ParamDefault kParamDefaults[] = {
   doubleDefault("hdrPeakNits", 1000.0),
   doubleDefault("hdrExposureEv", 0.0),
   intDefault("hdrToneMapping", 1),
+  boolDefault("colorAdaptation", false),
 
   boolDefault("cameraUvFilterEnabled", false),
   doubleDefault("cameraUvCutNm", 410.0),
@@ -494,7 +512,7 @@ inline constexpr ParamDefault kParamDefaults[] = {
   doubleDefault("grainFinalBlurUm", 7.17),
   doubleDefault("grainBlurDyeCloudsUm", 1.0),
   double2DDefault("grainMicroStructure", 0.2, 30.0),
-  intDefault("grainSeed", 1),
+  intDefault("grainSeed", 0),
   boolDefault("grainAnimate", true),
   doubleDefault("grainSynthesisSize", 1.0),
   doubleDefault("grainSynthesisAmount", 1.0),
@@ -569,6 +587,34 @@ using DefaultsSnapshot = std::unordered_map<std::string, StoredParamValue>;
 
 const DefaultsSnapshot *gDescribeDefaults = nullptr;
 
+std::mt19937 makeGrainSeedRng() {
+  uint32_t seedData[] = {
+    static_cast<uint32_t>(std::time(nullptr)),
+    static_cast<uint32_t>(std::clock()),
+    0x9e3779b9u,
+    0x85ebca6bu,
+    0xc2b2ae35u,
+    0x27d4eb2fu,
+  };
+  try {
+    std::random_device device;
+    for (uint32_t &word : seedData) {
+      word ^= device();
+    }
+  } catch (...) {
+  }
+  std::seed_seq seed(std::begin(seedData), std::end(seedData));
+  return std::mt19937(seed);
+}
+
+int randomGrainSeed() {
+  static std::mutex mutex;
+  static std::mt19937 rng = makeGrainSeedRng();
+  std::lock_guard<std::mutex> lock(mutex);
+  std::uniform_int_distribution<int> distribution(kGrainSeedMin, kGrainSeedMax);
+  return distribution(rng);
+}
+
 int paramComponentCount(ParamValueKind kind) {
   switch (kind) {
     case ParamValueKind::Double2D:
@@ -605,6 +651,8 @@ StoredParamValue factoryStoredValue(const ParamDefault &entry) {
     for (int i = 0; i < paramComponentCount(entry.kind); ++i) {
       value.doubleValue[i] = entry.doubleDefault[i];
     }
+  } else if (std::strcmp(entry.name, kGrainSeedParamName) == 0) {
+    value.intValue[0] = randomGrainSeed();
   } else {
     value.intValue[0] = entry.intDefault;
   }
@@ -643,6 +691,7 @@ struct InstanceData {
   OfxParamHandle hdrPeakNits = nullptr;
   OfxParamHandle hdrExposureEv = nullptr;
   OfxParamHandle hdrToneMapping = nullptr;
+  OfxParamHandle colorAdaptation = nullptr;
   OfxParamHandle cameraUvFilterEnabled = nullptr;
   OfxParamHandle cameraUvCutNm = nullptr;
   OfxParamHandle cameraIrFilterEnabled = nullptr;
@@ -774,7 +823,9 @@ struct InstanceData {
   bool lastPrinterLightsInitialized = false;
   bool syncingPrinterLights = false;
   bool syncingDirCalibration = false;
+  bool metalGpuBufferProbeLogged = false;
 
+  std::mutex rendererMutex;
   std::unique_ptr<spektrafilm::Renderer> renderer;
 };
 
@@ -785,6 +836,18 @@ InstanceData *getInstanceData(OfxImageEffectHandle effect) {
   gPropHost->propGetPointer(props, kOfxPropInstanceData, 0, reinterpret_cast<void **>(&data));
   return data;
 }
+
+spektrafilm::Renderer *ensureRenderer(InstanceData *data) {
+  if (!data) {
+    return nullptr;
+  }
+  if (!data->renderer) {
+    data->renderer = spektrafilm::createNativeRenderer();
+  }
+  return data->renderer.get();
+}
+
+void releaseInstanceRendererResources(InstanceData *data, bool resetRenderer);
 
 int mapPixelDepth(const char *depth) {
   if (!depth) {
@@ -875,6 +938,149 @@ void releaseImage(OfxPropertySetHandle image) {
     gEffectHost->clipReleaseImage(image);
   }
 }
+
+#if SPEKTRAFILM_OFX_METAL_GPU_BUFFERS
+struct MetalGpuImageProbe {
+  OfxRectI bounds{};
+  char *depth = nullptr;
+  char *components = nullptr;
+  void *buffer = nullptr;
+  int rowBytes = 0;
+};
+
+spektrafilm::MetalBufferImageView makeMetalBufferImageView(const MetalGpuImageProbe &probe) {
+  spektrafilm::MetalBufferImageView view{};
+  view.buffer = probe.buffer;
+  view.x1 = probe.bounds.x1;
+  view.y1 = probe.bounds.y1;
+  view.width = probe.bounds.x2 - probe.bounds.x1;
+  view.height = probe.bounds.y2 - probe.bounds.y1;
+  view.rowBytes = probe.rowBytes;
+  view.components = componentsForString(probe.components);
+  view.bytesPerComponent = mapPixelDepth(probe.depth) / 8;
+  return view;
+}
+
+bool metalGpuBuffersEnabled(OfxPropertySetHandle inArgs) {
+  int enabled = 0;
+  return inArgs &&
+         gPropHost->propGetInt(inArgs, kOfxImageEffectPropMetalEnabled, 0, &enabled) == kOfxStatOK &&
+         enabled != 0;
+}
+
+void *metalCommandQueueFromArgs(OfxPropertySetHandle inArgs) {
+  void *queue = nullptr;
+  if (inArgs) {
+    gPropHost->propGetPointer(inArgs, kOfxImageEffectPropMetalCommandQueue, 0, &queue);
+  }
+  return queue;
+}
+
+OfxStatus fetchMetalGpuImageProbe(
+  OfxImageClipHandle clip,
+  OfxTime time,
+  OfxPropertySetHandle *image,
+  MetalGpuImageProbe &probe
+) {
+  if (gEffectHost->clipGetImage(clip, time, nullptr, image) != kOfxStatOK || !*image) {
+    return kOfxStatFailed;
+  }
+
+  gPropHost->propGetIntN(*image, kOfxImagePropBounds, 4, &probe.bounds.x1);
+  gPropHost->propGetString(*image, kOfxImageEffectPropPixelDepth, 0, &probe.depth);
+  gPropHost->propGetString(*image, kOfxImageEffectPropComponents, 0, &probe.components);
+  gPropHost->propGetInt(*image, kOfxImagePropRowBytes, 0, &probe.rowBytes);
+  gPropHost->propGetPointer(*image, kOfxImagePropData, 0, &probe.buffer);
+  return probe.buffer ? kOfxStatOK : kOfxStatErrFormat;
+}
+
+OfxStatus probeMetalGpuBufferRender(
+  OfxImageEffectHandle effect,
+  InstanceData *data,
+  OfxTime time,
+  OfxPropertySetHandle inArgs,
+  const spektrafilm::RenderWindow &window,
+  const spektrafilm::RenderParams &params
+) {
+  OfxPropertySetHandle sourceImage = nullptr;
+  OfxPropertySetHandle outputImage = nullptr;
+  MetalGpuImageProbe source{};
+  MetalGpuImageProbe output{};
+  OfxStatus status = kOfxStatOK;
+
+  try {
+    status = fetchMetalGpuImageProbe(data->sourceClip, time, &sourceImage, source);
+    if (status != kOfxStatOK) {
+      throw status;
+    }
+    status = fetchMetalGpuImageProbe(data->outputClip, time, &outputImage, output);
+    if (status != kOfxStatOK) {
+      throw status;
+    }
+
+    if (!data->metalGpuBufferProbeLogged && gMessageHost) {
+      data->metalGpuBufferProbeLogged = true;
+      gMessageHost->message(
+        effect,
+        kOfxMessageLog,
+        "spektrafilmMetalGpuBufferProbe",
+        "OFX Metal GPU buffers enabled by host. queue=%p sourceBuffer=%p sourceBounds=[%d,%d,%d,%d] sourceRowBytes=%d sourceDepth=%s sourceComponents=%s outputBuffer=%p outputBounds=[%d,%d,%d,%d] outputRowBytes=%d outputDepth=%s outputComponents=%s",
+        metalCommandQueueFromArgs(inArgs),
+        source.buffer,
+        source.bounds.x1,
+        source.bounds.y1,
+        source.bounds.x2,
+        source.bounds.y2,
+        source.rowBytes,
+        source.depth ? source.depth : "",
+        source.components ? source.components : "",
+        output.buffer,
+        output.bounds.x1,
+        output.bounds.y1,
+        output.bounds.x2,
+        output.bounds.y2,
+        output.rowBytes,
+        output.depth ? output.depth : "",
+        output.components ? output.components : ""
+      );
+    }
+
+    auto *metalRenderer = dynamic_cast<spektrafilm::MetalRenderer *>(data->renderer.get());
+    if (!metalRenderer) {
+      status = static_cast<OfxStatus>(kOfxStatGPURenderFailed);
+    } else if (!metalRenderer->renderMetalBuffers(
+                 makeMetalBufferImageView(source),
+                 makeMetalBufferImageView(output),
+                 window,
+                 params,
+                 time,
+                 metalCommandQueueFromArgs(inArgs))) {
+      if (gMessageHost) {
+        gMessageHost->message(
+          effect,
+          kOfxMessageLog,
+          "spektrafilmMetalGpuBufferFallback",
+          "OFX Metal GPU buffer render fell back to CPU: %s",
+          metalRenderer->lastError().c_str()
+        );
+      }
+      status = static_cast<OfxStatus>(kOfxStatGPURenderFailed);
+    }
+  } catch (OfxStatus caught) {
+    status = caught;
+  } catch (...) {
+    status = kOfxStatErrUnknown;
+  }
+
+  releaseImage(sourceImage);
+  releaseImage(outputImage);
+  if (status != kOfxStatOK) {
+    return status;
+  }
+
+  return kOfxStatOK;
+}
+#endif
 
 double getDoubleAtTime(OfxParamHandle handle, OfxTime time, double fallback = 0.0) {
   if (!handle) {
@@ -1122,6 +1328,8 @@ spektrafilm::RenderParams readParams(InstanceData *data, OfxTime time) {
     spektrafilm::ColorSpace::PanasonicVLogVGamut,
     spektrafilm::ColorSpace::Aces2065_1,
     spektrafilm::ColorSpace::AcesCg,
+    spektrafilm::ColorSpace::AcesCct,
+    spektrafilm::ColorSpace::AcesCc,
     spektrafilm::ColorSpace::LinearRec2020,
     spektrafilm::ColorSpace::LinearRec709,
     spektrafilm::ColorSpace::LinearP3D65,
@@ -1155,6 +1363,7 @@ spektrafilm::RenderParams readParams(InstanceData *data, OfxTime time) {
   params.hdrPeakNits = static_cast<float>(getDoubleAtTime(data->hdrPeakNits, time, 1000.0));
   params.hdrExposureEv = static_cast<float>(getDoubleAtTime(data->hdrExposureEv, time, 0.0));
   params.hdrToneMapping = static_cast<spektrafilm::HdrToneMapping>(getIntAtTime(data->hdrToneMapping, time, 1));
+  params.colorAdaptation = getBoolAtTime(data->colorAdaptation, time, false);
   params.cameraUvFilterEnabled = getBoolAtTime(data->cameraUvFilterEnabled, time, false);
   params.cameraUvCutNm = static_cast<float>(getDoubleAtTime(data->cameraUvCutNm, time, 410.0));
   params.cameraIrFilterEnabled = getBoolAtTime(data->cameraIrFilterEnabled, time, false);
@@ -1452,10 +1661,18 @@ std::filesystem::path userDefaultsPath() {
   }
   const char *home = std::getenv("USERPROFILE");
   return std::filesystem::path(home && home[0] ? home : ".") / "AppData" / "Roaming" / "spektrafilm" / "ofx-defaults-v1.spkdefaults";
-#else
+#elif defined __APPLE__
   const char *home = std::getenv("HOME");
   return std::filesystem::path(home && home[0] ? home : ".") /
     "Library" / "Application Support" / "spektrafilm" / "ofx-defaults-v1.spkdefaults";
+#else
+  const char *home = std::getenv("HOME");
+  const char *xdgConfigHome = std::getenv("XDG_CONFIG_HOME");
+  const std::filesystem::path configRoot =
+    xdgConfigHome && xdgConfigHome[0]
+      ? std::filesystem::path(xdgConfigHome)
+      : std::filesystem::path(home && home[0] ? home : ".") / ".config";
+  return configRoot / "spektrafilm" / "ofx-defaults-v1.spkdefaults";
 #endif
 }
 
@@ -2312,6 +2529,10 @@ const char *colorSpaceName(spektrafilm::ColorSpace colorSpace) {
       return "ACES2065-1";
     case spektrafilm::ColorSpace::AcesCg:
       return "ACEScg";
+    case spektrafilm::ColorSpace::AcesCct:
+      return "ACEScct";
+    case spektrafilm::ColorSpace::AcesCc:
+      return "ACEScc";
     case spektrafilm::ColorSpace::LinearRec2020:
       return "Linear Rec.2020";
     case spektrafilm::ColorSpace::LinearRec709:
@@ -2390,6 +2611,49 @@ std::filesystem::path envPath(const char *name, const std::filesystem::path &fal
   return std::filesystem::path(value && value[0] ? value : fallback.string());
 }
 
+bool envFlagEnabledOrDefault(const char *name, bool defaultValue) {
+  const char *value = std::getenv(name);
+  if (!value || value[0] == '\0') {
+    return defaultValue;
+  }
+  if (std::strcmp(value, "0") == 0 ||
+      std::strcmp(value, "false") == 0 ||
+      std::strcmp(value, "FALSE") == 0 ||
+      std::strcmp(value, "no") == 0 ||
+      std::strcmp(value, "NO") == 0 ||
+      std::strcmp(value, "off") == 0 ||
+      std::strcmp(value, "OFF") == 0) {
+    return false;
+  }
+  return true;
+}
+
+bool resetRendererAfterEndSequence() {
+  return envFlagEnabledOrDefault("SPEKTRAFILM_OFX_RESET_RENDERER_AFTER_END_SEQUENCE", false);
+}
+
+bool releaseTransientAfterEndSequence() {
+#if defined(__APPLE__)
+  constexpr bool defaultValue = true;
+#else
+  constexpr bool defaultValue = false;
+#endif
+  return envFlagEnabledOrDefault("SPEKTRAFILM_OFX_RELEASE_TRANSIENT_AFTER_END_SEQUENCE", defaultValue);
+}
+
+bool resetRendererOnPurgeCaches() {
+  return envFlagEnabledOrDefault("SPEKTRAFILM_OFX_RESET_RENDERER_ON_PURGE", true);
+}
+
+bool resetRendererAfterLutExport() {
+#if defined(__APPLE__)
+  constexpr bool defaultValue = false;
+#else
+  constexpr bool defaultValue = true;
+#endif
+  return envFlagEnabledOrDefault("SPEKTRAFILM_OFX_RESET_RENDERER_AFTER_LUT_EXPORT", defaultValue);
+}
+
 std::filesystem::path homeFolder() {
 #if defined _WIN32
   return envPath("USERPROFILE", ".");
@@ -2401,8 +2665,10 @@ std::filesystem::path homeFolder() {
 std::filesystem::path userLutFolder() {
 #if defined _WIN32
   return homeFolder() / "Documents" / "spektrafilm";
-#else
+#elif defined __APPLE__
   return homeFolder() / "Movies" / "spektrafilm";
+#else
+  return homeFolder() / "spektrafilm";
 #endif
 }
 
@@ -2413,9 +2679,11 @@ std::filesystem::path lutDestinationFolder(int destination) {
 #if defined _WIN32
       return envPath("PROGRAMDATA", "C:\\ProgramData") /
         "Blackmagic Design" / "DaVinci Resolve" / "Support" / "LUT" / "spektrafilm";
-#else
+#elif defined __APPLE__
       return std::filesystem::path("/") / "Library" / "Application Support" /
         "Blackmagic Design" / "DaVinci Resolve" / "LUT" / "spektrafilm";
+#else
+      return userLutFolder();
 #endif
     case 2:
       return homePath / ".nuke" / "spektrafilm";
@@ -2423,16 +2691,20 @@ std::filesystem::path lutDestinationFolder(int destination) {
 #if defined _WIN32
       return envPath("PROGRAMFILES", "C:\\Program Files") /
         "Adobe" / "Common" / "LUTs" / "Creative" / "spektrafilm";
-#else
+#elif defined __APPLE__
       return std::filesystem::path("/") / "Library" / "Application Support" /
         "Adobe" / "Common" / "LUTs" / "Creative" / "spektrafilm";
+#else
+      return userLutFolder();
 #endif
     case 4:
 #if defined _WIN32
       return userLutFolder();
-#else
+#elif defined __APPLE__
       return homePath / "Library" / "Application Support" /
         "ProApps" / "Custom LUTs" / "spektrafilm";
+#else
+      return userLutFolder();
 #endif
     case 0:
     default:
@@ -2453,6 +2725,49 @@ std::filesystem::path generatedLutExportPath(int destination, const std::string 
   }
   return folder / (date + "_" + cleanIdentifier + "_" + randomExportCode() + ".cube");
 }
+
+#if defined __linux__
+std::string shellQuote(const std::string &value) {
+  std::string quoted = "'";
+  for (char ch : value) {
+    if (ch == '\'') {
+      quoted += "'\\''";
+    } else {
+      quoted += ch;
+    }
+  }
+  quoted += "'";
+  return quoted;
+}
+
+std::filesystem::path executableOnPath(const char *name) {
+  const char *pathEnv = std::getenv("PATH");
+  if (!pathEnv || !pathEnv[0]) {
+    return {};
+  }
+
+  std::string pathList(pathEnv);
+  size_t start = 0;
+  while (start <= pathList.size()) {
+    const size_t end = pathList.find(':', start);
+    const std::string directory = pathList.substr(
+      start,
+      end == std::string::npos ? std::string::npos : end - start
+    );
+    const std::filesystem::path candidate =
+      std::filesystem::path(directory.empty() ? "." : directory) / name;
+    const std::string candidateString = candidate.string();
+    if (access(candidateString.c_str(), X_OK) == 0) {
+      return candidate;
+    }
+    if (end == std::string::npos) {
+      break;
+    }
+    start = end + 1u;
+  }
+  return {};
+}
+#endif
 
 std::filesystem::path bundledUserManualPath() {
 #if defined __APPLE__
@@ -2493,6 +2808,17 @@ std::filesystem::path bundledUserManualPath() {
     buffer.resize(buffer.size() * 2u);
   }
   return {};
+#elif defined __linux__
+  Dl_info imageInfo{};
+  if (dladdr(&gPluginImageAnchor, &imageInfo) == 0 || !imageInfo.dli_fname) {
+    return {};
+  }
+  const std::filesystem::path imagePath(imageInfo.dli_fname);
+  const std::filesystem::path contentsPath = imagePath.parent_path().parent_path();
+  if (contentsPath.empty()) {
+    return {};
+  }
+  return contentsPath / "Resources" / "manual.pdf";
 #else
   return {};
 #endif
@@ -2537,6 +2863,20 @@ bool openBundledUserManual(std::string &error) {
   if (reinterpret_cast<intptr_t>(result) <= 32) {
     error = "Could not open the spektrafilm user manual. ShellExecute returned " +
       std::to_string(reinterpret_cast<intptr_t>(result)) + ".";
+    return false;
+  }
+  return true;
+#elif defined __linux__
+  const std::filesystem::path xdgOpen = executableOnPath("xdg-open");
+  if (xdgOpen.empty()) {
+    error = "Could not open the spektrafilm user manual because xdg-open was not found on PATH.";
+    return false;
+  }
+
+  const std::string command =
+    shellQuote(xdgOpen.string()) + " " + shellQuote(manualPath.string()) + " >/dev/null 2>&1 &";
+  if (std::system(command.c_str()) != 0) {
+    error = "Could not open the spektrafilm user manual with xdg-open.";
     return false;
   }
   return true;
@@ -2714,7 +3054,7 @@ bool writeCubeLut(
 bool exportCurrentLut(InstanceData *data, OfxTime time, std::filesystem::path &path, std::vector<std::string> &disabledEffects, std::string &error) {
   error.clear();
   disabledEffects.clear();
-  if (!data || !data->renderer) {
+  if (!data) {
     error = "LUT export is not available because the renderer is not initialized.";
     return false;
   }
@@ -2766,12 +3106,27 @@ bool exportCurrentLut(InstanceData *data, OfxTime time, std::filesystem::path &p
   destinationView.bytesPerComponent = 4;
 
   spektrafilm::RenderWindow window{0, 0, width, height};
-  if (!data->renderer->render(sourceView, destinationView, window, renderParams, time)) {
-    error = data->renderer->lastError().empty() ? "Could not render LUT samples." : data->renderer->lastError();
+  bool renderOk = false;
+  {
+    std::lock_guard<std::mutex> rendererLock(data->rendererMutex);
+    spektrafilm::Renderer *renderer = ensureRenderer(data);
+    if (!renderer) {
+      error = "LUT export is not available because the renderer is not initialized.";
+      return false;
+    }
+    renderOk = renderer->render(sourceView, destinationView, window, renderParams, time);
+    if (!renderOk) {
+      error = renderer->lastError().empty() ? "Could not render LUT samples." : renderer->lastError();
+    }
+  }
+  if (!renderOk) {
+    releaseInstanceRendererResources(data, resetRendererAfterLutExport());
     return false;
   }
 
-  return writeCubeLut(path, lutSize, params, destination, disabledEffects, error);
+  const bool wroteLut = writeCubeLut(path, lutSize, params, destination, disabledEffects, error);
+  releaseInstanceRendererResources(data, resetRendererAfterLutExport());
+  return wroteLut;
 }
 
 OfxStatus createInstance(OfxImageEffectHandle effect) {
@@ -2796,6 +3151,7 @@ OfxStatus createInstance(OfxImageEffectHandle effect) {
   cacheParam(paramSet, "hdrPeakNits", data->hdrPeakNits);
   cacheParam(paramSet, "hdrExposureEv", data->hdrExposureEv);
   cacheParam(paramSet, "hdrToneMapping", data->hdrToneMapping);
+  cacheParam(paramSet, "colorAdaptation", data->colorAdaptation);
   cacheParam(paramSet, "cameraUvFilterEnabled", data->cameraUvFilterEnabled);
   cacheParam(paramSet, "cameraUvCutNm", data->cameraUvCutNm);
   cacheParam(paramSet, "cameraIrFilterEnabled", data->cameraIrFilterEnabled);
@@ -2933,7 +3289,6 @@ OfxStatus createInstance(OfxImageEffectHandle effect) {
     applyDirStockCalibration(data, false);
   }
 
-  data->renderer = spektrafilm::createNativeRenderer();
   rememberCurrentPrinterLights(data);
   syncConditionalParamVisibility(data);
   gPropHost->propSetPointer(effectProps, kOfxPropInstanceData, 0, data);
@@ -2943,6 +3298,28 @@ OfxStatus createInstance(OfxImageEffectHandle effect) {
 OfxStatus destroyInstance(OfxImageEffectHandle effect) {
   InstanceData *data = getInstanceData(effect);
   delete data;
+  return kOfxStatOK;
+}
+
+void releaseInstanceRendererResources(InstanceData *data, bool resetRenderer) {
+  if (!data) {
+    return;
+  }
+  std::lock_guard<std::mutex> rendererLock(data->rendererMutex);
+  if (data->renderer) {
+    if (resetRenderer) {
+      data->renderer.reset();
+    } else {
+      data->renderer->releaseTransientResources();
+    }
+  }
+}
+
+OfxStatus releaseInactiveInstanceResources(OfxImageEffectHandle effect, bool resetRenderer) {
+  if (!effect) {
+    return kOfxStatOK;
+  }
+  releaseInstanceRendererResources(getInstanceData(effect), resetRenderer);
   return kOfxStatOK;
 }
 
@@ -3596,7 +3973,7 @@ OfxStatus getRegionOfInterest(OfxImageEffectHandle effect, OfxPropertySetHandle 
 
 OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs, OfxPropertySetHandle) {
   InstanceData *data = getInstanceData(effect);
-  if (!data || !data->renderer) {
+  if (!data) {
     return kOfxStatFailed;
   }
 
@@ -3604,6 +3981,18 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs, OfxPr
   OfxRectI renderWindow{};
   gPropHost->propGetDouble(inArgs, kOfxPropTime, 0, &time);
   gPropHost->propGetIntN(inArgs, kOfxImageEffectPropRenderWindow, 4, &renderWindow.x1);
+  spektrafilm::RenderWindow window{renderWindow.x1, renderWindow.y1, renderWindow.x2, renderWindow.y2};
+  spektrafilm::RenderParams params = readParams(data, time);
+
+#if SPEKTRAFILM_OFX_METAL_GPU_BUFFERS
+  if (metalGpuBuffersEnabled(inArgs)) {
+    std::lock_guard<std::mutex> rendererLock(data->rendererMutex);
+    if (!ensureRenderer(data)) {
+      return kOfxStatFailed;
+    }
+    return probeMetalGpuBufferRender(effect, data, time, inArgs, window, params);
+  }
+#endif
 
   OfxPropertySetHandle sourceImage = nullptr;
   OfxPropertySetHandle outputImage = nullptr;
@@ -3621,11 +4010,14 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs, OfxPr
       throw status;
     }
 
-    spektrafilm::RenderWindow window{renderWindow.x1, renderWindow.y1, renderWindow.x2, renderWindow.y2};
-    spektrafilm::RenderParams params = readParams(data, time);
-    if (!data->renderer->render(source, output, window, params, time)) {
+    std::lock_guard<std::mutex> rendererLock(data->rendererMutex);
+    spektrafilm::Renderer *renderer = ensureRenderer(data);
+    if (!renderer) {
+      throw kOfxStatFailed;
+    }
+    if (!renderer->render(source, output, window, params, time)) {
       if (gMessageHost) {
-        gMessageHost->message(effect, kOfxMessageError, "spektrafilmRenderer", "%s", data->renderer->lastError().c_str());
+        gMessageHost->message(effect, kOfxMessageError, "spektrafilmRenderer", "%s", renderer->lastError().c_str());
       }
       status = kOfxStatFailed;
     }
@@ -3691,6 +4083,8 @@ OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHandle) {
     "Panasonic V-Log V-Gamut",
     "ACES2065-1",
     "ACEScg",
+    "ACEScct",
+    "ACEScc",
     "Linear Rec.2020",
     "Linear Rec.709",
     "Linear P3-D65",
@@ -3717,6 +4111,8 @@ OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHandle) {
     "Panasonic V-Log V-Gamut",
     "ACES2065-1",
     "ACEScg",
+    "ACEScct",
+    "ACEScc",
     "Linear Rec.2020",
     "Linear Rec.709",
     "Linear P3-D65"
@@ -3746,6 +4142,7 @@ OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHandle) {
   defineDouble(paramSet, "hdrExposureEv", "HDR Exposure EV", 0.0, -8.0, 8.0, "colorGroup");
   const char *hdrToneMappings[] = {"Soft Rolloff", "Hard Clip"};
   defineChoice(paramSet, "hdrToneMapping", "HDR Tone Mapping", hdrToneMappings, 2, 1, "colorGroup");
+  defineBool(paramSet, "colorAdaptation", "Color Adaptation", false, "colorGroup");
   defineBool(paramSet, "cameraUvFilterEnabled", "Filter UV", false, "filteringGroup");
   defineDouble(paramSet, "cameraUvCutNm", "UV Cut nm", 410.0, 380.0, 450.0, "filteringGroup");
   defineBool(paramSet, "cameraIrFilterEnabled", "Filter IR", false, "filteringGroup");
@@ -3836,7 +4233,7 @@ OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHandle) {
   defineDouble(paramSet, "grainFinalBlurUm", "Final Grain Blur", 7.17, 0.0, 25.0, "grainGroup");
   defineDouble(paramSet, "grainBlurDyeCloudsUm", "Dye Cloud Blur um", 1.0, 0.0, 10.0, "grainGroup");
   defineDouble2D(paramSet, "grainMicroStructure", "Micro Structure", 0.2, 30.0, "grainGroup");
-  defineInt(paramSet, "grainSeed", "Seed", 1, 0, 1000000, "grainGroup");
+  defineInt(paramSet, kGrainSeedParamName, "Seed", randomGrainSeed(), kGrainSeedMin, kGrainSeedMax, "grainGroup");
   defineBool(paramSet, "grainAnimate", "Animate", true, "grainGroup");
   defineDouble(paramSet, "grainSynthesisSize", "Synthesis Size", 1.0, 0.25, 4.0, "grainGroup");
   defineDouble(paramSet, "grainSynthesisAmount", "Synthesis Amount", 1.0, 0.0, 3.0, "grainGroup");
@@ -3923,17 +4320,17 @@ OfxStatus describe(OfxImageEffectHandle effect) {
   gPropHost->propSetString(props, kOfxPropIcon, 1, pngIconFileForFlavor());
   gPropHost->propSetString(props, kOfxImageEffectPluginPropGrouping, 0, "spektrafilm OFX");
   gPropHost->propSetString(props, kOfxImageEffectPropSupportedContexts, 0, kOfxImageEffectContextFilter);
-#if defined(_WIN32)
-  gPropHost->propSetString(props, kOfxImageEffectPropSupportedPixelDepths, 0, kOfxBitDepthHalf);
-#else
   gPropHost->propSetString(props, kOfxImageEffectPropSupportedPixelDepths, 0, kOfxBitDepthHalf);
   gPropHost->propSetString(props, kOfxImageEffectPropSupportedPixelDepths, 1, kOfxBitDepthFloat);
-#endif
   gPropHost->propSetString(props, kOfxImageEffectPropColourManagementStyle, 0, kOfxImageEffectColourManagementCore);
   gPropHost->propSetString(props, kOfxImageEffectPropColourManagementAvailableConfigs, 0, kOfxConfigIdentifier);
   gPropHost->propSetInt(props, kOfxImageEffectPropSupportsMultipleClipDepths, 0, 0);
   gPropHost->propSetInt(props, kOfxImageEffectPropSupportsTiles, 0, 0);
   gPropHost->propSetInt(props, kOfxImageEffectPropTemporalClipAccess, 0, 0);
+#if defined(__APPLE__) && SPEKTRAFILM_OFX_METAL_GPU_BUFFERS
+  gPropHost->propSetString(props, kOfxImageEffectPropMetalRenderSupported, 0, "true");
+  gPropHost->propSetString(props, kOfxImageEffectPropCPURenderSupported, 0, "true");
+#endif
   return kOfxStatOK;
 }
 
@@ -3967,6 +4364,18 @@ OfxStatus pluginMain(const char *action, const void *handle, OfxPropertySetHandl
   }
   if (std::strcmp(action, kOfxActionDestroyInstance) == 0) {
     return destroyInstance(effect);
+  }
+  if (std::strcmp(action, kOfxImageEffectActionEndSequenceRender) == 0) {
+    if (resetRendererAfterEndSequence()) {
+      return releaseInactiveInstanceResources(effect, true);
+    }
+    if (releaseTransientAfterEndSequence()) {
+      return releaseInactiveInstanceResources(effect, false);
+    }
+    return kOfxStatOK;
+  }
+  if (std::strcmp(action, kOfxActionPurgeCaches) == 0) {
+    return releaseInactiveInstanceResources(effect, resetRendererOnPurgeCaches());
   }
   if (std::strcmp(action, kOfxActionInstanceChanged) == 0) {
     return instanceChanged(effect, inArgs);

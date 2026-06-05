@@ -8,8 +8,11 @@
 
 namespace spektrafilm {
 
-constexpr uint32_t kSpektraColorSpaceCount = 24u;
+constexpr uint32_t kSpektraColorSpaceCount = 26u;
 constexpr uint32_t kSpektraColorTransferLutSize = 4096u;
+constexpr uint32_t kSpektraOutputGamutCompressionStride = 18u;
+constexpr uint32_t kSpektraOutputGamutCompressionElementCount =
+  kSpektraColorSpaceCount * kSpektraOutputGamutCompressionStride;
 
 #ifndef SPEKTRA_GENERATED_PROFILE_COUNTS
 constexpr uint32_t kSpektraFilmCount = 20u;
@@ -64,6 +67,7 @@ const ProfileCurveSet *paperProfileCurves(int32_t index);
 const HanatosSpectraLutInfo &hanatosSpectraLutInfo();
 const float *inputMeterXyzMatrices();
 const uint32_t *colorTransferKinds();
+const float *colorTransferParams();
 const char *colorSpaceLabel(int32_t index);
 const float *colorDecodeLuts();
 const float *colorEncodeLuts();

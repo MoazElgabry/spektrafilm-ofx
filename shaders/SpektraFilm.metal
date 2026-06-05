@@ -1,6 +1,9 @@
 #include <metal_stdlib>
 using namespace metal;
 
+constant int kSpektraOutputRoleDisplayHdr = 1;
+constant int kSpektraOutputRoleSceneHandoff = 2;
+
 struct SpektraKernelParams {
   int process;
   int rgbToRawMethod;
@@ -13,7 +16,7 @@ struct SpektraKernelParams {
   float hdrPeakNits;
   float hdrExposureEv;
   int hdrToneMapping;
-  uint _padColor0;
+  uint colorAdaptationEnabled;
   int film;
   int paper;
   int printTiming;
@@ -393,9 +396,13 @@ static uint spektra_color_space_index(int colorSpace, constant SpektraColorInfo 
   return uint(colorSpace);
 }
 
+static bool spektra_scene_handoff_enabled(constant SpektraKernelParams &params) {
+  return params.outputRole == kSpektraOutputRoleSceneHandoff;
+}
+
 static uint spektra_final_output_color_space(constant SpektraKernelParams &params, constant SpektraColorInfo &colorInfo) {
-  constexpr int kLinearRec2020ColorSpace = 12;
-  if (params.outputRole == 1) {
+  constexpr int kLinearRec2020ColorSpace = 14;
+  if (params.outputRole == kSpektraOutputRoleDisplayHdr) {
     return spektra_color_space_index(kLinearRec2020ColorSpace, colorInfo);
   }
   return spektra_color_space_index(params.outputColorSpace, colorInfo);
@@ -465,16 +472,76 @@ static float spektra_sample_lut_range(
   return mix(luts[offset + lo], luts[offset + hi], f);
 }
 
+constant uint kSpektraTransferLinear = 0u;
+constant uint kSpektraTransferSrgb = 2u;
+constant uint kSpektraTransferGamma = 3u;
+constant uint kSpektraTransferProPhoto = 4u;
+
+static float spektra_signed_srgb_encode(float value) {
+  const float x = abs(value);
+  const float y = x <= 0.0031308
+    ? 12.92 * x
+    : 1.055 * pow(x, 1.0 / 2.4) - 0.055;
+  return value < 0.0 ? -y : y;
+}
+
+static float spektra_signed_gamma_encode(float value, float gamma) {
+  const float y = pow(abs(value), 1.0 / max(gamma, 1.0e-6));
+  return value < 0.0 ? -y : y;
+}
+
+static float spektra_signed_prophoto_encode(float value) {
+  const float x = abs(value);
+  const float y = x < (1.0 / 512.0) ? 16.0 * x : pow(x, 1.0 / 1.8);
+  return value < 0.0 ? -y : y;
+}
+
+static float3 spektra_signed_srgb_encode(float3 rgb) {
+  return float3(
+    spektra_signed_srgb_encode(rgb.r),
+    spektra_signed_srgb_encode(rgb.g),
+    spektra_signed_srgb_encode(rgb.b)
+  );
+}
+
+static float3 spektra_signed_gamma_encode(float3 rgb, float gamma) {
+  return float3(
+    spektra_signed_gamma_encode(rgb.r, gamma),
+    spektra_signed_gamma_encode(rgb.g, gamma),
+    spektra_signed_gamma_encode(rgb.b, gamma)
+  );
+}
+
+static float3 spektra_signed_prophoto_encode(float3 rgb) {
+  return float3(
+    spektra_signed_prophoto_encode(rgb.r),
+    spektra_signed_prophoto_encode(rgb.g),
+    spektra_signed_prophoto_encode(rgb.b)
+  );
+}
+
 static float3 spektra_encode_output_rgb(
   float3 rgb,
+  uint colorSpace,
   constant SpektraKernelParams &params,
   constant SpektraColorInfo &colorInfo,
   device const float *encodeLuts,
-  device const uint *transferKinds
+  device const uint *transferKinds,
+  device const float *transferParams
 ) {
-  const uint colorSpace = spektra_color_space_index(params.outputColorSpace, colorInfo);
-  if (transferKinds[colorSpace] == 0u) {
+  (void)params;
+  const uint transferKind = transferKinds[colorSpace];
+  if (transferKind == kSpektraTransferLinear) {
     return rgb;
+  }
+  if (transferKind == kSpektraTransferSrgb) {
+    return spektra_signed_srgb_encode(rgb);
+  }
+  if (transferKind == kSpektraTransferGamma) {
+    return spektra_signed_gamma_encode(rgb, transferParams[colorSpace]);
+  }
+  if (transferKind == kSpektraTransferProPhoto) {
+    return spektra_signed_prophoto_encode(rgb);
   }
   return float3(
     spektra_sample_lut_range(rgb.r, colorSpace, colorInfo.encodeMin, colorInfo.encodeMax, colorInfo, encodeLuts),
@@ -483,15 +550,30 @@ static float3 spektra_encode_output_rgb(
   );
 }
 
+static float3 spektra_encode_output_rgb(
+  float3 rgb,
+  constant SpektraKernelParams &params,
+  constant SpektraColorInfo &colorInfo,
+  device const float *encodeLuts,
+  device const uint *transferKinds,
+  device const float *transferParams
+) {
+  const uint colorSpace = spektra_color_space_index(params.outputColorSpace, colorInfo);
+  return spektra_encode_output_rgb(rgb, colorSpace, params, colorInfo, encodeLuts, transferKinds, transferParams);
+}
+
 static float spektra_rec2020_luminance(float3 rgb) {
   return dot(rgb, float3(0.2627, 0.6780, 0.0593));
 }
 
-static float3 spektra_hdr_map_to_nits(float3 rgb, constant SpektraKernelParams &params) {
+static float3 spektra_hdr_apply_luminance_tone_map(float3 rgb, constant SpektraKernelParams &params) {
   const float referenceWhite = max(params.hdrReferenceWhiteNits, 1.0);
   const float peak = max(params.hdrPeakNits, referenceWhite + 1.0);
-  float3 nits = max(rgb, float3(0.0)) * (referenceWhite * exp2(params.hdrExposureEv));
-  const float sourceY = max(spektra_rec2020_luminance(nits), 1.0e-6);
+  float3 nits = rgb * (referenceWhite * exp2(params.hdrExposureEv));
+  const float sourceY = spektra_rec2020_luminance(nits);
+  if (!(sourceY > 1.0e-6) || !isfinite(sourceY)) {
+    return float3(0.0);
+  }
   float mappedY = sourceY;
   if (params.hdrToneMapping == 1) {
     mappedY = min(sourceY, peak);
@@ -524,13 +606,223 @@ static float spektra_hlg_system_gamma(float peakNits) {
   return max(1.0 + 0.42 * log10(max(peakNits, 1.0) / 1000.0), 1.0e-6);
 }
 
-static float3 spektra_hlg_display_nits_to_signal(float3 nits, float peakNits) {
+static float spektra_hlg_channel_to_signal(float nits, float peakNits, bool clampToPeak) {
+  const float normalized = max(nits, 0.0) / peakNits;
+  return clampToPeak ? clamp(normalized, 0.0, 1.0) : normalized;
+}
+
+static float3 spektra_hlg_display_nits_to_signal(float3 nits, float peakNits, bool clampToPeak) {
   const float gamma = spektra_hlg_system_gamma(peakNits);
   return float3(
-    spektra_encode_hlg(pow(max(nits.r, 0.0) / peakNits, 1.0 / gamma)),
-    spektra_encode_hlg(pow(max(nits.g, 0.0) / peakNits, 1.0 / gamma)),
-    spektra_encode_hlg(pow(max(nits.b, 0.0) / peakNits, 1.0 / gamma))
+    spektra_encode_hlg(pow(spektra_hlg_channel_to_signal(nits.r, peakNits, clampToPeak), 1.0 / gamma)),
+    spektra_encode_hlg(pow(spektra_hlg_channel_to_signal(nits.g, peakNits, clampToPeak), 1.0 / gamma)),
+    spektra_encode_hlg(pow(spektra_hlg_channel_to_signal(nits.b, peakNits, clampToPeak), 1.0 / gamma))
   );
+}
+
+constant uint kSpektraOutputGamutCompressionStride = 18u;
+
+static float spektra_reinhard_knee(float value, float threshold, float limit, float power) {
+  if (!isfinite(value) || value <= threshold) {
+    return value;
+  }
+  const float scale = max(limit - threshold, 1.0e-12);
+  const float x = (value - threshold) / scale;
+  const float y = x / pow(1.0 + pow(x, power), 1.0 / power);
+  return threshold + scale * y;
+}
+
+static float spektra_signed_cuberoot(float value) {
+  return value < 0.0 ? -pow(-value, 1.0 / 3.0) : pow(value, 1.0 / 3.0);
+}
+
+static float3 spektra_mul_packed_matrix(device const float *data, uint offset, float3 value) {
+  return float3(
+    data[offset] * value.r + data[offset + 1u] * value.g + data[offset + 2u] * value.b,
+    data[offset + 3u] * value.r + data[offset + 4u] * value.g + data[offset + 5u] * value.b,
+    data[offset + 6u] * value.r + data[offset + 7u] * value.g + data[offset + 8u] * value.b
+  );
+}
+
+static float3 spektra_oklab_from_output_rgb(float3 rgb, device const float *outputGamutCompressionData, uint dataOffset) {
+  const float3 lms = spektra_mul_packed_matrix(outputGamutCompressionData, dataOffset, rgb);
+  const float3 lmsPrime = float3(
+    spektra_signed_cuberoot(lms.r),
+    spektra_signed_cuberoot(lms.g),
+    spektra_signed_cuberoot(lms.b)
+  );
+  const float3 row0 = float3(0.2104542553, 0.7936177850, -0.0040720468);
+  const float3 row1 = float3(1.9779984951, -2.4285922050, 0.4505937099);
+  const float3 row2 = float3(0.0259040371, 0.7827717662, -0.8086757660);
+  return float3(dot(row0, lmsPrime), dot(row1, lmsPrime), dot(row2, lmsPrime));
+}
+
+static float3 spektra_output_rgb_from_oklab(float3 lab, device const float *outputGamutCompressionData, uint dataOffset) {
+  const float3 invRow0 = float3(1.0, 0.3963377774, 0.2158037573);
+  const float3 invRow1 = float3(1.0, -0.1055613458, -0.0638541728);
+  const float3 invRow2 = float3(1.0, -0.0894841775, -1.2914855480);
+  const float3 lmsPrime = float3(dot(invRow0, lab), dot(invRow1, lab), dot(invRow2, lab));
+  const float3 lms = lmsPrime * lmsPrime * lmsPrime;
+  return spektra_mul_packed_matrix(outputGamutCompressionData, dataOffset + 9u, lms);
+}
+
+static bool spektra_rgb_in_bounds(float3 rgb, float lowerBound, float upperBound) {
+  constexpr float epsilon = 1.0e-6;
+  return all(isfinite(rgb)) &&
+    all(rgb >= float3(lowerBound - epsilon)) &&
+    all(rgb <= float3(upperBound + epsilon));
+}
+
+static float spektra_solve_oklch_cmax(
+  float3 lab,
+  float chroma,
+  float2 hueUnit,
+  device const float *outputGamutCompressionData,
+  uint dataOffset,
+  float lowerBound,
+  float upperBound
+) {
+  float lo = 0.0;
+  float hi = max(chroma, 1.0e-6);
+  const float maxHi = 4.0 * max(upperBound, 1.0);
+  for (uint expansion = 0u; expansion < 12u; ++expansion) {
+    const float3 candidate = spektra_output_rgb_from_oklab(
+      float3(lab.x, hueUnit.x * hi, hueUnit.y * hi),
+      outputGamutCompressionData,
+      dataOffset
+    );
+    if (!spektra_rgb_in_bounds(candidate, lowerBound, upperBound)) {
+      break;
+    }
+    lo = hi;
+    hi = min(hi * 2.0, maxHi);
+    if (hi >= maxHi) {
+      break;
+    }
+  }
+  for (uint iteration = 0u; iteration < 16u; ++iteration) {
+    const float mid = 0.5 * (lo + hi);
+    const float3 candidate = spektra_output_rgb_from_oklab(
+      float3(lab.x, hueUnit.x * mid, hueUnit.y * mid),
+      outputGamutCompressionData,
+      dataOffset
+    );
+    if (spektra_rgb_in_bounds(candidate, lowerBound, upperBound)) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo;
+}
+
+static float3 spektra_output_gamut_compress_oklch(
+  float3 rgb,
+  uint colorSpace,
+  device const float *outputGamutCompressionData,
+  float lowerBound,
+  float upperBound,
+  bool softenInGamut
+) {
+  if (outputGamutCompressionData == nullptr) {
+    return rgb;
+  }
+  if (!all(isfinite(rgb))) {
+    return float3(lowerBound);
+  }
+  const bool inBounds = spektra_rgb_in_bounds(rgb, lowerBound, upperBound);
+  if (inBounds && !softenInGamut) {
+    return rgb;
+  }
+  const uint dataOffset = colorSpace * kSpektraOutputGamutCompressionStride;
+  float3 lab = spektra_oklab_from_output_rgb(rgb, outputGamutCompressionData, dataOffset);
+  lab.x = softenInGamut
+    ? spektra_reinhard_knee(max(lab.x, 0.0), 0.7, 1.0, 2.2)
+    : clamp(lab.x, 0.0, pow(max(upperBound, 0.0), 1.0 / 3.0));
+  const float chroma = length(lab.yz);
+  if (!(chroma > 1.0e-10) || !isfinite(chroma)) {
+    if (inBounds) {
+      return rgb;
+    }
+    const float3 neutral = spektra_output_rgb_from_oklab(float3(lab.x, 0.0, 0.0), outputGamutCompressionData, dataOffset);
+    return clamp(neutral, float3(lowerBound), float3(upperBound));
+  }
+  const float2 hueUnit = lab.yz / chroma;
+  const float cmax = max(
+    spektra_solve_oklch_cmax(lab, chroma, hueUnit, outputGamutCompressionData, dataOffset, lowerBound, upperBound),
+    1.0e-9
+  );
+  const float normalizedChroma = chroma / cmax;
+  const float compressedNormalized = softenInGamut
+    ? spektra_reinhard_knee(normalizedChroma, 0.0, 1.0, 6.0)
+    : (normalizedChroma <= 1.0 ? normalizedChroma : spektra_reinhard_knee(normalizedChroma, 0.85, 1.0, 4.0));
+  const float compressedChroma = min(compressedNormalized * cmax, cmax);
+  const float3 compressed = spektra_output_rgb_from_oklab(
+    float3(lab.x, hueUnit.x * compressedChroma, hueUnit.y * compressedChroma),
+    outputGamutCompressionData,
+    dataOffset
+  );
+  return spektra_rgb_in_bounds(compressed, lowerBound, upperBound)
+    ? compressed
+    : clamp(compressed, float3(lowerBound), float3(upperBound));
+}
+
+static float3 spektra_finalize_display_hdr_rgb(
+  float3 rgb,
+  constant SpektraKernelParams &params,
+  constant SpektraColorInfo &colorInfo,
+  device const float *encodeLuts
+) {
+  const float peak = max(params.hdrPeakNits, max(params.hdrReferenceWhiteNits, 1.0) + 1.0);
+  device const float *outputGamutCompressionData =
+    encodeLuts + colorInfo.colorSpaceCount * colorInfo.transferLutSize;
+  const uint colorSpace = spektra_final_output_color_space(params, colorInfo);
+  const bool compressOutputGamut = params.colorAdaptationEnabled != 0u;
+  float3 nits = spektra_hdr_apply_luminance_tone_map(compressOutputGamut ? rgb : max(rgb, float3(0.0)), params);
+  if (compressOutputGamut) {
+    nits = spektra_output_gamut_compress_oklch(nits / peak, colorSpace, outputGamutCompressionData, 0.0, 1.0, false) * peak;
+    nits = clamp(nits, float3(0.0), float3(peak));
+  } else {
+    nits = max(nits, float3(0.0));
+  }
+  return params.hdrTransfer == 1
+    ? spektra_hlg_display_nits_to_signal(nits, peak, compressOutputGamut)
+    : float3(
+        spektra_encode_pq(nits.r),
+        spektra_encode_pq(nits.g),
+        spektra_encode_pq(nits.b)
+      );
+}
+
+static float3 spektra_finalize_display_sdr_rgb(
+  float3 rgb,
+  constant SpektraKernelParams &params,
+  constant SpektraColorInfo &colorInfo,
+  device const float *encodeLuts,
+  device const uint *transferKinds
+) {
+  device const float *outputGamutCompressionData =
+    encodeLuts + colorInfo.colorSpaceCount * colorInfo.transferLutSize;
+  device const float *transferParams =
+    encodeLuts + colorInfo.colorSpaceCount * (colorInfo.transferLutSize + kSpektraOutputGamutCompressionStride);
+  if (params.colorAdaptationEnabled != 0u) {
+    const uint colorSpace = spektra_final_output_color_space(params, colorInfo);
+    rgb = spektra_output_gamut_compress_oklch(rgb, colorSpace, outputGamutCompressionData, 0.0, 1.0, true);
+  }
+  return spektra_encode_output_rgb(rgb, params, colorInfo, encodeLuts, transferKinds, transferParams);
+}
+
+static float3 spektra_finalize_scene_handoff_rgb(
+  float3 sceneCreativeLinear,
+  constant SpektraKernelParams &params,
+  constant SpektraColorInfo &colorInfo,
+  device const float *encodeLuts,
+  device const uint *transferKinds
+) {
+  device const float *transferParams =
+    encodeLuts + colorInfo.colorSpaceCount * (colorInfo.transferLutSize + kSpektraOutputGamutCompressionStride);
+  const uint colorSpace = spektra_color_space_index(params.outputColorSpace, colorInfo);
+  return spektra_encode_output_rgb(sceneCreativeLinear, colorSpace, params, colorInfo, encodeLuts, transferKinds, transferParams);
 }
 
 static float3 spektra_finalize_output_rgb(
@@ -540,20 +832,17 @@ static float3 spektra_finalize_output_rgb(
   device const float *encodeLuts,
   device const uint *transferKinds
 ) {
-  if (params.outputRole == 1) {
-    const float peak = max(params.hdrPeakNits, max(params.hdrReferenceWhiteNits, 1.0) + 1.0);
-    const float3 nits = spektra_hdr_map_to_nits(rgb, params);
-    rgb = params.hdrTransfer == 1
-      ? spektra_hlg_display_nits_to_signal(nits, peak)
-      : float3(
-          spektra_encode_pq(nits.r),
-          spektra_encode_pq(nits.g),
-          spektra_encode_pq(nits.b)
-        );
-  } else {
-    rgb = spektra_encode_output_rgb(rgb, params, colorInfo, encodeLuts, transferKinds);
+  if (params.outputRole == kSpektraOutputRoleDisplayHdr) {
+    return spektra_finalize_display_hdr_rgb(rgb, params, colorInfo, encodeLuts);
   }
-  return rgb;
+  if (params.outputRole == kSpektraOutputRoleSceneHandoff) {
+    // Scene Handoff is a scene-referred contract. It may include the
+    // SpektraFilm creative look, but must not include SDR/HDR display
+    // rendering, OOTF/RRT/ODT-style rendering, nits mapping, tone mapping,
+    // display gamut compression, or display gamma.
+    return spektra_finalize_scene_handoff_rgb(rgb, params, colorInfo, encodeLuts, transferKinds);
+  }
+  return spektra_finalize_display_sdr_rgb(rgb, params, colorInfo, encodeLuts, transferKinds);
 }
 
 static float spektra_decode_srgb_scalar(float value) {
@@ -949,7 +1238,8 @@ static float spektra_interp_density_curve(
   constant SpektraCurveInfo &curveInfo,
   device const float *logExposure,
   device const float *densityCurves,
-  uint lookupMode
+  uint lookupMode,
+  uint smoothInterpolation
 ) {
   const uint count = curveInfo.exposureCount;
   if (count == 0u) {
@@ -966,7 +1256,7 @@ static float spektra_interp_density_curve(
     return densityCurves[(count - 1u) * 3u + channel];
   }
 
-  if (lookupMode != 0u && count > 1u) {
+  if (smoothInterpolation == 0u && lookupMode != 0u && count > 1u) {
     const float indexF = clamp(
       (logRaw - firstX) * float(count - 1u) / max(lastX - firstX, 1.0e-9),
       0.0,
@@ -1000,6 +1290,38 @@ static float spektra_interp_density_curve(
   const float y0 = densityCurves[lo * 3u + channel];
   const float y1 = densityCurves[hi * 3u + channel];
   const float t = clamp((logRaw - x0) / max(x1 - x0, 1.0e-9), 0.0, 1.0);
+  if (smoothInterpolation != 0u && count > 2u) {
+    const float dx0 = max(x1 - x0, 1.0e-9);
+    const float d0 = (y1 - y0) / dx0;
+    float m0 = d0;
+    float m1 = d0;
+    if (lo > 0u) {
+      const float xPrev = logExposure[lo - 1u] / gamma;
+      const float yPrev = densityCurves[(lo - 1u) * 3u + channel];
+      const float dPrev = (y0 - yPrev) / max(x0 - xPrev, 1.0e-9);
+      m0 = dPrev * d0 > 0.0 ? 0.5 * (dPrev + d0) : 0.0;
+    }
+    if (hi + 1u < count) {
+      const float xNext = logExposure[hi + 1u] / gamma;
+      const float yNext = densityCurves[(hi + 1u) * 3u + channel];
+      const float dNext = (yNext - y1) / max(xNext - x1, 1.0e-9);
+      m1 = dNext * d0 > 0.0 ? 0.5 * (dNext + d0) : 0.0;
+    }
+    if (abs(d0) <= 1.0e-9) {
+      m0 = 0.0;
+      m1 = 0.0;
+    } else {
+      const float limit = 3.0 * abs(d0);
+      m0 = d0 * m0 > 0.0 ? clamp(m0, -limit, limit) : 0.0;
+      m1 = d0 * m1 > 0.0 ? clamp(m1, -limit, limit) : 0.0;
+    }
+    const float t2 = t * t;
+    const float t3 = t2 * t;
+    return (2.0 * t3 - 3.0 * t2 + 1.0) * y0 +
+      (t3 - 2.0 * t2 + t) * dx0 * m0 +
+      (-2.0 * t3 + 3.0 * t2) * y1 +
+      (t3 - t2) * dx0 * m1;
+  }
   return mix(y0, y1, t);
 }
 
@@ -1081,7 +1403,10 @@ static float3 spektra_film_raw_from_decoded(
     raw = spektra_mallett_raw(srgb, mallettBasisIlluminant);
   } else {
     const float3 xyz = spektra_mul_color_matrix(decoded, params.inputColorSpace, colorInfo, inputToReferenceXyz);
-    raw = spektra_hanatos_raw(xyz, info, hanatosSpectraLut);
+    const uint compressedOffset = params.colorAdaptationEnabled != 0u
+      ? info.hanatosWidth * info.hanatosHeight * 3u
+      : 0u;
+    raw = spektra_hanatos_raw(xyz, info, hanatosSpectraLut + compressedOffset);
   }
   return max(raw * exp2(params.filmExposureEv + params.autoExposureEv), float3(0.0));
 }
@@ -1157,7 +1482,7 @@ static float3 spektra_film_log_raw_linear_srgb(
   device const float *mallettBasisIlluminant,
   device const float *inputToReferenceXyz
 ) {
-  constexpr int kLinearSrgbColorSpace = 15;
+  constexpr int kLinearSrgbColorSpace = 17;
   const float3 rgb = max(linearSrgb, float3(0.0));
   (void)logSensitivity;
   (void)bandpassHanatos2025;
@@ -1181,9 +1506,9 @@ static float3 spektra_develop_film_density(
   if (params.filmPushPullMode == 1) {
     const float3 lookupRaw = spektra_experimental_push_pull_log_raw(logRaw, params.filmPushPullStops);
     const float3 density = float3(
-      spektra_interp_density_curve(lookupRaw.r, 0u, params.filmGamma, curveInfo, logExposure, densityCurves, params.densityCurveLookupMode),
-      spektra_interp_density_curve(lookupRaw.g, 1u, params.filmGamma, curveInfo, logExposure, densityCurves, params.densityCurveLookupMode),
-      spektra_interp_density_curve(lookupRaw.b, 2u, params.filmGamma, curveInfo, logExposure, densityCurves, params.densityCurveLookupMode)
+      spektra_interp_density_curve(lookupRaw.r, 0u, params.filmGamma, curveInfo, logExposure, densityCurves, params.densityCurveLookupMode, params.colorAdaptationEnabled),
+      spektra_interp_density_curve(lookupRaw.g, 1u, params.filmGamma, curveInfo, logExposure, densityCurves, params.densityCurveLookupMode, params.colorAdaptationEnabled),
+      spektra_interp_density_curve(lookupRaw.b, 2u, params.filmGamma, curveInfo, logExposure, densityCurves, params.densityCurveLookupMode, params.colorAdaptationEnabled)
     );
     return density * float3(
       spektra_experimental_push_pull_density_gain(lookupRaw.r, 0u, params.filmPushPullStops),
@@ -1192,9 +1517,9 @@ static float3 spektra_develop_film_density(
     );
   }
   return float3(
-    spektra_interp_density_curve(logRaw.r, 0u, params.filmGamma, curveInfo, logExposure, densityCurves, params.densityCurveLookupMode),
-    spektra_interp_density_curve(logRaw.g, 1u, params.filmGamma, curveInfo, logExposure, densityCurves, params.densityCurveLookupMode),
-    spektra_interp_density_curve(logRaw.b, 2u, params.filmGamma, curveInfo, logExposure, densityCurves, params.densityCurveLookupMode)
+    spektra_interp_density_curve(logRaw.r, 0u, params.filmGamma, curveInfo, logExposure, densityCurves, params.densityCurveLookupMode, params.colorAdaptationEnabled),
+    spektra_interp_density_curve(logRaw.g, 1u, params.filmGamma, curveInfo, logExposure, densityCurves, params.densityCurveLookupMode, params.colorAdaptationEnabled),
+    spektra_interp_density_curve(logRaw.b, 2u, params.filmGamma, curveInfo, logExposure, densityCurves, params.densityCurveLookupMode, params.colorAdaptationEnabled)
   );
 }
 
@@ -1737,9 +2062,9 @@ static float3 spektra_develop_print_density(
   device const float *paperDensityCurves
 ) {
   const float3 density = float3(
-    spektra_interp_density_curve(logRaw.r, 0u, params.printGamma, paperCurveInfo, paperLogExposure, paperDensityCurves, params.densityCurveLookupMode),
-    spektra_interp_density_curve(logRaw.g, 1u, params.printGamma, paperCurveInfo, paperLogExposure, paperDensityCurves, params.densityCurveLookupMode),
-    spektra_interp_density_curve(logRaw.b, 2u, params.printGamma, paperCurveInfo, paperLogExposure, paperDensityCurves, params.densityCurveLookupMode)
+    spektra_interp_density_curve(logRaw.r, 0u, params.printGamma, paperCurveInfo, paperLogExposure, paperDensityCurves, params.densityCurveLookupMode, params.colorAdaptationEnabled),
+    spektra_interp_density_curve(logRaw.g, 1u, params.printGamma, paperCurveInfo, paperLogExposure, paperDensityCurves, params.densityCurveLookupMode, params.colorAdaptationEnabled),
+    spektra_interp_density_curve(logRaw.b, 2u, params.printGamma, paperCurveInfo, paperLogExposure, paperDensityCurves, params.densityCurveLookupMode, params.colorAdaptationEnabled)
   );
   if (params.printShadowShape == 0.0 && params.printHighlightShape == 0.0) {
     return density;
@@ -1917,6 +2242,38 @@ static float3 spektra_apply_scanner_black_white_correction(
   const float q = blackLevel - m * referenceBlackY;
   const float correctedY = clamp(m * sourceY + q, 0.0, 1.0);
   return rgb * (correctedY / max(sourceY, 1.0e-10));
+}
+
+static float3 spektra_apply_print_scan_output_contract(
+  SpektraScanResult scan,
+  constant SpektraFrameConstants &frameConstants,
+  constant SpektraKernelParams &params
+) {
+  return spektra_apply_scanner_black_white_correction(
+    scan.rgb,
+    scan.y,
+    frameConstants.print.y,
+    frameConstants.print.z,
+    params
+  );
+}
+
+static float3 spektra_apply_film_scan_output_contract(
+  SpektraScanResult scan,
+  constant SpektraFrameConstants &frameConstants,
+  constant SpektraKernelParams &params,
+  constant SpektraSpectralInfo &info
+) {
+  if (spektra_scene_handoff_enabled(params) || info.filmPositive == 0u) {
+    return scan.rgb;
+  }
+  return spektra_apply_scanner_black_white_correction(
+    scan.rgb,
+    scan.y,
+    frameConstants.film.x,
+    frameConstants.film.y,
+    params
+  );
 }
 
 static float spektra_scan_density_to_y(
@@ -3597,6 +3954,47 @@ kernel void spektrafilm_half_to_float_buffer(
   destination[index] = float4(source[index]);
 }
 
+static uint spektra_hash_uint(uint value) {
+  value ^= value >> 16u;
+  value *= 0x7feb352du;
+  value ^= value >> 15u;
+  value *= 0x846ca68bu;
+  value ^= value >> 16u;
+  return value;
+}
+
+static float spektra_hash_unit_float(uint value) {
+  return float(spektra_hash_uint(value) & 0x00ffffffu) * (1.0 / 16777216.0);
+}
+
+static float spektra_half_ulp(float value) {
+  const float magnitude = abs(value);
+  if (!isfinite(magnitude) || magnitude >= 65504.0) {
+    return 0.0;
+  }
+  if (magnitude < 6.103515625e-5) {
+    return 5.960464477539063e-8;
+  }
+  return exp2(floor(log2(magnitude)) - 10.0);
+}
+
+static float spektra_dither_tpdf_for_half(uint pixelIndex) {
+  const uint seed = pixelIndex * 747796405u + 0x9e3779b9u;
+  return 0.5 * (spektra_hash_unit_float(seed) + spektra_hash_unit_float(seed ^ 0x85ebca6bu) - 1.0);
+}
+
+static float spektra_dither_for_half(float value, float tpdf) {
+  return value + tpdf * spektra_half_ulp(value);
+}
+
+static float3 spektra_dither_rgb_for_half(float3 rgb, uint pixelIndex) {
+  const float tpdf = spektra_dither_tpdf_for_half(pixelIndex);
+  return float3(
+    spektra_dither_for_half(rgb.r, tpdf),
+    spektra_dither_for_half(rgb.g, tpdf),
+    spektra_dither_for_half(rgb.b, tpdf)
+  );
+}
 kernel void spektrafilm_float_to_half_buffer(
   device const float4 *source [[buffer(0)]],
   device half4 *destination [[buffer(1)]],
@@ -3607,7 +4005,76 @@ kernel void spektrafilm_float_to_half_buffer(
     return;
   }
   const uint index = gid.y * dims.x + gid.x;
-  destination[index] = half4(source[index]);
+  const float4 pixel = source[index];
+  destination[index] = half4(float4(spektra_dither_rgb_for_half(pixel.rgb, index), pixel.a));
+}
+
+struct SpektraHostBufferLayout {
+  uint width;
+  uint height;
+  uint rowBytes;
+  uint startByteOffset;
+};
+
+kernel void spektrafilm_strided_float_to_float_buffer(
+  device const uchar *source [[buffer(0)]],
+  device float4 *destination [[buffer(1)]],
+  constant SpektraHostBufferLayout &layout [[buffer(2)]],
+  uint2 gid [[thread_position_in_grid]]
+) {
+  if (gid.x >= layout.width || gid.y >= layout.height) {
+    return;
+  }
+  const uint index = gid.y * layout.width + gid.x;
+  const uint byteOffset = layout.startByteOffset + gid.y * layout.rowBytes + gid.x * uint(sizeof(float4));
+  device const float4 *pixel = reinterpret_cast<device const float4 *>(source + byteOffset);
+  destination[index] = *pixel;
+}
+
+kernel void spektrafilm_strided_half_to_float_buffer(
+  device const uchar *source [[buffer(0)]],
+  device float4 *destination [[buffer(1)]],
+  constant SpektraHostBufferLayout &layout [[buffer(2)]],
+  uint2 gid [[thread_position_in_grid]]
+) {
+  if (gid.x >= layout.width || gid.y >= layout.height) {
+    return;
+  }
+  const uint index = gid.y * layout.width + gid.x;
+  const uint byteOffset = layout.startByteOffset + gid.y * layout.rowBytes + gid.x * uint(sizeof(half4));
+  device const half4 *pixel = reinterpret_cast<device const half4 *>(source + byteOffset);
+  destination[index] = float4(*pixel);
+}
+
+kernel void spektrafilm_float_to_strided_float_buffer(
+  device const float4 *source [[buffer(0)]],
+  device uchar *destination [[buffer(1)]],
+  constant SpektraHostBufferLayout &layout [[buffer(2)]],
+  uint2 gid [[thread_position_in_grid]]
+) {
+  if (gid.x >= layout.width || gid.y >= layout.height) {
+    return;
+  }
+  const uint index = gid.y * layout.width + gid.x;
+  const uint byteOffset = layout.startByteOffset + gid.y * layout.rowBytes + gid.x * uint(sizeof(float4));
+  device float4 *pixel = reinterpret_cast<device float4 *>(destination + byteOffset);
+  *pixel = source[index];
+}
+
+kernel void spektrafilm_float_to_strided_half_buffer(
+  device const float4 *source [[buffer(0)]],
+  device uchar *destination [[buffer(1)]],
+  constant SpektraHostBufferLayout &layout [[buffer(2)]],
+  uint2 gid [[thread_position_in_grid]]
+) {
+  if (gid.x >= layout.width || gid.y >= layout.height) {
+    return;
+  }
+  const uint index = gid.y * layout.width + gid.x;
+  const uint byteOffset = layout.startByteOffset + gid.y * layout.rowBytes + gid.x * uint(sizeof(half4));
+  device half4 *pixel = reinterpret_cast<device half4 *>(destination + byteOffset);
+  const float4 value = source[index];
+  *pixel = half4(float4(spektra_dither_rgb_for_half(value.rgb, index), value.a));
 }
 
 kernel void spektrafilm_raw_to_log_raw(
@@ -5988,8 +6455,9 @@ kernel void spektrafilm_final_from_film_density(
   device const float *filmScanToOutputRgb = scanToOutputRgbData;
   device const float *paperScanToOutputRgb = scanToOutputRgbData + colorInfo.colorSpaceCount * 9u;
 
-  const bool finalPrintSimulation = params.process == 0;
-  const bool finalScanNegative = params.process == 1;
+  const bool sceneHandoffOutput = spektra_scene_handoff_enabled(params);
+  const bool finalPrintSimulation = params.process == 0 && !sceneHandoffOutput;
+  const bool finalScanNegative = params.process == 1 || sceneHandoffOutput;
   if (finalPrintSimulation) {
     pixel.rgb = spektra_print_log_raw_with_preflash_and_exposure_factor(
         pixel.rgb,
@@ -6037,13 +6505,7 @@ kernel void spektrafilm_final_from_film_density(
       standardObserverCmfs,
       paperScanToOutputRgb
     );
-    pixel.rgb = spektra_apply_scanner_black_white_correction(
-      scan.rgb,
-      scan.y,
-      frameConstants.print.y,
-      frameConstants.print.z,
-      params
-    );
+    pixel.rgb = spektra_apply_print_scan_output_contract(scan, frameConstants, params);
   } else if (finalScanNegative) {
     const float3 filmDensityCmy = pixel.rgb;
     const float3 bypassedFilmDensityCmy = spektra_negative_bleach_bypass_dye_density(
@@ -6065,17 +6527,7 @@ kernel void spektrafilm_final_from_film_density(
       standardObserverCmfs,
       filmScanToOutputRgb
     );
-    if (spectralInfo.filmPositive != 0u) {
-      pixel.rgb = spektra_apply_scanner_black_white_correction(
-        scan.rgb,
-        scan.y,
-        frameConstants.film.x,
-        frameConstants.film.y,
-        params
-      );
-    } else {
-      pixel.rgb = scan.rgb;
-    }
+    pixel.rgb = spektra_apply_film_scan_output_contract(scan, frameConstants, params, spectralInfo);
   }
   if (encodeOutput != 0u && (finalPrintSimulation || finalScanNegative)) {
     pixel.rgb = spektra_finalize_output_rgb(pixel.rgb, params, colorInfo, encodeLuts, transferKinds);
@@ -6224,13 +6676,7 @@ kernel void spektrafilm_final_from_print_raw(
     standardObserverCmfs,
     paperScanToOutputRgb
   );
-  pixel.rgb = spektra_apply_scanner_black_white_correction(
-    scan.rgb,
-    scan.y,
-    frameConstants.print.y,
-    frameConstants.print.z,
-    params
-  );
+  pixel.rgb = spektra_apply_print_scan_output_contract(scan, frameConstants, params);
   if (encodeOutput != 0u) {
     pixel.rgb = spektra_finalize_output_rgb(pixel.rgb, params, colorInfo, encodeLuts, transferKinds);
   }
@@ -6675,7 +7121,8 @@ kernel void spektrafilm_scanner_finalize(
   float4 pixel = linearSource[index];
   if (params.scannerEnabled != 0u && params.scannerUnsharpSigmaPx > 0.0 && params.scannerUnsharpAmount > 0.0) {
     const float3 blurred = unsharpBlur[index].rgb;
-    pixel.rgb = pixel.rgb + params.scannerUnsharpAmount * (pixel.rgb - blurred);
+    const float3 sourceRgb = pixel.rgb;
+    pixel.rgb = max(sourceRgb + params.scannerUnsharpAmount * (sourceRgb - blurred), min(sourceRgb, float3(0.0)));
   }
   pixel.rgb = spektra_finalize_output_rgb(pixel.rgb, params, colorInfo, encodeLuts, transferKinds);
   destination[index] = pixel;
@@ -6699,7 +7146,8 @@ kernel void spektrafilm_scanner_finalize_texture(
   float4 pixel = linearSource.read(gid);
   if (params.scannerEnabled != 0u && params.scannerUnsharpSigmaPx > 0.0 && params.scannerUnsharpAmount > 0.0) {
     const float3 blurred = unsharpBlur.read(gid).rgb;
-    pixel.rgb = pixel.rgb + params.scannerUnsharpAmount * (pixel.rgb - blurred);
+    const float3 sourceRgb = pixel.rgb;
+    pixel.rgb = max(sourceRgb + params.scannerUnsharpAmount * (sourceRgb - blurred), min(sourceRgb, float3(0.0)));
   }
   pixel.rgb = spektra_finalize_output_rgb(pixel.rgb, params, colorInfo, encodeLuts, transferKinds);
   destination[index] = pixel;
@@ -6772,8 +7220,9 @@ kernel void spektrafilm_grain_preview(
   const uint baseSeed = params.grainSeed ^ frameSeed;
   const float2 filmUm = spektra_output_pixel_film_um(gid, params, dims);
 
-  const bool finalPrintSimulation = params.process == 0;
-  const bool finalScanNegative = params.process == 1;
+  const bool sceneHandoffOutput = spektra_scene_handoff_enabled(params);
+  const bool finalPrintSimulation = params.process == 0 && !sceneHandoffOutput;
+  const bool finalScanNegative = params.process == 1 || sceneHandoffOutput;
   pixel.rgb = spektra_develop_film_density(
     spektra_film_log_raw(
       pixel.rgb,
@@ -6852,7 +7301,7 @@ kernel void spektrafilm_grain_preview(
       true,
       spectralInfo
     );
-    pixel.rgb = spektra_scan_density_to_output_rgb(
+    SpektraScanResult scan = spektra_scan_density_to_output_rgb_linear_y(
       bypassedPrintDensityCmy,
       spektra_bleach_bypass_retained_silver_density(printDensityCmy, params.printBleachBypassAmount, true, spectralInfo),
       true,
@@ -6863,10 +7312,10 @@ kernel void spektrafilm_grain_preview(
       paperBaseDensity,
       paperScanIlluminant,
       standardObserverCmfs,
-      paperScanToOutputRgb,
-      encodeLuts,
-      transferKinds
+      paperScanToOutputRgb
     );
+    pixel.rgb = scan.rgb;
+    pixel.rgb = spektra_finalize_output_rgb(pixel.rgb, params, colorInfo, encodeLuts, transferKinds);
   } else if (finalScanNegative) {
     const float3 filmDensityCmy = pixel.rgb;
     const float3 bypassedFilmDensityCmy = spektra_negative_bleach_bypass_dye_density(
@@ -6875,7 +7324,7 @@ kernel void spektrafilm_grain_preview(
       params,
       spectralInfo
     );
-    pixel.rgb = spektra_scan_density_to_output_rgb(
+    SpektraScanResult scan = spektra_scan_density_to_output_rgb_linear_y(
       bypassedFilmDensityCmy,
       spektra_bleach_bypass_retained_silver_density(filmDensityCmy, params.negativeBleachBypassAmount, false, spectralInfo),
       false,
@@ -6886,10 +7335,10 @@ kernel void spektrafilm_grain_preview(
       filmBaseDensity,
       filmScanIlluminant,
       standardObserverCmfs,
-      filmScanToOutputRgb,
-      encodeLuts,
-      transferKinds
+      filmScanToOutputRgb
     );
+    pixel.rgb = scan.rgb;
+    pixel.rgb = spektra_finalize_output_rgb(pixel.rgb, params, colorInfo, encodeLuts, transferKinds);
   }
 
   destination[index] = pixel;

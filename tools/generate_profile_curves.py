@@ -45,6 +45,28 @@ COLOR_LUT_SIZE = 4096
 
 TRANSFER_LINEAR = 0
 TRANSFER_LUT = 1
+TRANSFER_SRGB = 2
+TRANSFER_GAMMA = 3
+TRANSFER_PROPHOTO = 4
+
+_OKLAB_M1 = np.asarray(
+    [
+        [0.8189330101, 0.3618667424, -0.1288597137],
+        [0.0329845436, 0.9293118715, 0.0361456387],
+        [0.0482003018, 0.2643662691, 0.6338517070],
+    ],
+    dtype=np.float64,
+)
+_OKLAB_M2 = np.asarray(
+    [
+        [0.2104542553, 0.7936177850, -0.0040720468],
+        [1.9779984951, -2.4285922050, 0.4505937099],
+        [0.0259040371, 0.7827717662, -0.8086757660],
+    ],
+    dtype=np.float64,
+)
+_OKLAB_M1_INV = np.linalg.inv(_OKLAB_M1)
+_OKLAB_M2_INV = np.linalg.inv(_OKLAB_M2)
 
 
 def _unique_numeric_csv(path: Path) -> np.ndarray:
@@ -253,6 +275,24 @@ COLOR_SPACES = [
     },
     {"key": "aces2065_1", "label": "ACES2065-1", "matrix_space": "ACES2065-1", "ofx": "ACES2065-1", "transfer": TRANSFER_LINEAR},
     {"key": "acescg", "label": "ACEScg", "matrix_space": "ACEScg", "ofx": "ACEScg", "transfer": TRANSFER_LINEAR},
+    {
+        "key": "acescct",
+        "label": "ACEScct",
+        "matrix_space": "ACEScg",
+        "ofx": "ACEScct",
+        "transfer": TRANSFER_LUT,
+        "decode": lambda x: colour.models.log_decoding_ACEScct(x),
+        "encode": lambda x: colour.models.log_encoding_ACEScct(x),
+    },
+    {
+        "key": "acescc",
+        "label": "ACEScc",
+        "matrix_space": "ACEScg",
+        "ofx": "ACEScc",
+        "transfer": TRANSFER_LUT,
+        "decode": lambda x: colour.models.log_decoding_ACEScc(x),
+        "encode": lambda x: colour.models.log_encoding_ACEScc(x),
+    },
     {"key": "lin_rec2020", "label": "Linear Rec.2020", "matrix_space": "ITU-R BT.2020", "ofx": "lin_rec2020", "transfer": TRANSFER_LINEAR},
     {"key": "lin_rec709", "label": "Linear Rec.709", "matrix_space": "ITU-R BT.709", "ofx": "lin_rec709_srgb", "transfer": TRANSFER_LINEAR},
     {"key": "lin_p3d65", "label": "Linear P3-D65", "matrix_space": "P3-D65", "ofx": "lin_p3d65", "transfer": TRANSFER_LINEAR},
@@ -261,7 +301,7 @@ COLOR_SPACES = [
         "label": "sRGB",
         "matrix_space": "sRGB",
         "ofx": "srgb_tx",
-        "transfer": TRANSFER_LUT,
+        "transfer": TRANSFER_SRGB,
         "decode": lambda x: colour.models.cctf_decoding(x, function="sRGB"),
         "encode": lambda x: colour.models.cctf_encoding(x, function="sRGB"),
     },
@@ -270,7 +310,7 @@ COLOR_SPACES = [
         "label": "Display P3",
         "matrix_space": "Display P3",
         "ofx": "displayp3_display",
-        "transfer": TRANSFER_LUT,
+        "transfer": TRANSFER_SRGB,
         "decode": lambda x: colour.models.cctf_decoding(x, function="sRGB"),
         "encode": lambda x: colour.models.cctf_encoding(x, function="sRGB"),
     },
@@ -279,7 +319,7 @@ COLOR_SPACES = [
         "label": "ProPhoto RGB",
         "matrix_space": "ProPhoto RGB",
         "ofx": "prophoto_rgb",
-        "transfer": TRANSFER_LUT,
+        "transfer": TRANSFER_PROPHOTO,
         "decode": lambda x: colour.models.cctf_decoding_ProPhotoRGB(x),
         "encode": lambda x: colour.models.cctf_encoding_ProPhotoRGB(x),
     },
@@ -288,7 +328,8 @@ COLOR_SPACES = [
         "label": "Adobe RGB (1998)",
         "matrix_space": "Adobe RGB (1998)",
         "ofx": "adobe_rgb_1998",
-        "transfer": TRANSFER_LUT,
+        "transfer": TRANSFER_GAMMA,
+        "transfer_param": 2.19921875,
         "decode": lambda x: np.sign(x) * (np.abs(x) ** 2.19921875),
         "encode": lambda x: np.sign(x) * (np.abs(x) ** (1.0 / 2.19921875)),
     },
@@ -297,7 +338,8 @@ COLOR_SPACES = [
         "label": "DCI-P3",
         "matrix_space": "DCI-P3",
         "ofx": "p3_dci_display",
-        "transfer": TRANSFER_LUT,
+        "transfer": TRANSFER_GAMMA,
+        "transfer_param": 2.6,
         "decode": lambda x: np.sign(x) * (np.abs(x) ** 2.6),
         "encode": lambda x: np.sign(x) * (np.abs(x) ** (1.0 / 2.6)),
     },
@@ -306,7 +348,8 @@ COLOR_SPACES = [
         "label": "P3-D65 Gamma 2.2",
         "matrix_space": "P3-D65",
         "ofx": "g22_p3d65_tx",
-        "transfer": TRANSFER_LUT,
+        "transfer": TRANSFER_GAMMA,
+        "transfer_param": 2.2,
         "decode": lambda x: np.sign(x) * (np.abs(x) ** 2.2),
         "encode": lambda x: np.sign(x) * (np.abs(x) ** (1.0 / 2.2)),
     },
@@ -315,7 +358,8 @@ COLOR_SPACES = [
         "label": "P3-D65 Gamma 2.6",
         "matrix_space": "P3-D65",
         "ofx": "g26_p3d65_tx",
-        "transfer": TRANSFER_LUT,
+        "transfer": TRANSFER_GAMMA,
+        "transfer_param": 2.6,
         "decode": lambda x: np.sign(x) * (np.abs(x) ** 2.6),
         "encode": lambda x: np.sign(x) * (np.abs(x) ** (1.0 / 2.6)),
     },
@@ -324,7 +368,8 @@ COLOR_SPACES = [
         "label": "Rec.709 Gamma 2.2",
         "matrix_space": "ITU-R BT.709",
         "ofx": "g22_rec709_tx",
-        "transfer": TRANSFER_LUT,
+        "transfer": TRANSFER_GAMMA,
+        "transfer_param": 2.2,
         "decode": lambda x: np.sign(x) * (np.abs(x) ** 2.2),
         "encode": lambda x: np.sign(x) * (np.abs(x) ** (1.0 / 2.2)),
     },
@@ -333,7 +378,8 @@ COLOR_SPACES = [
         "label": "Rec.709 Gamma 2.4",
         "matrix_space": "ITU-R BT.709",
         "ofx": "g24_rec709_tx",
-        "transfer": TRANSFER_LUT,
+        "transfer": TRANSFER_GAMMA,
+        "transfer_param": 2.4,
         "decode": lambda x: np.sign(x) * (np.abs(x) ** 2.4),
         "encode": lambda x: np.sign(x) * (np.abs(x) ** (1.0 / 2.4)),
     },
@@ -440,6 +486,160 @@ def _color_space_to_meter_xyz_matrix(matrix_space: str) -> list[list[float]]:
     return _matrix_to_rows(np.stack(columns, axis=1))
 
 
+def _xy_to_xyz_unit_y(xy: np.ndarray) -> np.ndarray:
+    x = xy[..., 0]
+    y = xy[..., 1]
+    safe_y = np.maximum(y, 1.0e-12)
+    return np.stack([x / safe_y, np.ones_like(x), (1.0 - x - y) / safe_y], axis=-1)
+
+
+def _chromatic_adaptation_matrix(source_xy: np.ndarray, target_xy: np.ndarray) -> np.ndarray:
+    source_xyz = _xy_to_xyz_unit_y(np.asarray(source_xy, dtype=np.float64))
+    target_xyz = _xy_to_xyz_unit_y(np.asarray(target_xy, dtype=np.float64))
+    return np.asarray(
+        colour.adaptation.matrix_chromatic_adaptation_VonKries(source_xyz, target_xyz, transform="CAT16"),
+        dtype=np.float64,
+    )
+
+
+def _oklab_rgb_matrices(matrix_space: str) -> tuple[np.ndarray, np.ndarray]:
+    """Output-RGB <-> OkLab LMS matrices used by the Metal gamut compressor.
+
+    Andrea Volpato's current spektrafilm work uses CAT16 for I/O gamut
+    compression. The native renderer follows that by adapting each output
+    space white to D65 before the OkLab step, then adapting back after the
+    inverse transform.
+    """
+    rgb_to_xyz = np.asarray(_color_space_to_meter_xyz_matrix(matrix_space), dtype=np.float64)
+    xyz_to_rgb = np.linalg.inv(rgb_to_xyz)
+    source_white = np.asarray(colour.RGB_COLOURSPACES[matrix_space].whitepoint, dtype=np.float64)
+    d65_white = np.asarray(colour.RGB_COLOURSPACES["sRGB"].whitepoint, dtype=np.float64)
+    cat_to_d65 = _chromatic_adaptation_matrix(source_white, d65_white)
+    cat_from_d65 = np.linalg.inv(cat_to_d65)
+    rgb_to_oklab_lms = _OKLAB_M1 @ cat_to_d65 @ rgb_to_xyz
+    oklab_lms_to_rgb = xyz_to_rgb @ cat_from_d65 @ _OKLAB_M1_INV
+    return rgb_to_oklab_lms, oklab_lms_to_rgb
+
+
+def _reinhard_knee_array(values: np.ndarray, threshold: float, limit: float, power: float) -> np.ndarray:
+    out = np.asarray(values, dtype=np.float64).copy()
+    mask = out > threshold
+    if np.any(mask):
+        scale = max(limit - threshold, 1.0e-12)
+        x = (out[mask] - threshold) / scale
+        y = x / np.power(1.0 + np.power(x, power), 1.0 / power)
+        out[mask] = threshold + scale * y
+    return out
+
+
+def _ray_polygon_distance_array(origin: np.ndarray, direction: np.ndarray, polygon: np.ndarray) -> np.ndarray:
+    direction = np.asarray(direction, dtype=np.float64)
+    flat = direction.reshape(-1, 2)
+    t_min = np.full(flat.shape[0], np.inf, dtype=np.float64)
+    edges = polygon[1:] - polygon[:-1]
+    for edge_index, edge in enumerate(edges):
+        ex, ey = edge
+        ax, ay = polygon[edge_index]
+        dx = flat[:, 0]
+        dy = flat[:, 1]
+        denom = dx * ey - dy * ex
+        valid = np.abs(denom) > 1.0e-12
+        ox = origin[0] - ax
+        oy = origin[1] - ay
+        safe_denom = np.where(valid, denom, 1.0)
+        t = np.where(valid, (-ox * ey + oy * ex) / safe_denom, np.inf)
+        s = np.where(valid, (-ox * dy + oy * dx) / safe_denom, np.inf)
+        good = valid & (t > 1.0e-9) & (s >= 0.0) & (s <= 1.0)
+        t_min = np.where(good & (t < t_min), t, t_min)
+    return t_min.reshape(direction.shape[:-1])
+
+
+def _compress_xy_radial_for_tests(
+    xy: np.ndarray,
+    white_xy: np.ndarray,
+    locus: np.ndarray,
+    threshold: float = 0.0,
+    limit: float = 1.0,
+    power: float = 6.0,
+) -> np.ndarray:
+    xy = np.asarray(xy, dtype=np.float64)
+    white_xy = np.asarray(white_xy, dtype=np.float64)
+    delta = xy - white_xy
+    distance = np.linalg.norm(delta, axis=-1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        safe_distance = np.maximum(distance, 1.0e-12)
+        direction = delta / safe_distance[..., None]
+        boundary = _ray_polygon_distance_array(white_xy, direction, np.asarray(locus, dtype=np.float64))
+        normalized = distance / np.maximum(boundary, 1.0e-12)
+        compressed = _reinhard_knee_array(normalized, threshold, limit, power)
+        out = white_xy + direction * (compressed * boundary)[..., None]
+    return np.where((distance < 1.0e-9)[..., None], xy, out)
+
+
+def _output_gamut_compression_data() -> list[float]:
+    data: list[float] = []
+    for space in COLOR_SPACES:
+        rgb_to_oklab_lms, oklab_lms_to_rgb = _oklab_rgb_matrices(space["matrix_space"])
+        data.extend(float(value) for value in rgb_to_oklab_lms.reshape(-1))
+        data.extend(float(value) for value in oklab_lms_to_rgb.reshape(-1))
+    return data
+
+
+def _compress_rgb_oklch_for_tests(rgb: np.ndarray, color_space_index: int = 0) -> np.ndarray:
+    rgb_to_oklab_lms, oklab_lms_to_rgb = _oklab_rgb_matrices(COLOR_SPACES[color_space_index]["matrix_space"])
+    rgb = np.asarray(rgb, dtype=np.float64)
+    lms = np.einsum("ij,...j->...i", rgb_to_oklab_lms, rgb)
+    lms_prime = np.sign(lms) * np.power(np.abs(lms), 1.0 / 3.0)
+    lab = np.einsum("ij,...j->...i", _OKLAB_M2, lms_prime)
+    flat_rgb = rgb.reshape((-1, 3))
+    flat_lab = lab.reshape((-1, 3)).copy()
+    flat_out = np.empty_like(flat_rgb)
+
+    def rgb_from_lab(lab_value: np.ndarray) -> np.ndarray:
+        lms_prime_value = _OKLAB_M2_INV @ lab_value
+        return oklab_lms_to_rgb @ (lms_prime_value * lms_prime_value * lms_prime_value)
+
+    for index, (source_rgb, lab_value) in enumerate(zip(flat_rgb, flat_lab)):
+        in_bounds = np.all(np.isfinite(source_rgb)) and np.all(source_rgb >= -1.0e-6) and np.all(source_rgb <= 1.0 + 1.0e-6)
+        lab_value[0] = float(_reinhard_knee_array(np.asarray([max(lab_value[0], 0.0)]), 0.7, 1.0, 2.2)[0])
+        chroma = float(np.hypot(lab_value[1], lab_value[2]))
+        if not np.isfinite(chroma) or chroma <= 1.0e-10:
+            flat_out[index] = source_rgb if in_bounds else np.clip(
+                rgb_from_lab(np.asarray([lab_value[0], 0.0, 0.0], dtype=np.float64)),
+                0.0,
+                1.0,
+            )
+            continue
+        hue = lab_value[1:] / chroma
+        lo = 0.0
+        hi = max(chroma, 1.0e-6)
+        for _ in range(12):
+            candidate = rgb_from_lab(np.asarray([lab_value[0], hue[0] * hi, hue[1] * hi], dtype=np.float64))
+            if not (np.all(np.isfinite(candidate)) and np.all(candidate >= -1.0e-6) and np.all(candidate <= 1.0 + 1.0e-6)):
+                break
+            lo = hi
+            hi = min(hi * 2.0, 4.0)
+            if hi >= 4.0:
+                break
+        for _ in range(16):
+            mid = (lo + hi) * 0.5
+            candidate = rgb_from_lab(np.asarray([lab_value[0], hue[0] * mid, hue[1] * mid], dtype=np.float64))
+            if np.all(np.isfinite(candidate)) and np.all(candidate >= -1.0e-6) and np.all(candidate <= 1.0 + 1.0e-6):
+                lo = mid
+            else:
+                hi = mid
+        cmax = max(lo, 1.0e-9)
+        normalized = chroma / cmax
+        compressed_normalized = float(_reinhard_knee_array(np.asarray([normalized]), 0.0, 1.0, 6.0)[0])
+        compressed_chroma = min(compressed_normalized * cmax, cmax)
+        flat_out[index] = np.clip(
+            rgb_from_lab(np.asarray([lab_value[0], hue[0] * compressed_chroma, hue[1] * compressed_chroma], dtype=np.float64)),
+            0.0,
+            1.0,
+        )
+    return flat_out.reshape(rgb.shape)
+
+
 def _color_space_to_srgb_matrix(matrix_space: str) -> list[list[float]]:
     columns = []
     for rgb in np.eye(3):
@@ -514,11 +714,13 @@ def _emit_color_transforms() -> str:
     decode_luts: list[float] = []
     encode_luts: list[float] = []
     transfer_kinds: list[int] = []
+    transfer_params: list[float] = []
     label_records: list[str] = []
     for space in COLOR_SPACES:
         decode_luts.extend(_lut_values(space, "decode", COLOR_DECODE_MIN, COLOR_DECODE_MAX))
         encode_luts.extend(_lut_values(space, "encode", COLOR_ENCODE_MIN, COLOR_ENCODE_MAX))
         transfer_kinds.append(int(space["transfer"]))
+        transfer_params.append(float(space.get("transfer_param", 0.0)))
         label_records.append(f"  {json.dumps(space['label'])},")
 
     return "\n\n".join(
@@ -529,6 +731,7 @@ def _emit_color_transforms() -> str:
             "alignas(16) constexpr uint32_t color_transfer_kinds[] = {"
             + ", ".join(f"{value}u" for value in transfer_kinds)
             + "};",
+            _array("color_transfer_params", transfer_params),
             "constexpr const char *color_space_labels[] = {",
             "\n".join(label_records),
             "};",
@@ -959,6 +1162,10 @@ def generate() -> str:
             "  return color_transfer_kinds;",
             "}",
             "",
+            "const float *colorTransferParams() {",
+            "  return color_transfer_params;",
+            "}",
+            "",
             "const char *colorSpaceLabel(int32_t index) {",
             "  if (index < 0 || index >= static_cast<int32_t>(kSpektraColorSpaceCount)) {",
             "    return nullptr;",
@@ -1063,11 +1270,21 @@ def write_hanatos_lut(output: Path) -> None:
     output.write_bytes(lut.tobytes(order="C"))
 
 
+def write_output_gamut_compression_data(output: Path) -> None:
+    data = np.asarray(_output_gamut_compression_data(), dtype="<f4")
+    expected_count = len(COLOR_SPACES) * 18
+    if data.size != expected_count:
+        raise ValueError(f"Unexpected output gamut compression data size {data.size}; expected {expected_count}.")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_bytes(data.tobytes(order="C"))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--counts-output", type=Path)
     parser.add_argument("--hanatos-output", type=Path)
+    parser.add_argument("--output-gamut-compression-output", type=Path)
     args = parser.parse_args()
     print_missing_st2065_2_disclaimer()
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -1080,6 +1297,9 @@ def main() -> int:
     if args.hanatos_output:
         write_hanatos_lut(args.hanatos_output)
         print(f"Wrote {args.hanatos_output}")
+    if args.output_gamut_compression_output:
+        write_output_gamut_compression_data(args.output_gamut_compression_output)
+        print(f"Wrote {args.output_gamut_compression_output}")
     return 0
 
 

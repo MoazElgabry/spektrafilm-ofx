@@ -35,6 +35,11 @@ struct RendererDiagnostics {
   uint64_t privateScratchAllocationBytes = 0;
   uint64_t privateScratchAllocationCount = 0;
   uint64_t uploadBytes = 0;
+  bool sharedBackend = false;
+  uint32_t sharedBackendGeneration = 0;
+  uint32_t sharedQueueCount = 0;
+  uint64_t transientCachedBytes = 0;
+  uint64_t transientBudgetBytes = 0;
   uint32_t passCount = 0;
   bool sourceNoCopy = false;
   bool destinationNoCopy = false;
@@ -73,6 +78,7 @@ public:
   virtual bool isAvailable() const = 0;
   virtual const std::string &lastError() const = 0;
   virtual const RendererDiagnostics &lastDiagnostics() const = 0;
+  virtual void releaseTransientResources() {}
 
   virtual bool render(
     const ImageView &source,
