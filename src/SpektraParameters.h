@@ -122,6 +122,11 @@ enum class ColorSpace : int32_t {
   Rec709Gamma24 = 25,
 };
 
+enum class ImageMemoryDomain : int32_t {
+  Host = 0,
+  CudaDevice = 1,
+};
+
 struct RenderParams {
   ProcessMode process = ProcessMode::PrintSimulation;
   bool scanNegativeInvert = false;
@@ -314,11 +319,6 @@ inline uint32_t colorAdaptationFlags(const RenderParams &params) {
   flags |= params.colorAdaptationOutputChromaCompression ? kColorAdaptationOutputChromaCompression : 0u;
   return flags;
 }
-
-enum class ImageMemoryDomain : int32_t {
-  Host = 0,
-  CudaDevice = 1,
-};
 
 struct ImageView {
   const void *data = nullptr;

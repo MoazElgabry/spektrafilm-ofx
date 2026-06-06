@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "SpektraParameters.h"
@@ -10,6 +11,29 @@
 namespace spektrafilm {
 
 struct RendererPassDiagnostics {
+  RendererPassDiagnostics() = default;
+
+  RendererPassDiagnostics(
+    std::string passName,
+    double passGpuMs,
+    uint32_t passWidth,
+    uint32_t passHeight,
+    uint32_t passDepth,
+    uint32_t passThreadgroupWidth,
+    uint32_t passThreadgroupHeight,
+    uint64_t passEstimatedBytes,
+    bool passGpuTimeAvailable
+  )
+    : name(std::move(passName))
+    , gpuMs(passGpuMs)
+    , width(passWidth)
+    , height(passHeight)
+    , depth(passDepth)
+    , threadgroupWidth(passThreadgroupWidth)
+    , threadgroupHeight(passThreadgroupHeight)
+    , estimatedBytes(passEstimatedBytes)
+    , gpuTimeAvailable(passGpuTimeAvailable) {}
+
   std::string name;
   double gpuMs = 0.0;
   uint32_t width = 0;
@@ -99,6 +123,10 @@ struct RendererDiagnostics {
   uint32_t tileHeight = 0;
   uint32_t tileOverlap = 0;
   uint32_t diffusionGroupSize = 2;
+  std::string deviceName;
+  std::string cudaTransferMode;
+  int cudaComputeCapabilityMajor = 0;
+  int cudaComputeCapabilityMinor = 0;
   std::string threadgroupMode = "auto";
   std::string passTimingMode;
   std::string blurBackend = "custom";
@@ -109,10 +137,6 @@ struct RendererDiagnostics {
   std::string densityCurveLookup = "binary";
   std::string spectralTransmittance = "pow";
   std::string finalCoreMode = "fused";
-  std::string deviceName;
-  std::string cudaTransferMode;
-  int cudaComputeCapabilityMajor = 0;
-  int cudaComputeCapabilityMinor = 0;
   std::vector<RendererPassDiagnostics> passes;
   std::vector<RendererTileDiagnostics> tiles;
 };
