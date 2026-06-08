@@ -2055,6 +2055,36 @@ bool CudaRenderer::renderCudaOwned(
       });
       kernelMs += passMs;
     } else {
+      float *dirLogRawDevice = nullptr;
+      if (dirPath) {
+        // Preserve the raw baseline before development; spatial paths may reuse rawDevice for density.
+        dirLogRawDevice = static_cast<float *>(sourceDevice_.pointer);
+        if (!spektraCudaRawToLogRaw(
+              rawDevice,
+              dirLogRawDevice,
+              width,
+              height,
+              &passMs,
+              error.data(),
+              error.size())) {
+          lastError_ = error.data();
+          return false;
+        }
+        diagnostics_.passes.push_back({
+          "cuda_raw_to_log_raw",
+          static_cast<double>(passMs),
+          static_cast<uint32_t>(width),
+          static_cast<uint32_t>(height),
+          1u,
+          256u,
+          1u,
+          static_cast<uint64_t>(bytes) * 2u,
+          true
+        });
+        kernelMs += passMs;
+        passMs = 0.0f;
+      }
+
       float *filmDensityDevice = (filmDensityOutput || (filmDensityWithGrainOutput && !previewGrainPath))
         ? static_cast<float *>(destinationDevice_.pointer)
         : (useEnlarger ? static_cast<float *>(scratchDeviceA_.pointer) : static_cast<float *>(scratchDeviceB_.pointer));
@@ -2088,32 +2118,6 @@ bool CudaRenderer::renderCudaOwned(
 
       // DIR corrects developed density, then rejoins the normal grain/print pipeline
       if (dirPath) {
-        passMs = 0.0f;
-        float *logRawDevice = static_cast<float *>(sourceDevice_.pointer);
-        if (!spektraCudaRawToLogRaw(
-              rawDevice,
-              logRawDevice,
-              width,
-              height,
-              &passMs,
-              error.data(),
-              error.size())) {
-          lastError_ = error.data();
-          return false;
-        }
-        diagnostics_.passes.push_back({
-          "cuda_raw_to_log_raw",
-          static_cast<double>(passMs),
-          static_cast<uint32_t>(width),
-          static_cast<uint32_t>(height),
-          1u,
-          256u,
-          1u,
-          static_cast<uint64_t>(bytes) * 2u,
-          true
-        });
-        kernelMs += passMs;
-
         passMs = 0.0f;
         float *dirCorrectionOriginalDevice = rawDevice;
         if (!spektraCudaDirCorrectionFromDensity(
@@ -2171,7 +2175,11 @@ bool CudaRenderer::renderCudaOwned(
           kernelMs += passMs;
 
           passMs = 0.0f;
-          dirFinalCorrectionDevice = filmDensityDevice;
+          dirFinalCorrectionDevice = filmDensityDevice != static_cast<float *>(destinationDevice_.pointer)
+            ? filmDensityDevice
+            : (rawDevice == static_cast<float *>(scratchDeviceA_.pointer)
+                ? static_cast<float *>(scratchDeviceB_.pointer)
+                : static_cast<float *>(scratchDeviceA_.pointer));
           if (!spektraCudaDirBlurY(
                 static_cast<const float *>(destinationDevice_.pointer),
                 dirFinalCorrectionDevice,
@@ -2256,7 +2264,7 @@ bool CudaRenderer::renderCudaOwned(
         passMs = 0.0f;
         float *redevelopedDensityDevice = static_cast<float *>(destinationDevice_.pointer);
         if (!spektraCudaDirRedevelop(
-              logRawDevice,
+              dirLogRawDevice,
               dirFinalCorrectionDevice,
               redevelopedDensityDevice,
               width,

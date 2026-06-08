@@ -156,6 +156,66 @@ bool renderSpatial(spektrafilm::Renderer &renderer, const std::vector<float> &so
     validOutput(destination, "spatial render");
 }
 
+bool renderCameraDiffusionDir(spektrafilm::Renderer &renderer, const std::vector<float> &source) {
+  std::vector<float> baseline(source.size(), -1.0f);
+  std::vector<float> coupled(source.size(), -1.0f);
+  const int32_t rowBytes = kWidth * kComponents * static_cast<int32_t>(sizeof(float));
+  const spektrafilm::ImageView src{source.data(), 0, 0, kWidth, kHeight, rowBytes, kComponents, 4};
+  const spektrafilm::RenderWindow window{0, 0, kWidth, kHeight};
+  spektrafilm::RenderParams params = baseParams();
+  params.cameraDiffusionEnabled = true;
+  params.cameraDiffusionStrength = 0.2f;
+  params.cameraDiffusionSpatialScale = 0.5f;
+  params.dirCouplersDiffusionUm = 7.0f;
+  params.dirCouplersDiffusionTailUm = 233.0f;
+  params.dirCouplersDiffusionTailWeight = 0.0f;
+  params.dirCouplersAmount = 0.0f;
+  spektrafilm::MutableImageView baselineDst{baseline.data(), 0, 0, kWidth, kHeight, rowBytes, kComponents, 4};
+  if (!renderer.render(src, baselineDst, window, params, 3.1)) {
+    std::cerr << "CUDA camera-diffusion DIR baseline failed: " << renderer.lastError() << "\n";
+    return false;
+  }
+
+  params.dirCouplersAmount = 0.171f;
+  spektrafilm::MutableImageView coupledDst{coupled.data(), 0, 0, kWidth, kHeight, rowBytes, kComponents, 4};
+  if (!renderer.render(src, coupledDst, window, params, 3.1)) {
+    std::cerr << "CUDA camera-diffusion DIR render failed: " << renderer.lastError() << "\n";
+    return false;
+  }
+  const auto &diagnostics = renderer.lastDiagnostics();
+  const float difference = maxRgbDifference(baseline, coupled);
+  if (!diagnostics.cameraDiffusionPath ||
+      !diagnostics.dirPath ||
+      !hasPass(diagnostics, "cuda_dir_redevelop") ||
+      difference <= 1.0e-6f ||
+      difference > 4.0f) {
+    std::cerr << "CUDA camera-diffusion DIR response is invalid. max_difference=" << difference << "\n";
+    return false;
+  }
+  return validOutput(coupled, "camera-diffusion DIR render");
+}
+
+bool renderDirFilmDensity(spektrafilm::Renderer &renderer, const std::vector<float> &source) {
+  std::vector<float> destination(source.size(), -1.0f);
+  const int32_t rowBytes = kWidth * kComponents * static_cast<int32_t>(sizeof(float));
+  const spektrafilm::ImageView src{source.data(), 0, 0, kWidth, kHeight, rowBytes, kComponents, 4};
+  const spektrafilm::MutableImageView dst{destination.data(), 0, 0, kWidth, kHeight, rowBytes, kComponents, 4};
+  const spektrafilm::RenderWindow window{0, 0, kWidth, kHeight};
+  spektrafilm::RenderParams params = baseParams();
+  params.renderOutput = spektrafilm::RenderOutputMode::FilmDensityCmy;
+  params.dirCouplersAmount = 0.25f;
+  params.dirCouplersDiffusionUm = 20.0f;
+  if (!renderer.render(src, dst, window, params, 3.2)) {
+    std::cerr << "CUDA DIR FilmDensityCmy render failed: " << renderer.lastError() << "\n";
+    return false;
+  }
+  const auto &diagnostics = renderer.lastDiagnostics();
+  return diagnostics.dirPath &&
+    hasPass(diagnostics, "cuda_dir_blur_y") &&
+    hasPass(diagnostics, "cuda_dir_redevelop") &&
+    validOutput(destination, "DIR FilmDensityCmy render");
+}
+
 bool renderCameraDiffusionFilmLog(spektrafilm::Renderer &renderer, const std::vector<float> &source) {
   // Keep FilmLogRaw on the same camera-diffusion path as the Metal and Vulkan backends.
   std::vector<float> baseline(source.size(), -1.0f);
@@ -274,6 +334,8 @@ int main() {
   if (!renderHost(*renderer, source) ||
       !renderDevice(*renderer, source) ||
       !renderSpatial(*renderer, source) ||
+      !renderCameraDiffusionDir(*renderer, source) ||
+      !renderDirFilmDensity(*renderer, source) ||
       !renderCameraDiffusionFilmLog(*renderer, source) ||
       !renderProcessNegative(*renderer, source) ||
       !renderRcmAces(*renderer, source) ||
