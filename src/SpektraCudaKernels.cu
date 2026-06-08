@@ -12,6 +12,12 @@
 namespace spektrafilm {
 namespace {
 
+constexpr uint32_t kColorAdaptationInputCompression = 1u << 0u;
+constexpr uint32_t kColorAdaptationCurveSmoothing = 1u << 1u;
+constexpr uint32_t kColorAdaptationOutputLightnessCompression = 1u << 2u;
+constexpr uint32_t kColorAdaptationOutputChromaCompression = 1u << 3u;
+constexpr uint32_t kOutputGamutCompressionStride = 18u;
+
 // host-facing error text stays here so launch wrappers remain small
 void setError(char *error, size_t errorSize, const char *message, cudaError_t status = cudaSuccess) {
   if (!error || errorSize == 0u) {
@@ -166,6 +172,10 @@ __device__ uint32_t colorSpaceIndex(int colorSpace, const KernelColorInfo &color
   return static_cast<uint32_t>(colorSpace);
 }
 
+__device__ bool colorAdaptationEnabled(const KernelParams &params, uint32_t flag) {
+  return (params.colorAdaptationFlags & flag) != 0u;
+}
+
 __device__ float sampleTransferLut(float value, uint32_t colorSpace, const KernelColorInfo &colorInfo, const float *lut) {
   const uint32_t lutSize = colorInfo.transferLutSize;
   if (!lut || lutSize <= 1u) {
@@ -213,7 +223,12 @@ __device__ float3 mulColorMatrix(float3 rgb, int colorSpace, const KernelColorIn
   );
 }
 
-__device__ float3 hanatosRaw(float3 xyz, const KernelSpectralInfo &info, const float *hanatosRawResponse) {
+__device__ float3 hanatosRaw(
+  float3 xyz,
+  const KernelParams &params,
+  const KernelSpectralInfo &info,
+  const float *hanatosRawResponse
+) {
   const float b = xyz.x + xyz.y + xyz.z;
   const float invB = 1.0f / fmaxf(b, 1.0e-10f);
   const float xyX = clampf(xyz.x * invB, 0.0f, 1.0f);
@@ -245,13 +260,16 @@ __device__ float3 hanatosRaw(float3 xyz, const KernelSpectralInfo &info, const f
 
   float3 raw = make_float3(0.0f, 0.0f, 0.0f);
   float weightSum = 0.0f;
+  const uint32_t responseBase = colorAdaptationEnabled(params, kColorAdaptationInputCompression)
+    ? info.hanatosWidth * info.hanatosHeight * 3u
+    : 0u;
   for (uint32_t i = 0u; i < 4u; ++i) {
     const uint32_t xi = mirroredIndex(xBase - 1 + static_cast<int>(i), info.hanatosWidth);
     for (uint32_t j = 0u; j < 4u; ++j) {
       const uint32_t yj = mirroredIndex(yBase - 1 + static_cast<int>(j), info.hanatosHeight);
       const float weight = wx[i] * wy[j];
       weightSum += weight;
-      const uint32_t offset = (xi * info.hanatosHeight + yj) * 3u;
+      const uint32_t offset = responseBase + (xi * info.hanatosHeight + yj) * 3u;
       raw.x += weight * hanatosRawResponse[offset];
       raw.y += weight * hanatosRawResponse[offset + 1u];
       raw.z += weight * hanatosRawResponse[offset + 2u];
@@ -297,7 +315,11 @@ __device__ float3 filmRawFromRgb(
   if (params.rgbToRawMethod == 1) {
     raw = mallettRaw(mulColorMatrix(decoded, params.inputColorSpace, colorInfo, inputToSrgb), mallettBasisIlluminant);
   } else {
-    raw = hanatosRaw(mulColorMatrix(decoded, params.inputColorSpace, colorInfo, inputToReferenceXyz), spectralInfo, hanatosRawResponse);
+    raw = hanatosRaw(
+      mulColorMatrix(decoded, params.inputColorSpace, colorInfo, inputToReferenceXyz),
+      params,
+      spectralInfo,
+      hanatosRawResponse);
   }
   const float exposure = exp2f(params.filmExposureEv + params.autoExposureEv);
   return make_float3(fmaxf(raw.x * exposure, 0.0f), fmaxf(raw.y * exposure, 0.0f), fmaxf(raw.z * exposure, 0.0f));
@@ -587,6 +609,40 @@ __device__ float interpDensityCurve(
   const float x0 = logExposure[lo] / gamma;
   const float x1 = logExposure[hi] / gamma;
   const float t = clampf((logRaw - x0) / fmaxf(x1 - x0, 1.0e-9f), 0.0f, 1.0f);
+  if (colorAdaptationEnabled(params, kColorAdaptationCurveSmoothing) && count > 2u) {
+    const float dx0 = fmaxf(x1 - x0, 1.0e-9f);
+    const float d0 = (densityCurves[hi * 3u + channel] - densityCurves[lo * 3u + channel]) / dx0;
+    float m0 = d0;
+    float m1 = d0;
+    if (lo > 0u) {
+      const float xPrev = logExposure[lo - 1u] / gamma;
+      const float dxPrev = fmaxf(x0 - xPrev, 1.0e-9f);
+      const float dPrev = (densityCurves[lo * 3u + channel] - densityCurves[(lo - 1u) * 3u + channel]) / dxPrev;
+      m0 = dPrev * d0 > 0.0f ? 0.5f * (dPrev + d0) : 0.0f;
+    }
+    if (hi + 1u < count) {
+      const float xNext = logExposure[hi + 1u] / gamma;
+      const float dxNext = fmaxf(xNext - x1, 1.0e-9f);
+      const float dNext = (densityCurves[(hi + 1u) * 3u + channel] - densityCurves[hi * 3u + channel]) / dxNext;
+      m1 = dNext * d0 > 0.0f ? 0.5f * (dNext + d0) : 0.0f;
+    }
+    if (fabsf(d0) <= 1.0e-9f) {
+      m0 = 0.0f;
+      m1 = 0.0f;
+    } else {
+      const float limit = 3.0f * fabsf(d0);
+      m0 = d0 * m0 > 0.0f ? clampf(m0, -limit, limit) : 0.0f;
+      m1 = d0 * m1 > 0.0f ? clampf(m1, -limit, limit) : 0.0f;
+    }
+    const float y0 = densityCurves[lo * 3u + channel];
+    const float y1 = densityCurves[hi * 3u + channel];
+    const float t2 = t * t;
+    const float t3 = t2 * t;
+    return (2.0f * t3 - 3.0f * t2 + 1.0f) * y0 +
+      (t3 - 2.0f * t2 + t) * dx0 * m0 +
+      (-2.0f * t3 + 3.0f * t2) * y1 +
+      (t3 - t2) * dx0 * m1;
+  }
   return mixf(densityCurves[lo * 3u + channel], densityCurves[hi * 3u + channel], t);
 }
 
@@ -942,7 +998,7 @@ __device__ float3 filmLogRawLinearSrgb(
   const float3 rgb = max3s(linearSrgb, 0.0f);
   const float3 raw = params.rgbToRawMethod == 1
     ? mallettRaw(rgb, mallettBasisIlluminant)
-    : hanatosRaw(mulColorMatrix(rgb, linearSrgbColorSpace, colorInfo, inputToReferenceXyz), info, hanatosRawResponse);
+    : hanatosRaw(mulColorMatrix(rgb, linearSrgbColorSpace, colorInfo, inputToReferenceXyz), params, info, hanatosRawResponse);
   constexpr float invLog10 = 1.0f / 2.302585092994046f;
   return make_float3(
     logf(fmaxf(raw.x, 0.0f) + 1.0e-10f) * invLog10,
@@ -1029,7 +1085,7 @@ struct CudaScanResult {
 };
 
 __device__ uint32_t finalOutputColorSpace(const KernelParams &params, const KernelColorInfo &colorInfo) {
-  constexpr int linearRec2020ColorSpace = 12;
+  constexpr int linearRec2020ColorSpace = 14;
   return colorSpaceIndex(params.outputRole == 1 ? linearRec2020ColorSpace : params.outputColorSpace, colorInfo);
 }
 
@@ -1142,6 +1198,184 @@ __device__ float3 hlgDisplayNitsToSignal(float3 nits, float peakNits) {
     encodeHlg(powf(fmaxf(nits.z, 0.0f) / peakNits, 1.0f / gamma)));
 }
 
+__device__ float reinhardKneeCuda(float value, float threshold, float limit, float power) {
+  if (!isfinite(value) || value <= threshold) {
+    return value;
+  }
+  const float scale = fmaxf(limit - threshold, 1.0e-12f);
+  const float x = (value - threshold) / scale;
+  const float y = x / powf(1.0f + powf(x, power), 1.0f / power);
+  return threshold + scale * y;
+}
+
+__device__ float signedCuberootCuda(float value) {
+  return value < 0.0f ? -powf(-value, 1.0f / 3.0f) : powf(value, 1.0f / 3.0f);
+}
+
+__device__ float3 multiplyPackedColorMatrixCuda(const float *data, uint32_t offset, float3 value) {
+  return make_float3(
+    data[offset] * value.x + data[offset + 1u] * value.y + data[offset + 2u] * value.z,
+    data[offset + 3u] * value.x + data[offset + 4u] * value.y + data[offset + 5u] * value.z,
+    data[offset + 6u] * value.x + data[offset + 7u] * value.y + data[offset + 8u] * value.z);
+}
+
+__device__ float3 oklabFromOutputRgbCuda(float3 rgb, const float *outputGamutCompressionData, uint32_t dataOffset) {
+  const float3 lms = multiplyPackedColorMatrixCuda(outputGamutCompressionData, dataOffset, rgb);
+  const float3 lmsPrime = make_float3(
+    signedCuberootCuda(lms.x),
+    signedCuberootCuda(lms.y),
+    signedCuberootCuda(lms.z));
+  return make_float3(
+    0.2104542553f * lmsPrime.x + 0.7936177850f * lmsPrime.y - 0.0040720468f * lmsPrime.z,
+    1.9779984951f * lmsPrime.x - 2.4285922050f * lmsPrime.y + 0.4505937099f * lmsPrime.z,
+    0.0259040371f * lmsPrime.x + 0.7827717662f * lmsPrime.y - 0.8086757660f * lmsPrime.z);
+}
+
+__device__ float3 outputRgbFromOklabCuda(float3 lab, const float *outputGamutCompressionData, uint32_t dataOffset) {
+  const float l = lab.x + 0.3963377774f * lab.y + 0.2158037573f * lab.z;
+  const float m = lab.x - 0.1055613458f * lab.y - 0.0638541728f * lab.z;
+  const float s = lab.x - 0.0894841775f * lab.y - 1.2914855480f * lab.z;
+  const float3 lms = make_float3(l * l * l, m * m * m, s * s * s);
+  return multiplyPackedColorMatrixCuda(outputGamutCompressionData, dataOffset + 9u, lms);
+}
+
+__device__ bool rgbInBoundsCuda(float3 rgb, float lowerBound, float upperBound) {
+  constexpr float epsilon = 1.0e-6f;
+  return isfinite(rgb.x) && isfinite(rgb.y) && isfinite(rgb.z) &&
+    rgb.x >= lowerBound - epsilon && rgb.y >= lowerBound - epsilon && rgb.z >= lowerBound - epsilon &&
+    rgb.x <= upperBound + epsilon && rgb.y <= upperBound + epsilon && rgb.z <= upperBound + epsilon;
+}
+
+__device__ float solveOklchCmaxCuda(
+  float3 lab,
+  float chroma,
+  float hueX,
+  float hueY,
+  const float *outputGamutCompressionData,
+  uint32_t dataOffset,
+  float lowerBound,
+  float upperBound
+) {
+  float lo = 0.0f;
+  float hi = fmaxf(chroma, 1.0e-6f);
+  const float maxHi = 4.0f * fmaxf(upperBound, 1.0f);
+  for (uint32_t expansion = 0u; expansion < 12u; ++expansion) {
+    const float3 candidate = outputRgbFromOklabCuda(
+      make_float3(lab.x, hueX * hi, hueY * hi),
+      outputGamutCompressionData,
+      dataOffset);
+    if (!rgbInBoundsCuda(candidate, lowerBound, upperBound)) {
+      break;
+    }
+    lo = hi;
+    hi = fminf(hi * 2.0f, maxHi);
+    if (hi >= maxHi) {
+      break;
+    }
+  }
+  for (uint32_t iteration = 0u; iteration < 16u; ++iteration) {
+    const float mid = 0.5f * (lo + hi);
+    const float3 candidate = outputRgbFromOklabCuda(
+      make_float3(lab.x, hueX * mid, hueY * mid),
+      outputGamutCompressionData,
+      dataOffset);
+    if (rgbInBoundsCuda(candidate, lowerBound, upperBound)) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo;
+}
+
+__device__ float3 outputGamutCompressOklchCuda(
+  float3 rgb,
+  uint32_t colorSpace,
+  const KernelColorInfo &colorInfo,
+  const float *colorEncodeLut,
+  float lowerBound,
+  float upperBound,
+  bool softenInGamut,
+  bool compressLightness,
+  bool compressChroma
+) {
+  if (!isfinite(rgb.x) || !isfinite(rgb.y) || !isfinite(rgb.z)) {
+    return make_float3(lowerBound, lowerBound, lowerBound);
+  }
+  const bool inBounds = rgbInBoundsCuda(rgb, lowerBound, upperBound);
+  if (inBounds && !softenInGamut) {
+    return rgb;
+  }
+  const float *outputGamutCompressionData =
+    colorEncodeLut + colorInfo.colorSpaceCount * colorInfo.transferLutSize;
+  const uint32_t dataOffset = colorSpace * kOutputGamutCompressionStride;
+  float3 lab = oklabFromOutputRgbCuda(rgb, outputGamutCompressionData, dataOffset);
+  if (compressLightness) {
+    lab.x = softenInGamut
+      ? reinhardKneeCuda(fmaxf(lab.x, 0.0f), 0.7f, 1.0f, 2.2f)
+      : clampf(lab.x, 0.0f, powf(fmaxf(upperBound, 0.0f), 1.0f / 3.0f));
+  }
+  const float chroma = sqrtf(lab.y * lab.y + lab.z * lab.z);
+  if (!(chroma > 1.0e-10f) || !isfinite(chroma)) {
+    if (inBounds) {
+      return rgb;
+    }
+    const float3 neutral = outputRgbFromOklabCuda(
+      make_float3(lab.x, 0.0f, 0.0f),
+      outputGamutCompressionData,
+      dataOffset);
+    return make_float3(
+      clampf(neutral.x, lowerBound, upperBound),
+      clampf(neutral.y, lowerBound, upperBound),
+      clampf(neutral.z, lowerBound, upperBound));
+  }
+  if (!compressChroma) {
+    const float3 lightnessCompressed = outputRgbFromOklabCuda(lab, outputGamutCompressionData, dataOffset);
+    return rgbInBoundsCuda(lightnessCompressed, lowerBound, upperBound)
+      ? lightnessCompressed
+      : make_float3(
+          clampf(lightnessCompressed.x, lowerBound, upperBound),
+          clampf(lightnessCompressed.y, lowerBound, upperBound),
+          clampf(lightnessCompressed.z, lowerBound, upperBound));
+  }
+  const float hueX = lab.y / chroma;
+  const float hueY = lab.z / chroma;
+  const float cmax = fmaxf(
+    solveOklchCmaxCuda(lab, chroma, hueX, hueY, outputGamutCompressionData, dataOffset, lowerBound, upperBound),
+    1.0e-9f);
+  const float normalizedChroma = chroma / cmax;
+  const float compressedNormalized = softenInGamut
+    ? reinhardKneeCuda(normalizedChroma, 0.0f, 1.0f, 6.0f)
+    : (normalizedChroma <= 1.0f ? normalizedChroma : reinhardKneeCuda(normalizedChroma, 0.85f, 1.0f, 4.0f));
+  const float compressedChroma = fminf(compressedNormalized * cmax, cmax);
+  const float3 compressed = outputRgbFromOklabCuda(
+    make_float3(lab.x, hueX * compressedChroma, hueY * compressedChroma),
+    outputGamutCompressionData,
+    dataOffset);
+  return rgbInBoundsCuda(compressed, lowerBound, upperBound)
+    ? compressed
+    : make_float3(
+        clampf(compressed.x, lowerBound, upperBound),
+        clampf(compressed.y, lowerBound, upperBound),
+        clampf(compressed.z, lowerBound, upperBound));
+}
+
+__device__ float inverseRcmOotfChannel(float value) {
+  const float x = fabsf(value);
+  const float signal = powf(x, 1.0f / 2.4f);
+  const float sceneLinear = signal < 0.081f
+    ? signal / 4.5f
+    : powf((signal + 0.099f) / 1.099f, 1.0f / 0.45f);
+  return value < 0.0f ? -sceneLinear : sceneLinear;
+}
+
+__device__ float3 applyInverseRcmOotf(float3 rgb) {
+  return make_float3(
+    inverseRcmOotfChannel(rgb.x),
+    inverseRcmOotfChannel(rgb.y),
+    inverseRcmOotfChannel(rgb.z));
+}
+
 __device__ float3 finalizeOutputRgb(
   float3 rgb,
   const KernelParams &params,
@@ -1151,10 +1385,54 @@ __device__ float3 finalizeOutputRgb(
 ) {
   if (params.outputRole == 1) {
     const float peak = fmaxf(params.hdrPeakNits, fmaxf(params.hdrReferenceWhiteNits, 1.0f) + 1.0f);
-    const float3 nits = hdrMapToNits(rgb, params);
+    const bool compressLightness = colorAdaptationEnabled(params, kColorAdaptationOutputLightnessCompression);
+    const bool compressChroma = colorAdaptationEnabled(params, kColorAdaptationOutputChromaCompression);
+    const bool compressOutputGamut = compressLightness || compressChroma;
+    float3 nits = hdrMapToNits(rgb, params);
+    if (compressOutputGamut) {
+      nits = outputGamutCompressOklchCuda(
+        make_float3(nits.x / peak, nits.y / peak, nits.z / peak),
+        finalOutputColorSpace(params, colorInfo),
+        colorInfo,
+        colorEncodeLut,
+        0.0f,
+        1.0f,
+        false,
+        compressLightness,
+        compressChroma);
+      nits = make_float3(
+        clampf(nits.x * peak, 0.0f, peak),
+        clampf(nits.y * peak, 0.0f, peak),
+        clampf(nits.z * peak, 0.0f, peak));
+    }
     return params.hdrTransfer == 1
       ? hlgDisplayNitsToSignal(nits, peak)
       : make_float3(encodePq(nits.x), encodePq(nits.y), encodePq(nits.z));
+  }
+  if (params.outputRole == 2) {
+    const int colorSpace = params.outputColorSpace;
+    const bool inverseOotf =
+      colorSpace == 2 || colorSpace == 3 ||
+      (colorSpace >= 10 && colorSpace <= 18) ||
+      (colorSpace >= 21 && colorSpace <= 25);
+    if (inverseOotf) {
+      rgb = applyInverseRcmOotf(rgb);
+    }
+  } else {
+    const bool compressLightness = colorAdaptationEnabled(params, kColorAdaptationOutputLightnessCompression);
+    const bool compressChroma = colorAdaptationEnabled(params, kColorAdaptationOutputChromaCompression);
+    if (compressLightness || compressChroma) {
+      rgb = outputGamutCompressOklchCuda(
+        rgb,
+        finalOutputColorSpace(params, colorInfo),
+        colorInfo,
+        colorEncodeLut,
+        0.0f,
+        1.0f,
+        true,
+        compressLightness,
+        compressChroma);
+    }
   }
   return encodeOutputRgb(rgb, params, colorInfo, colorEncodeLut, colorTransferKind);
 }
@@ -3600,6 +3878,56 @@ __global__ void printRawFromFilmDensityKernel(
   printRaw[offset + 3u] = filmDensity[offset + 3u];
 }
 
+__global__ void printRawFromNegativeLightKernel(
+  const float *source,
+  float *printRaw,
+  int pixelCount,
+  const KernelParams *params,
+  const KernelSpectralInfo *spectralInfo,
+  const KernelColorInfo *colorInfo,
+  const float *colorDecodeLut,
+  const uint32_t *colorTransferKind,
+  const float *inputToReferenceXyz,
+  const float *paperHanatosResponse,
+  const float *preflashPaperHanatosResponse,
+  const float *academyPrinterDensityData
+) {
+  const int index = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= pixelCount) {
+    return;
+  }
+  const size_t offset = static_cast<size_t>(index) * 4u;
+  const KernelParams p = *params;
+  const KernelSpectralInfo info = *spectralInfo;
+  const KernelColorInfo cinfo = *colorInfo;
+  const float3 sourceRgb = make_float3(source[offset], source[offset + 1u], source[offset + 2u]);
+  const float3 decoded = decodeInputRgb(sourceRgb, p, cinfo, colorDecodeLut, colorTransferKind);
+  const float3 referenceXyz = mulColorMatrix(decoded, p.inputColorSpace, cinfo, inputToReferenceXyz);
+  float3 raw = max3s(hanatosRaw(referenceXyz, p, info, paperHanatosResponse), 0.0f);
+
+  constexpr int linearSrgbColorSpace = 17;
+  const float3 midgrayXyz = mulColorMatrix(
+    make_float3(0.184f, 0.184f, 0.184f), linearSrgbColorSpace, cinfo, inputToReferenceXyz);
+  const float3 midgrayRaw = max3s(hanatosRaw(midgrayXyz, p, info, paperHanatosResponse), 1.0e-10f);
+  const float midgrayGeomean =
+    expf((logf(midgrayRaw.x) + logf(midgrayRaw.y) + logf(midgrayRaw.z)) / 3.0f);
+  const float exposureFactor = 1.0f / fmaxf(midgrayGeomean, 1.0e-10f);
+
+  const float3 whiteXyz = mulColorMatrix(
+    make_float3(1.0f, 1.0f, 1.0f), linearSrgbColorSpace, cinfo, inputToReferenceXyz);
+  const float3 preflashRaw = max3s(hanatosRaw(whiteXyz, p, info, preflashPaperHanatosResponse), 0.0f);
+  raw = add3(
+    mul3s(
+      mul3(raw, apdPrinterTimingExposureScale(p, info, academyPrinterDensityData)),
+      exposureFactor * exp2f(p.printExposureEv)),
+    mul3s(preflashRaw, exp2f(p.printExposureEv)));
+  raw = max3s(raw, 0.0f);
+  printRaw[offset] = raw.x;
+  printRaw[offset + 1u] = raw.y;
+  printRaw[offset + 2u] = raw.z;
+  printRaw[offset + 3u] = source[offset + 3u];
+}
+
 __global__ void printDensityFromPrintRawKernel(
   const float *printRaw,
   float *printDensity,
@@ -3732,26 +4060,16 @@ __global__ void makeFrameConstantsKernel(
     inputToReferenceXyz);
   const float3 filmBlack = densityCurveMaxCmy(false, info);
   const float3 filmWhite = make_float3(0.0f, 0.0f, 0.0f);
-  const float filmReferenceBlackY = scanDensityToY(
-    filmBlack,
-    0.0f,
-    p,
-    info,
-    filmChannelDensity,
-    filmBaseDensity,
-    paperScanDensityData,
-    scanIlluminantsAndCmfs,
-    false);
-  const float filmReferenceWhiteY = scanDensityToY(
-    filmWhite,
-    0.0f,
-    p,
-    info,
-    filmChannelDensity,
-    filmBaseDensity,
-    paperScanDensityData,
-    scanIlluminantsAndCmfs,
-    false);
+  CudaScanResult filmDmaxScan{make_float3(0.0f, 0.0f, 0.0f), 0.0f};
+  CudaScanResult filmDminScan{make_float3(0.0f, 0.0f, 0.0f), 0.0f};
+  if (p.scanNegativeInvert != 0u) {
+    filmDmaxScan = scanDensityToOutputRgbLinearY(
+      filmBlack, 0.0f, p, cinfo, info, filmChannelDensity, filmBaseDensity,
+      paperScanDensityData, scanIlluminantsAndCmfs, scanToOutputRgbData, false);
+    filmDminScan = scanDensityToOutputRgbLinearY(
+      filmWhite, 0.0f, p, cinfo, info, filmChannelDensity, filmBaseDensity,
+      paperScanDensityData, scanIlluminantsAndCmfs, scanToOutputRgbData, false);
+  }
   const float3 printGlareRgb = scanIlluminantToOutputRgb(
     p,
     cinfo,
@@ -3763,8 +4081,8 @@ __global__ void makeFrameConstantsKernel(
   frameConstants->print[1] = printReferenceBlackY;
   frameConstants->print[2] = printReferenceWhiteY;
   frameConstants->print[3] = 0.0f;
-  frameConstants->film[0] = filmReferenceBlackY;
-  frameConstants->film[1] = filmReferenceWhiteY;
+  frameConstants->film[0] = filmDmaxScan.y;
+  frameConstants->film[1] = filmDminScan.y;
   frameConstants->film[2] = 0.0f;
   frameConstants->film[3] = 0.0f;
   frameConstants->glare[0] = printGlareRgb.x;
@@ -3775,6 +4093,14 @@ __global__ void makeFrameConstantsKernel(
   frameConstants->preflash[1] = preflashRaw.y;
   frameConstants->preflash[2] = preflashRaw.z;
   frameConstants->preflash[3] = 0.0f;
+  frameConstants->filmDmaxScan[0] = filmDmaxScan.rgb.x;
+  frameConstants->filmDmaxScan[1] = filmDmaxScan.rgb.y;
+  frameConstants->filmDmaxScan[2] = filmDmaxScan.rgb.z;
+  frameConstants->filmDmaxScan[3] = filmDmaxScan.y;
+  frameConstants->filmDminScan[0] = filmDminScan.rgb.x;
+  frameConstants->filmDminScan[1] = filmDminScan.rgb.y;
+  frameConstants->filmDminScan[2] = filmDminScan.rgb.z;
+  frameConstants->filmDminScan[3] = filmDminScan.y;
 }
 
 __global__ void finalFromFilmDensityKernel(
@@ -3872,9 +4198,25 @@ __global__ void finalFromFilmDensityKernel(
       scanIlluminantsAndCmfs,
       scanToOutputRgbData,
       false);
-    if (info.filmPositive != 0u) {
+    if (p.scanNegativeInvert != 0u) {
       const KernelFrameConstants fc = *frameConstants;
-      rgb = applyScannerBlackWhiteCorrection(scan.rgb, scan.y, fc.film[0], fc.film[1], p);
+      const float3 dmax = make_float3(fc.filmDmaxScan[0], fc.filmDmaxScan[1], fc.filmDmaxScan[2]);
+      const float3 dmin = make_float3(fc.filmDminScan[0], fc.filmDminScan[1], fc.filmDminScan[2]);
+      const float3 range = make_float3(
+        copysignf(fmaxf(fabsf(dmin.x - dmax.x), 1.0e-6f), dmin.x - dmax.x),
+        copysignf(fmaxf(fabsf(dmin.y - dmax.y), 1.0e-6f), dmin.y - dmax.y),
+        copysignf(fmaxf(fabsf(dmin.z - dmax.z), 1.0e-6f), dmin.z - dmax.z));
+      const float yRange = fmaxf(fc.filmDminScan[3] - fc.filmDmaxScan[3], 1.0e-10f);
+      const bool positive = info.filmPositive != 0u;
+      const float3 normalized = positive
+        ? div3(sub3(scan.rgb, dmax), range)
+        : div3(sub3(dmin, scan.rgb), range);
+      const float normalizedY = positive
+        ? (scan.y - fc.filmDmaxScan[3]) / yRange
+        : (fc.filmDminScan[3] - scan.y) / yRange;
+      rgb = p.outputRole == 2
+        ? normalized
+        : applyScannerBlackWhiteCorrection(normalized, normalizedY, 0.0f, 1.0f, p);
     } else {
       rgb = scan.rgb;
     }
@@ -3993,7 +4335,9 @@ __global__ void finalFromPrintRawKernel(
     hanatosRawResponse,
     mallettBasisIlluminant,
     inputToReferenceXyz);
-  float3 rgb = applyScannerBlackWhiteCorrection(scan.rgb, scan.y, printReferenceBlackY, printReferenceWhiteY, p);
+  float3 rgb = p.outputRole == 2
+    ? scan.rgb
+    : applyScannerBlackWhiteCorrection(scan.rgb, scan.y, printReferenceBlackY, printReferenceWhiteY, p);
   if (finalizeOutput) {
     rgb = finalizeOutputRgb(rgb, p, cinfo, colorEncodeLut, colorTransferKind);
   }
@@ -5785,6 +6129,53 @@ bool spektraCudaPrintRawFromFilmDensity(
       mallettBasisIlluminant,
       inputToReferenceXyz,
       logOutput);
+  }, kernelMs, error, errorSize);
+}
+
+bool spektraCudaPrintRawFromNegativeLight(
+  const float *source,
+  float *printRaw,
+  int width,
+  int height,
+  const KernelParams *params,
+  const KernelSpectralInfo *spectralInfo,
+  const KernelColorInfo *colorInfo,
+  const float *colorDecodeLut,
+  const uint32_t *colorTransferKind,
+  const float *inputToReferenceXyz,
+  const float *paperHanatosResponse,
+  const float *preflashPaperHanatosResponse,
+  const float *academyPrinterDensityData,
+  float *kernelMs,
+  char *error,
+  size_t errorSize
+) {
+  if (!source || !printRaw || !params || !spectralInfo || !colorInfo || !colorDecodeLut ||
+      !colorTransferKind || !inputToReferenceXyz || !paperHanatosResponse ||
+      !preflashPaperHanatosResponse || !academyPrinterDensityData || width <= 0 || height <= 0) {
+    setError(error, errorSize, "Invalid CUDA process-negative arguments");
+    return false;
+  }
+  if (kernelMs) {
+    *kernelMs = 0.0f;
+  }
+  constexpr int blockSize = 256;
+  const int pixelCount = width * height;
+  const unsigned int blockCount = static_cast<unsigned int>((pixelCount + blockSize - 1) / blockSize);
+  return timedLaunch([&]() {
+    printRawFromNegativeLightKernel<<<blockCount, blockSize>>>(
+      source,
+      printRaw,
+      pixelCount,
+      params,
+      spectralInfo,
+      colorInfo,
+      colorDecodeLut,
+      colorTransferKind,
+      inputToReferenceXyz,
+      paperHanatosResponse,
+      preflashPaperHanatosResponse,
+      academyPrinterDensityData);
   }, kernelMs, error, errorSize);
 }
 

@@ -443,6 +443,8 @@ CudaRenderer::~CudaRenderer() {
   releaseDeviceBuffer(colorInfoDevice_);
   releaseDeviceBuffer(curveInfoDevice_);
   releaseDeviceBuffer(hanatosRawResponseDevice_);
+  releaseDeviceBuffer(paperHanatosResponseDevice_);
+  releaseDeviceBuffer(preflashPaperHanatosResponseDevice_);
   releaseDeviceBuffer(mallettBasisIlluminantDevice_);
   releaseDeviceBuffer(inputToReferenceXyzDevice_);
   releaseDeviceBuffer(inputToSrgbDevice_);
@@ -593,6 +595,9 @@ bool CudaRenderer::ensureStaticResources(const RenderParams &params) {
     if (hanatosSpectraData_.empty()) {
       hanatosSpectraData_ = readFloatFile(resourcePath("SpektraHanatos2025Spectra.f32"));
     }
+    if (outputGamutCompressionData_.empty()) {
+      outputGamutCompressionData_ = readFloatFile(resourcePath("SpektraOutputGamutCompression.f32"));
+    }
   } catch (const std::exception &ex) {
     lastError_ = ex.what();
     staticBuffersUploaded_ = false;
@@ -605,11 +610,26 @@ bool CudaRenderer::ensureStaticResources(const RenderParams &params) {
     staticBuffersUploaded_ = false;
     return false;
   }
+  if (outputGamutCompressionData_.size() != kSpektraOutputGamutCompressionElementCount) {
+    lastError_ = "Unable to load CUDA output gamut compression data.";
+    staticBuffersUploaded_ = false;
+    return false;
+  }
+  staticResources_.colorEncodeLut.insert(
+    staticResources_.colorEncodeLut.end(),
+    outputGamutCompressionData_.begin(),
+    outputGamutCompressionData_.end());
+  staticResources_.colorEncodeLut.insert(
+    staticResources_.colorEncodeLut.end(),
+    colorTransferParams(),
+    colorTransferParams() + static_cast<size_t>(kSpektraColorSpaceCount));
 
   if (!uploadDeviceStruct(spectralInfoDevice_, staticResources_.spectralInfo) ||
       !uploadDeviceStruct(colorInfoDevice_, staticResources_.colorInfo) ||
       !uploadDeviceStruct(curveInfoDevice_, staticResources_.curveInfo) ||
       !uploadDeviceFloats(hanatosRawResponseDevice_, staticResources_.hanatosRawResponse) ||
+      !uploadDeviceFloats(paperHanatosResponseDevice_, staticResources_.paperHanatosResponse) ||
+      !uploadDeviceFloats(preflashPaperHanatosResponseDevice_, staticResources_.preflashPaperHanatosResponse) ||
       !uploadDeviceBytes(
         mallettBasisIlluminantDevice_,
         staticResources_.mallettBasisIlluminant.data(),
@@ -758,14 +778,19 @@ bool CudaRenderer::renderCudaOwned(
   const bool printLogRawOutput = params.renderOutput == RenderOutputMode::PrintLogRaw;
   const bool printDensityOutput = params.renderOutput == RenderOutputMode::PrintDensityCmy;
   const bool finalOutput = params.renderOutput == RenderOutputMode::FinalPreview;
+  const bool finalProcessNegative = finalOutput && params.process == ProcessMode::ProcessNegative;
+  const bool rcmOutput = finalOutput && params.outputRole == OutputRole::Rcm;
   const bool printPipelineOutput = printLogRawOutput || printDensityOutput;
   const bool previewGrainPath = params.grainEnabled &&
+    !finalProcessNegative &&
     params.grainModel == GrainModel::Preview &&
     (filmDensityWithGrainOutput || printPipelineOutput || finalOutput);
   const bool productionGrainPath = params.grainEnabled &&
+    !finalProcessNegative &&
     params.grainModel == GrainModel::Production &&
     (filmDensityWithGrainOutput || printPipelineOutput || finalOutput);
   const bool grainSynthesisPath = params.grainEnabled &&
+    !finalProcessNegative &&
     params.grainModel == GrainModel::GrainSynthesis &&
     (filmDensityWithGrainOutput || printPipelineOutput || finalOutput);
   int32_t grainSynthesisRequestedSamples = 0;
@@ -775,6 +800,7 @@ bool CudaRenderer::renderCudaOwned(
   // decide optional passes once here, dispatch code below just follows these flags
   KernelParams kernelParams{};
   bool dirPath = !copyDiagnostic &&
+    !finalProcessNegative &&
     params.dirCouplersAmount > 0.0f &&
     params.renderOutput != RenderOutputMode::FilmLogRaw;
   bool dirBlurPath = dirPath && params.dirCouplersDiffusionUm > 0.0f;
@@ -946,6 +972,7 @@ bool CudaRenderer::renderCudaOwned(
     printDiffusionComponents =
       makePrintDiffusionComponents(params, kernelParams.filmPixelSizeUm, printDiffusionInfo);
     cameraDiffusionPath =
+      !finalProcessNegative &&
       params.cameraDiffusionEnabled &&
       params.cameraDiffusionStrength > 0.0f &&
       params.cameraDiffusionSpatialScale > 0.0f &&
@@ -960,17 +987,21 @@ bool CudaRenderer::renderCudaOwned(
       !printDiffusionComponents.empty() &&
       (params.renderOutput == RenderOutputMode::PrintLogRaw ||
        params.renderOutput == RenderOutputMode::PrintDensityCmy ||
-       (finalOutput && params.process == ProcessMode::PrintSimulation));
+       (finalOutput && (params.process == ProcessMode::PrintSimulation ||
+                        params.process == ProcessMode::ProcessNegative)));
     halationBoostPath =
+      !finalProcessNegative &&
       params.halationEnabled &&
       kernelParams.halationBoostEv > 0.0f &&
       !filmLogRawOutput &&
       (filmDensityOutput || printPipelineOutput || finalOutput);
     halationScatterPath =
+      !finalProcessNegative &&
       params.halationEnabled &&
       kernelParams.scatterAmount > 0.0f &&
       kernelParams.scatterScale > 0.0f;
     halationBouncePath =
+      !finalProcessNegative &&
       params.halationEnabled &&
       kernelParams.halationAmount > 0.0f &&
       kernelParams.halationScale > 0.0f &&
@@ -1417,8 +1448,259 @@ bool CudaRenderer::renderCudaOwned(
       kernelMs += passMs;
       return true;
     };
+    auto dispatchScannerPost = [&](bool printGlarePath) -> bool {
+      const KernelParams &kp = kernelParams;
+      if (printGlarePath) {
+        passMs = 0.0f;
+        if (!spektraCudaPrintGlareGenerate(
+              static_cast<float *>(scratchDeviceA_.pointer),
+              width,
+              height,
+              static_cast<const KernelParams *>(paramsDevice_.pointer),
+              &passMs,
+              error.data(),
+              error.size())) {
+          lastError_ = error.data();
+          return false;
+        }
+        recordCudaPass("cuda_print_glare_generate", passMs, 1u, static_cast<uint64_t>(bytes));
+        kernelMs += passMs;
+
+        if (kp.glareBlur > 1.0e-4f) {
+          passMs = 0.0f;
+          if (!spektraCudaGaussianBlurX(
+                static_cast<const float *>(scratchDeviceA_.pointer),
+                static_cast<float *>(scratchDeviceB_.pointer),
+                width,
+                height,
+                kp.glareBlur,
+                &passMs,
+                error.data(),
+                error.size())) {
+            lastError_ = error.data();
+            return false;
+          }
+          recordCudaPass("cuda_print_glare_blur_x", passMs, 1u, static_cast<uint64_t>(bytes) * 2u);
+          kernelMs += passMs;
+
+          passMs = 0.0f;
+          if (!spektraCudaGaussianBlurY(
+                static_cast<const float *>(scratchDeviceB_.pointer),
+                static_cast<float *>(scratchDeviceA_.pointer),
+                width,
+                height,
+                kp.glareBlur,
+                &passMs,
+                error.data(),
+                error.size())) {
+            lastError_ = error.data();
+            return false;
+          }
+          recordCudaPass("cuda_print_glare_blur_y", passMs, 1u, static_cast<uint64_t>(bytes) * 2u);
+          kernelMs += passMs;
+        }
+
+        passMs = 0.0f;
+        if (!spektraCudaPrintGlareApply(
+              static_cast<const float *>(destinationDevice_.pointer),
+              static_cast<const float *>(scratchDeviceA_.pointer),
+              static_cast<float *>(destinationDevice_.pointer),
+              width,
+              height,
+              static_cast<const KernelParams *>(paramsDevice_.pointer),
+              static_cast<const KernelSpectralInfo *>(spectralInfoDevice_.pointer),
+              static_cast<const KernelColorInfo *>(colorInfoDevice_.pointer),
+              static_cast<const float *>(scanIlluminantsAndCmfsDevice_.pointer),
+              static_cast<const float *>(scanToOutputRgbDataDevice_.pointer),
+              &passMs,
+              error.data(),
+              error.size())) {
+          lastError_ = error.data();
+          return false;
+        }
+        recordCudaPass("cuda_print_glare_apply", passMs, 1u, static_cast<uint64_t>(bytes) * 3u);
+        kernelMs += passMs;
+      }
+
+      if (kp.scannerBlurSigmaPx > 1.0e-4f) {
+        passMs = 0.0f;
+        if (!spektraCudaGaussianBlurX(
+              static_cast<const float *>(destinationDevice_.pointer),
+              static_cast<float *>(scratchDeviceA_.pointer),
+              width,
+              height,
+              kp.scannerBlurSigmaPx,
+              &passMs,
+              error.data(),
+              error.size())) {
+          lastError_ = error.data();
+          return false;
+        }
+        recordCudaPass("cuda_scanner_blur_x", passMs, 1u, static_cast<uint64_t>(bytes) * 2u);
+        kernelMs += passMs;
+
+        passMs = 0.0f;
+        if (!spektraCudaGaussianBlurY(
+              static_cast<const float *>(scratchDeviceA_.pointer),
+              static_cast<float *>(destinationDevice_.pointer),
+              width,
+              height,
+              kp.scannerBlurSigmaPx,
+              &passMs,
+              error.data(),
+              error.size())) {
+          lastError_ = error.data();
+          return false;
+        }
+        recordCudaPass("cuda_scanner_blur_y", passMs, 1u, static_cast<uint64_t>(bytes) * 2u);
+        kernelMs += passMs;
+      }
+
+      const bool needsUnsharp = kp.scannerUnsharpSigmaPx > 1.0e-4f && kp.scannerUnsharpAmount > 0.0f;
+      const float *unsharpDevice = nullptr;
+      if (needsUnsharp) {
+        passMs = 0.0f;
+        if (!spektraCudaGaussianBlurX(
+              static_cast<const float *>(destinationDevice_.pointer),
+              static_cast<float *>(scratchDeviceA_.pointer),
+              width,
+              height,
+              kp.scannerUnsharpSigmaPx,
+              &passMs,
+              error.data(),
+              error.size())) {
+          lastError_ = error.data();
+          return false;
+        }
+        recordCudaPass("cuda_unsharp_blur_x", passMs, 1u, static_cast<uint64_t>(bytes) * 2u);
+        kernelMs += passMs;
+
+        passMs = 0.0f;
+        if (!spektraCudaGaussianBlurY(
+              static_cast<const float *>(scratchDeviceA_.pointer),
+              static_cast<float *>(scratchDeviceB_.pointer),
+              width,
+              height,
+              kp.scannerUnsharpSigmaPx,
+              &passMs,
+              error.data(),
+              error.size())) {
+          lastError_ = error.data();
+          return false;
+        }
+        recordCudaPass("cuda_unsharp_blur_y", passMs, 1u, static_cast<uint64_t>(bytes) * 2u);
+        kernelMs += passMs;
+        unsharpDevice = static_cast<const float *>(scratchDeviceB_.pointer);
+      }
+
+      passMs = 0.0f;
+      if (!spektraCudaScannerFinalize(
+            static_cast<const float *>(destinationDevice_.pointer),
+            unsharpDevice,
+            static_cast<float *>(destinationDevice_.pointer),
+            width,
+            height,
+            static_cast<const KernelParams *>(paramsDevice_.pointer),
+            static_cast<const KernelColorInfo *>(colorInfoDevice_.pointer),
+            static_cast<const float *>(colorEncodeLutDevice_.pointer),
+            static_cast<const uint32_t *>(colorTransferKindDevice_.pointer),
+            &passMs,
+            error.data(),
+            error.size())) {
+        lastError_ = error.data();
+        return false;
+      }
+      recordCudaPass("cuda_scanner_finalize", passMs, 1u, static_cast<uint64_t>(bytes) * 2u);
+      kernelMs += passMs;
+      diagnostics_.finalPostProcessPath = true;
+      return true;
+    };
+    if (finalProcessNegative) {
+      float *printRawDevice = static_cast<float *>(scratchDeviceA_.pointer);
+      passMs = 0.0f;
+      if (!spektraCudaPrintRawFromNegativeLight(
+            sourceFrameDevice,
+            printRawDevice,
+            width,
+            height,
+            static_cast<const KernelParams *>(paramsDevice_.pointer),
+            static_cast<const KernelSpectralInfo *>(spectralInfoDevice_.pointer),
+            static_cast<const KernelColorInfo *>(colorInfoDevice_.pointer),
+            static_cast<const float *>(colorDecodeLutDevice_.pointer),
+            static_cast<const uint32_t *>(colorTransferKindDevice_.pointer),
+            static_cast<const float *>(inputToReferenceXyzDevice_.pointer),
+            static_cast<const float *>(paperHanatosResponseDevice_.pointer),
+            static_cast<const float *>(preflashPaperHanatosResponseDevice_.pointer),
+            static_cast<const float *>(academyPrinterDensityDataDevice_.pointer),
+            &passMs,
+            error.data(),
+            error.size())) {
+        lastError_ = error.data();
+        return false;
+      }
+      recordCudaPass("cuda_print_raw_from_negative_light", passMs, 1u, static_cast<uint64_t>(bytes) * 2u);
+      kernelMs += passMs;
+
+      if (printDiffusionPath) {
+        if (!dispatchDiffusion(
+              "cuda_print",
+              printRawDevice,
+              static_cast<float *>(destinationDevice_.pointer),
+              static_cast<float *>(sourceDevice_.pointer),
+              printRawDevice,
+              static_cast<const KernelDiffusionInfo *>(printDiffusionInfoDevice_.pointer),
+              static_cast<const KernelDiffusionComponent *>(printDiffusionComponentsDevice_.pointer),
+              printDiffusionComponents)) {
+          return false;
+        }
+      }
+
+      const bool scannerPostPath = params.scannerEnabled && !rcmOutput;
+      passMs = 0.0f;
+      if (!spektraCudaFinalFromPrintRaw(
+            printRawDevice,
+            static_cast<float *>(destinationDevice_.pointer),
+            width,
+            height,
+            static_cast<const KernelParams *>(paramsDevice_.pointer),
+            static_cast<const KernelSpectralInfo *>(spectralInfoDevice_.pointer),
+            static_cast<const KernelColorInfo *>(colorInfoDevice_.pointer),
+            static_cast<const KernelCurveInfo *>(curveInfoDevice_.pointer),
+            static_cast<const KernelCurveInfo *>(paperCurveInfoDevice_.pointer),
+            static_cast<const float *>(logExposureDevice_.pointer),
+            static_cast<const float *>(densityCurvesDevice_.pointer),
+            static_cast<const float *>(paperLogExposureDevice_.pointer),
+            static_cast<const float *>(paperDensityCurvesDevice_.pointer),
+            static_cast<const float *>(filmChannelDensityDevice_.pointer),
+            static_cast<const float *>(filmBaseDensityDevice_.pointer),
+            static_cast<const float *>(paperLogSensitivityDevice_.pointer),
+            static_cast<const float *>(thKg3IlluminantDevice_.pointer),
+            static_cast<const float *>(customEnlargerFiltersDevice_.pointer),
+            static_cast<const float *>(neutralPrintFiltersDevice_.pointer),
+            static_cast<const float *>(academyPrinterDensityDataDevice_.pointer),
+            static_cast<const float *>(paperScanDensityDataDevice_.pointer),
+            static_cast<const float *>(scanIlluminantsAndCmfsDevice_.pointer),
+            static_cast<const float *>(scanToOutputRgbDataDevice_.pointer),
+            static_cast<const float *>(colorEncodeLutDevice_.pointer),
+            static_cast<const uint32_t *>(colorTransferKindDevice_.pointer),
+            static_cast<const float *>(hanatosRawResponseDevice_.pointer),
+            static_cast<const float *>(mallettBasisIlluminantDevice_.pointer),
+            static_cast<const float *>(inputToReferenceXyzDevice_.pointer),
+            !scannerPostPath,
+            &passMs,
+            error.data(),
+            error.size())) {
+        lastError_ = error.data();
+        return false;
+      }
+      recordCudaPass("cuda_final_from_process_negative", passMs, 1u, static_cast<uint64_t>(bytes) * 2u);
+      kernelMs += passMs;
+      if (scannerPostPath && !dispatchScannerPost(kernelParams.glarePercent > 0.0f)) {
+        return false;
+      }
+    } else {
     // pre-development work: film-plane transform, exposure, camera diffusion and halation
-    const bool useEnlarger = enlargerTransformActive(params);
+    const bool useEnlarger = !finalProcessNegative && enlargerTransformActive(params);
     const float *rawSourceDevice = sourceFrameDevice;
     float *rawDevice = static_cast<float *>(scratchDeviceA_.pointer);
     if (useEnlarger) {
@@ -2408,7 +2690,7 @@ bool CudaRenderer::renderCudaOwned(
       }
       if (finalOutput) {
         passMs = 0.0f;
-        const bool scannerPostPath = params.scannerEnabled;
+        const bool scannerPostPath = params.scannerEnabled && !rcmOutput;
         if (printDiffusionPath) {
           float *printRawDevice = static_cast<float *>(scratchDeviceA_.pointer);
           if (!spektraCudaPrintRawFromFilmDensity(
@@ -2862,6 +3144,7 @@ bool CudaRenderer::renderCudaOwned(
           diagnostics_.finalPostProcessPath = true;
         }
       }
+    }
     }
   }
   {

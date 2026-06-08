@@ -22,7 +22,7 @@ struct KernelParams {
   float hdrPeakNits;
   float hdrExposureEv;
   int32_t hdrToneMapping;
-  uint32_t _padColor0;
+  uint32_t colorAdaptationFlags;
   int32_t film;
   int32_t paper;
   int32_t printTiming;
@@ -43,7 +43,7 @@ struct KernelParams {
   float negativeBleachBypassAmount;
   float negativeLeucoCyanCoupling;
   float printBleachBypassAmount;
-  float _padBleachBypass1;
+  uint32_t scanNegativeInvert;
   float filterC;
   float filterMShift;
   float filterYShift;
@@ -250,6 +250,8 @@ struct KernelFrameConstants {
   float film[4] = {};
   float glare[4] = {};
   float preflash[4] = {};
+  float filmDmaxScan[4] = {};
+  float filmDminScan[4] = {};
 };
 
 static_assert(sizeof(KernelCurveInfo) == 16u);
@@ -259,7 +261,7 @@ static_assert(sizeof(KernelDiffusionInfo) == 16u);
 static_assert(sizeof(KernelDiffusionComponent) == 16u);
 static_assert(sizeof(KernelDirInfo) == 48u);
 static_assert(sizeof(KernelGaussianBlurInfo) == 32u);
-static_assert(sizeof(KernelFrameConstants) == 64u);
+static_assert(sizeof(KernelFrameConstants) == 96u);
 
 struct StaticProfileResourceData {
   int32_t film = -1;
@@ -269,6 +271,12 @@ struct StaticProfileResourceData {
   float cameraUvCutNm = 410.0f;
   bool cameraIrFilterEnabled = false;
   float cameraIrCutNm = 675.0f;
+  PrintTimingMode processNegativePrintTiming = PrintTimingMode::FilteredEnlarger;
+  float processNegativeFilterC = 0.0f;
+  float processNegativeFilterMShift = 0.0f;
+  float processNegativeFilterYShift = 0.0f;
+  float processNegativePreflashMFilterShift = 0.0f;
+  float processNegativePreflashYFilterShift = 0.0f;
   const ProfileCurveSet *filmCurves = nullptr;
   const ProfileCurveSet *paperCurves = nullptr;
   KernelCurveInfo curveInfo{};
@@ -281,6 +289,8 @@ struct StaticProfileResourceData {
   std::vector<float> logSensitivity;
   std::vector<float> bandpassHanatos;
   std::vector<float> hanatosRawResponse;
+  std::vector<float> paperHanatosResponse;
+  std::vector<float> preflashPaperHanatosResponse;
   std::array<float, 9> mallettBasisIlluminant{};
   std::vector<float> inputToReferenceXyz;
   std::vector<float> inputToSrgb;

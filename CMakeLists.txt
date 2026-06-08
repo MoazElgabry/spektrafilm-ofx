@@ -58,6 +58,7 @@ option(SPEKTRAFILM_METAL_PROFILE_SOURCES "Build Metal shader library with source
 option(SPEKTRAFILM_OFX_METAL_GPU_BUFFERS "Advertise OFX Metal GPU buffer renders on macOS. CPU rendering remains the fallback." ON)
 option(SPEKTRAFILM_RELEASE_LTO "Enable interprocedural optimization for Release native targets when supported." ON)
 option(SPEKTRAFILM_LINUX_STATIC_STDLIB "Static-link the Linux OFX plugin C++ runtime to avoid host stdlib symbol interposition." ON)
+option(SPEKTRAFILM_ENABLE_CUDA "Build the optional Windows CUDA backend. Vulkan remains the default Windows backend." OFF)
 set(SPEKTRAFILM_METAL_LANGUAGE_STANDARD "macos-metal2.3" CACHE STRING "Metal language standard used to build SpektraFilm.metallib.")
 set(SPEKTRAFILM_METAL_OPTIMIZATION_LEVEL "-O3" CACHE STRING "Optimization level passed to the Metal shader compiler.")
 set(SPEKTRAFILM_METAL_EXTRA_FLAGS "" CACHE STRING "Extra flags passed to the Metal shader compiler.")
@@ -305,7 +306,7 @@ if(APPLE)
 
   add_custom_target(SpektraFilmMetalLibrary ALL DEPENDS "${SPEKTRAFILM_METALLIB}")
 elseif(SPEKTRAFILM_USE_VULKAN)
-  if(WIN32)
+  if(WIN32 AND SPEKTRAFILM_ENABLE_CUDA)
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -allow-unsupported-compiler")
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
@@ -329,6 +330,10 @@ elseif(SPEKTRAFILM_USE_VULKAN)
   if(WIN32)
     list(PREPEND SPEKTRAFILM_PLATFORM_RENDERER_SOURCES
       src/SpektraNativeRenderer.cpp
+    )
+  endif()
+  if(WIN32 AND SPEKTRAFILM_ENABLE_CUDA)
+    list(PREPEND SPEKTRAFILM_PLATFORM_RENDERER_SOURCES
       src/SpektraCudaRenderer.cpp
       src/SpektraCudaKernels.cu
     )
@@ -471,7 +476,7 @@ function(configure_spektra_target target artifact_name display_name plugin_id fl
   set(SPEKTRAFILM_MANIFEST_VERSION "${SPEKTRAFILM_VERSION}")
   if(APPLE)
     set(SPEKTRAFILM_MANIFEST_RENDERER "Metal")
-  elseif(WIN32)
+  elseif(WIN32 AND SPEKTRAFILM_ENABLE_CUDA)
     set(SPEKTRAFILM_MANIFEST_RENDERER "CUDA/Vulkan")
   else()
     set(SPEKTRAFILM_MANIFEST_RENDERER "Vulkan")
@@ -505,19 +510,23 @@ function(configure_spektra_target target artifact_name display_name plugin_id fl
         NOMINMAX
         WIN32_LEAN_AND_MEAN
         _CRT_SECURE_NO_WARNINGS
-        SPEKTRAFILM_ENABLE_CUDA=1
       )
+      if(SPEKTRAFILM_ENABLE_CUDA)
+        target_compile_definitions(${target} PRIVATE SPEKTRAFILM_ENABLE_CUDA=1)
+      endif()
     endif()
     target_link_libraries(${target} PRIVATE
       Vulkan::Vulkan
     )
     if(WIN32)
       target_link_libraries(${target} PRIVATE shell32 user32)
-      target_link_libraries(${target} PRIVATE ${SPEKTRAFILM_CUDA_RUNTIME_TARGET})
-      set_target_properties(${target} PROPERTIES
-        CUDA_SEPARABLE_COMPILATION OFF
-        CUDA_RESOLVE_DEVICE_SYMBOLS ON
-      )
+      if(SPEKTRAFILM_ENABLE_CUDA)
+        target_link_libraries(${target} PRIVATE ${SPEKTRAFILM_CUDA_RUNTIME_TARGET})
+        set_target_properties(${target} PROPERTIES
+          CUDA_SEPARABLE_COMPILATION OFF
+          CUDA_RESOLVE_DEVICE_SYMBOLS ON
+        )
+      endif()
     elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
       target_compile_options(${target} PRIVATE
         -fvisibility=hidden
@@ -1036,7 +1045,7 @@ if(APPLE)
     VERBATIM
   )
 elseif(SPEKTRAFILM_USE_VULKAN)
-  if(WIN32)
+  if(WIN32 AND SPEKTRAFILM_ENABLE_CUDA)
     add_executable(SpektraCudaHarness
       tools/SpektraCudaHarness.cpp
       src/SpektraRenderCore.cpp

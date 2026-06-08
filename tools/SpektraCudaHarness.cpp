@@ -42,6 +42,15 @@ bool validOutput(const std::vector<float> &pixels, const char *label) {
   return true;
 }
 
+bool hasPass(const spektrafilm::RendererDiagnostics &diagnostics, const std::string &name) {
+  for (const auto &pass : diagnostics.passes) {
+    if (pass.name == name) {
+      return true;
+    }
+  }
+  return false;
+}
+
 spektrafilm::RenderParams baseParams() {
   spektrafilm::RenderParams params{};
   params.inputColorSpace = spektrafilm::ColorSpace::DavinciIntermediateWideGamut;
@@ -137,6 +146,70 @@ bool renderSpatial(spektrafilm::Renderer &renderer, const std::vector<float> &so
     validOutput(destination, "spatial render");
 }
 
+bool renderProcessNegative(spektrafilm::Renderer &renderer, const std::vector<float> &source) {
+  std::vector<float> destination(source.size(), -1.0f);
+  const int32_t rowBytes = kWidth * kComponents * static_cast<int32_t>(sizeof(float));
+  const spektrafilm::ImageView src{source.data(), 0, 0, kWidth, kHeight, rowBytes, kComponents, 4};
+  const spektrafilm::MutableImageView dst{destination.data(), 0, 0, kWidth, kHeight, rowBytes, kComponents, 4};
+  const spektrafilm::RenderWindow window{0, 0, kWidth, kHeight};
+  spektrafilm::RenderParams params = baseParams();
+  params.process = spektrafilm::ProcessMode::ProcessNegative;
+  params.printDiffusionEnabled = true;
+  params.scannerEnabled = false;
+  if (!renderer.render(src, dst, window, params, 4.0)) {
+    std::cerr << "CUDA process-negative render failed: " << renderer.lastError() << "\n";
+    return false;
+  }
+  const auto &diagnostics = renderer.lastDiagnostics();
+  return hasPass(diagnostics, "cuda_print_raw_from_negative_light") &&
+    hasPass(diagnostics, "cuda_final_from_process_negative") &&
+    diagnostics.printDiffusionPath &&
+    validOutput(destination, "process-negative render");
+}
+
+bool renderRcmAces(spektrafilm::Renderer &renderer, const std::vector<float> &source) {
+  std::vector<float> destination(source.size(), -1.0f);
+  const int32_t rowBytes = kWidth * kComponents * static_cast<int32_t>(sizeof(float));
+  const spektrafilm::ImageView src{source.data(), 0, 0, kWidth, kHeight, rowBytes, kComponents, 4};
+  const spektrafilm::MutableImageView dst{destination.data(), 0, 0, kWidth, kHeight, rowBytes, kComponents, 4};
+  const spektrafilm::RenderWindow window{0, 0, kWidth, kHeight};
+  spektrafilm::RenderParams params = baseParams();
+  params.process = spektrafilm::ProcessMode::ScanNegative;
+  params.scanNegativeInvert = true;
+  params.outputRole = spektrafilm::OutputRole::Rcm;
+  params.outputColorSpace = spektrafilm::ColorSpace::AcesCg;
+  params.scannerEnabled = false;
+  if (!renderer.render(src, dst, window, params, 5.0)) {
+    std::cerr << "CUDA RCM/ACES render failed: " << renderer.lastError() << "\n";
+    return false;
+  }
+  const auto &diagnostics = renderer.lastDiagnostics();
+  return diagnostics.backendName == "cuda" && diagnostics.passCount > 1 &&
+    validOutput(destination, "rcm aces render");
+}
+
+bool renderColorAdaptation(spektrafilm::Renderer &renderer, const std::vector<float> &source) {
+  std::vector<float> destination(source.size(), -1.0f);
+  const int32_t rowBytes = kWidth * kComponents * static_cast<int32_t>(sizeof(float));
+  const spektrafilm::ImageView src{source.data(), 0, 0, kWidth, kHeight, rowBytes, kComponents, 4};
+  const spektrafilm::MutableImageView dst{destination.data(), 0, 0, kWidth, kHeight, rowBytes, kComponents, 4};
+  const spektrafilm::RenderWindow window{0, 0, kWidth, kHeight};
+  spektrafilm::RenderParams params = baseParams();
+  params.colorAdaptation = true;
+  params.colorAdaptationInputCompression = true;
+  params.colorAdaptationCurveSmoothing = true;
+  params.colorAdaptationOutputLightnessCompression = true;
+  params.colorAdaptationOutputChromaCompression = true;
+  params.outputColorSpace = spektrafilm::ColorSpace::Srgb;
+  if (!renderer.render(src, dst, window, params, 6.0)) {
+    std::cerr << "CUDA color-adaptation render failed: " << renderer.lastError() << "\n";
+    return false;
+  }
+  const auto &diagnostics = renderer.lastDiagnostics();
+  return diagnostics.backendName == "cuda" && diagnostics.passCount > 1 &&
+    validOutput(destination, "color-adaptation render");
+}
+
 } // namespace
 
 int main() {
@@ -151,7 +224,12 @@ int main() {
   }
 
   const std::vector<float> source = makeSource();
-  if (!renderHost(*renderer, source) || !renderDevice(*renderer, source) || !renderSpatial(*renderer, source)) {
+  if (!renderHost(*renderer, source) ||
+      !renderDevice(*renderer, source) ||
+      !renderSpatial(*renderer, source) ||
+      !renderProcessNegative(*renderer, source) ||
+      !renderRcmAces(*renderer, source) ||
+      !renderColorAdaptation(*renderer, source)) {
     return 2;
   }
 

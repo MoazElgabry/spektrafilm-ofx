@@ -648,6 +648,25 @@ bool spektraCudaPrintRawFromFilmDensity(
   size_t errorSize
 );
 
+bool spektraCudaPrintRawFromNegativeLight(
+  const float *source,
+  float *printRaw,
+  int width,
+  int height,
+  const KernelParams *params,
+  const KernelSpectralInfo *spectralInfo,
+  const KernelColorInfo *colorInfo,
+  const float *colorDecodeLut,
+  const uint32_t *colorTransferKind,
+  const float *inputToReferenceXyz,
+  const float *paperHanatosResponse,
+  const float *preflashPaperHanatosResponse,
+  const float *academyPrinterDensityData,
+  float *kernelMs,
+  char *error,
+  size_t errorSize
+);
+
 bool spektraCudaPrintDensityFromPrintRaw(
   const float *printRaw,
   float *printDensity,

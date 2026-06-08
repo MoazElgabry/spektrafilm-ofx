@@ -292,6 +292,294 @@ std::vector<float> makeHanatosRawResponse(
   return response;
 }
 
+float reinhardKneeCpu(float value, float kneeStart, float kneeEnd, float strength) {
+  if (value <= kneeStart) {
+    return value;
+  }
+  const float span = std::max(kneeEnd - kneeStart, 1.0e-6f);
+  const float x = (value - kneeStart) / span;
+  return kneeStart + span * (x / (1.0f + std::max(strength, 0.0f) * x));
+}
+
+std::array<float, 2> filmReferenceIlluminantXyCpu(const ProfileCurveSet &filmCurves) {
+  const float *cmfs = standardObserverCmfs();
+  if (!filmCurves.referenceIlluminantSpectrum || !cmfs) {
+    return {0.3127f, 0.3290f};
+  }
+  std::array<float, 3> xyz = {0.0f, 0.0f, 0.0f};
+  for (uint32_t wavelength = 0u; wavelength < filmCurves.wavelengthCount; ++wavelength) {
+    const uint32_t offset = wavelength * 3u;
+    const float illuminant = filmCurves.referenceIlluminantSpectrum[wavelength];
+    xyz[0] += illuminant * cmfs[offset];
+    xyz[1] += illuminant * cmfs[offset + 1u];
+    xyz[2] += illuminant * cmfs[offset + 2u];
+  }
+  const float sum = xyz[0] + xyz[1] + xyz[2];
+  if (!(sum > 1.0e-12f) || !std::isfinite(sum)) {
+    return {0.3127f, 0.3290f};
+  }
+  return {xyz[0] / sum, xyz[1] / sum};
+}
+
+std::vector<std::array<float, 2>> spectralLocusXyCpu(const ProfileCurveSet &filmCurves) {
+  std::vector<std::array<float, 2>> locus;
+  const float *cmfs = standardObserverCmfs();
+  if (!filmCurves.wavelengths || !cmfs) {
+    return locus;
+  }
+  for (uint32_t wavelength = 0u; wavelength < filmCurves.wavelengthCount; ++wavelength) {
+    if (filmCurves.wavelengths[wavelength] > 700.0f + 1.0e-4f) {
+      continue;
+    }
+    const uint32_t offset = wavelength * 3u;
+    const float x = cmfs[offset];
+    const float y = cmfs[offset + 1u];
+    const float z = cmfs[offset + 2u];
+    const float sum = x + y + z;
+    if (sum > 1.0e-12f && std::isfinite(sum)) {
+      locus.push_back({x / sum, y / sum});
+    }
+  }
+  if (!locus.empty()) {
+    locus.push_back(locus.front());
+  }
+  return locus;
+}
+
+float rayPolygonDistanceCpu(
+  std::array<float, 2> origin,
+  std::array<float, 2> direction,
+  const std::vector<std::array<float, 2>> &polygon
+) {
+  float tMin = INFINITY;
+  for (size_t edgeIndex = 0u; edgeIndex + 1u < polygon.size(); ++edgeIndex) {
+    const float ax = polygon[edgeIndex][0];
+    const float ay = polygon[edgeIndex][1];
+    const float ex = polygon[edgeIndex + 1u][0] - ax;
+    const float ey = polygon[edgeIndex + 1u][1] - ay;
+    const float denom = direction[0] * ey - direction[1] * ex;
+    if (std::abs(denom) <= 1.0e-12f) {
+      continue;
+    }
+    const float ox = origin[0] - ax;
+    const float oy = origin[1] - ay;
+    const float t = (-ox * ey + oy * ex) / denom;
+    const float s = (-ox * direction[1] + oy * direction[0]) / denom;
+    if (t > 1.0e-9f && s >= 0.0f && s <= 1.0f && t < tMin) {
+      tMin = t;
+    }
+  }
+  return tMin;
+}
+
+std::array<float, 2> compressXyRadialCpu(
+  std::array<float, 2> xy,
+  std::array<float, 2> whiteXy,
+  const std::vector<std::array<float, 2>> &locus
+) {
+  const float dx = xy[0] - whiteXy[0];
+  const float dy = xy[1] - whiteXy[1];
+  const float distance = std::sqrt(dx * dx + dy * dy);
+  if (!(distance > 1.0e-9f) || locus.size() < 4u) {
+    return xy;
+  }
+  const std::array<float, 2> direction = {dx / distance, dy / distance};
+  const float boundary = rayPolygonDistanceCpu(whiteXy, direction, locus);
+  if (!(boundary > 1.0e-12f) || !std::isfinite(boundary)) {
+    return xy;
+  }
+  const float normalized = distance / boundary;
+  const float compressed = reinhardKneeCpu(normalized, 0.0f, 1.0f, 6.0f);
+  const float newDistance = compressed * boundary;
+  return {whiteXy[0] + direction[0] * newDistance, whiteXy[1] + direction[1] * newDistance};
+}
+
+std::array<float, 3> sampleHanatosResponseBilinearCpu(
+  const std::vector<float> &response,
+  const HanatosSpectraLutInfo &hanatos,
+  float x,
+  float y
+) {
+  x = std::clamp(x, 0.0f, static_cast<float>(hanatos.width - 1u));
+  y = std::clamp(y, 0.0f, static_cast<float>(hanatos.height - 1u));
+  const uint32_t x0 = static_cast<uint32_t>(std::floor(x));
+  const uint32_t y0 = static_cast<uint32_t>(std::floor(y));
+  const uint32_t x1 = std::min(x0 + 1u, hanatos.width - 1u);
+  const uint32_t y1 = std::min(y0 + 1u, hanatos.height - 1u);
+  const float tx = x - static_cast<float>(x0);
+  const float ty = y - static_cast<float>(y0);
+  const auto valueAt = [&](uint32_t xi, uint32_t yi) -> std::array<float, 3> {
+    const size_t offset = (static_cast<size_t>(xi) * hanatos.height + yi) * 3u;
+    return {response[offset], response[offset + 1u], response[offset + 2u]};
+  };
+  const std::array<float, 3> v00 = valueAt(x0, y0);
+  const std::array<float, 3> v10 = valueAt(x1, y0);
+  const std::array<float, 3> v01 = valueAt(x0, y1);
+  const std::array<float, 3> v11 = valueAt(x1, y1);
+  std::array<float, 3> out{};
+  for (uint32_t channel = 0u; channel < 3u; ++channel) {
+    const float a = v00[channel] + (v10[channel] - v00[channel]) * tx;
+    const float b = v01[channel] + (v11[channel] - v01[channel]) * tx;
+    out[channel] = a + (b - a) * ty;
+  }
+  return out;
+}
+
+std::vector<float> remapHanatosResponseForInputGamutCompressionCpu(
+  const ProfileCurveSet &filmCurves,
+  const std::vector<float> &baseResponse,
+  const HanatosSpectraLutInfo &hanatos
+) {
+  std::vector<float> remapped(baseResponse.size(), 0.0f);
+  if (hanatos.width < 2u || hanatos.height < 2u ||
+      baseResponse.size() < static_cast<size_t>(hanatos.width) * hanatos.height * 3u) {
+    return remapped;
+  }
+  const std::array<float, 2> whiteXy = filmReferenceIlluminantXyCpu(filmCurves);
+  const std::vector<std::array<float, 2>> locus = spectralLocusXyCpu(filmCurves);
+  if (locus.size() < 4u) {
+    return baseResponse;
+  }
+  for (uint32_t x = 0u; x < hanatos.width; ++x) {
+    const float tx = static_cast<float>(x) / static_cast<float>(hanatos.width - 1u);
+    const float rootTx = std::sqrt(std::max(tx, 0.0f));
+    for (uint32_t y = 0u; y < hanatos.height; ++y) {
+      const float ty = static_cast<float>(y) / static_cast<float>(hanatos.height - 1u);
+      const std::array<float, 2> xy = {1.0f - rootTx, ty * rootTx};
+      const std::array<float, 2> compressedXy = compressXyRadialCpu(xy, whiteXy, locus);
+      const float oneMinusX = std::max(1.0f - compressedXy[0], 1.0e-10f);
+      const float sampleTx = std::clamp(oneMinusX * oneMinusX, 0.0f, 1.0f);
+      const float sampleTy = std::clamp(compressedXy[1] / oneMinusX, 0.0f, 1.0f);
+      const std::array<float, 3> sampled = sampleHanatosResponseBilinearCpu(
+        baseResponse,
+        hanatos,
+        sampleTx * static_cast<float>(hanatos.width - 1u),
+        sampleTy * static_cast<float>(hanatos.height - 1u));
+      const size_t offset = (static_cast<size_t>(x) * hanatos.height + y) * 3u;
+      remapped[offset] = sampled[0];
+      remapped[offset + 1u] = sampled[1];
+      remapped[offset + 2u] = sampled[2];
+    }
+  }
+  return remapped;
+}
+
+std::vector<float> packHanatosResponsePairCpu(
+  const std::vector<float> &response,
+  const std::vector<float> &compressed
+) {
+  std::vector<float> packed;
+  packed.reserve((response.size() + compressed.size()) / 3u * 3u);
+  packed.insert(packed.end(), response.begin(), response.end());
+  packed.insert(packed.end(), compressed.begin(), compressed.end());
+  return packed;
+}
+
+std::vector<float> makeHanatosResponseFromWeights(
+  const std::vector<float> &spectralWeights,
+  const std::vector<float> &hanatosSpectra,
+  const HanatosSpectraLutInfo &hanatos
+) {
+  const size_t responseCount =
+    static_cast<size_t>(hanatos.width) * static_cast<size_t>(hanatos.height) * 3u;
+  std::vector<float> response(responseCount, 0.0f);
+  const size_t expectedSpectra =
+    static_cast<size_t>(hanatos.width) * static_cast<size_t>(hanatos.height) *
+    static_cast<size_t>(hanatos.wavelengthCount);
+  if (hanatos.width == 0u || hanatos.height == 0u || hanatos.wavelengthCount == 0u ||
+      hanatosSpectra.size() < expectedSpectra ||
+      spectralWeights.size() < static_cast<size_t>(hanatos.wavelengthCount) * 3u) {
+    return response;
+  }
+  for (uint32_t x = 0u; x < hanatos.width; ++x) {
+    for (uint32_t y = 0u; y < hanatos.height; ++y) {
+      const size_t spectraOffset =
+        (static_cast<size_t>(x) * hanatos.height + y) * hanatos.wavelengthCount;
+      const size_t responseOffset = (static_cast<size_t>(x) * hanatos.height + y) * 3u;
+      for (uint32_t wavelength = 0u; wavelength < hanatos.wavelengthCount; ++wavelength) {
+        const float spectrum = hanatosSpectra[spectraOffset + wavelength];
+        const uint32_t weightOffset = wavelength * 3u;
+        response[responseOffset] += spectrum * spectralWeights[weightOffset];
+        response[responseOffset + 1u] += spectrum * spectralWeights[weightOffset + 1u];
+        response[responseOffset + 2u] += spectrum * spectralWeights[weightOffset + 2u];
+      }
+    }
+  }
+  return response;
+}
+
+float filteredEnlargerIlluminantCpu(
+  uint32_t wavelength,
+  const RenderParams &params,
+  float cFilter,
+  float mFilterShift,
+  float yFilterShift
+) {
+  const uint32_t film = std::min<uint32_t>(
+    static_cast<uint32_t>(std::max(params.film, 0)),
+    std::max<uint32_t>(kSpektraFilmCount, 1u) - 1u);
+  const uint32_t paper = std::min<uint32_t>(
+    static_cast<uint32_t>(std::max(params.paper, 0)),
+    std::max<uint32_t>(kSpektraPaperCount, 1u) - 1u);
+  const uint32_t neutralOffset = (paper * kSpektraFilmCount + film) * 3u;
+  const float *neutral = neutralPrintFilters();
+  const float cc0 = std::max(neutral[neutralOffset] + cFilter, 0.0f);
+  const float cc1 = std::max(neutral[neutralOffset + 1u] + mFilterShift, 0.0f);
+  const float cc2 = std::max(neutral[neutralOffset + 2u] + yFilterShift, 0.0f);
+  const float wheel0 = std::pow(10.0f, -cc0 / 100.0f);
+  const float wheel1 = std::pow(10.0f, -cc1 / 100.0f);
+  const float wheel2 = std::pow(10.0f, -cc2 / 100.0f);
+  const uint32_t offset = wavelength * 3u;
+  const float *filters = customEnlargerFilters();
+  const float dim0 = 1.0f - (1.0f - std::clamp(filters[offset], 0.0f, 1.0f)) * (1.0f - wheel0);
+  const float dim1 = 1.0f - (1.0f - std::clamp(filters[offset + 1u], 0.0f, 1.0f)) * (1.0f - wheel1);
+  const float dim2 = 1.0f - (1.0f - std::clamp(filters[offset + 2u], 0.0f, 1.0f)) * (1.0f - wheel2);
+  return thKg3Illuminant()[wavelength] * dim0 * dim1 * dim2;
+}
+
+std::vector<float> makeProcessNegativePaperWeights(
+  const ProfileCurveSet &paperCurves,
+  const std::vector<float> &paperSensitivityLinear,
+  const RenderParams &params,
+  bool preflash
+) {
+  std::vector<float> weights(static_cast<size_t>(paperCurves.wavelengthCount) * 3u, 0.0f);
+  if (paperSensitivityLinear.size() < weights.size()) {
+    return weights;
+  }
+  if (params.printTiming == PrintTimingMode::ApdPrinterDensity) {
+    std::array<float, 3> normalization = {0.0f, 0.0f, 0.0f};
+    for (uint32_t wavelength = 0u; wavelength < paperCurves.wavelengthCount; ++wavelength) {
+      const uint32_t offset = wavelength * 3u;
+      for (uint32_t channel = 0u; channel < 3u; ++channel) {
+        normalization[channel] += std::max(academyPrinterDensityData()[offset + channel], 0.0f);
+      }
+    }
+    const float scale = preflash ? std::max(params.preflashExposure, 0.0f) : 1.0f;
+    for (uint32_t wavelength = 0u; wavelength < paperCurves.wavelengthCount; ++wavelength) {
+      const uint32_t offset = wavelength * 3u;
+      for (uint32_t channel = 0u; channel < 3u; ++channel) {
+        weights[offset + channel] =
+          scale * std::max(academyPrinterDensityData()[offset + channel], 0.0f) /
+          std::max(normalization[channel], 1.0e-10f);
+      }
+    }
+    return weights;
+  }
+  const float cFilter = preflash ? 0.0f : params.filterC;
+  const float mFilter = preflash ? params.preflashMFilterShift : params.filterMShift;
+  const float yFilter = preflash ? params.preflashYFilterShift : params.filterYShift;
+  const float scale = preflash ? std::max(params.preflashExposure, 0.0f) : 1.0f;
+  for (uint32_t wavelength = 0u; wavelength < paperCurves.wavelengthCount; ++wavelength) {
+    const uint32_t offset = wavelength * 3u;
+    const float illuminant = filteredEnlargerIlluminantCpu(wavelength, params, cFilter, mFilter, yFilter);
+    weights[offset] = scale * illuminant * paperSensitivityLinear[offset];
+    weights[offset + 1u] = scale * illuminant * paperSensitivityLinear[offset + 1u];
+    weights[offset + 2u] = scale * illuminant * paperSensitivityLinear[offset + 2u];
+  }
+  return weights;
+}
+
 std::array<float, 3> densityCurveMaximums(const ProfileCurveSet &curves) {
   std::array<float, 3> maxima = {0.0f, 0.0f, 0.0f};
   for (uint32_t channel = 0; channel < 3u; ++channel) {
@@ -617,6 +905,7 @@ KernelParams toKernelParams(const RenderParams &params, double time, int32_t wid
   out.hdrPeakNits = params.hdrPeakNits;
   out.hdrExposureEv = params.hdrExposureEv;
   out.hdrToneMapping = static_cast<int32_t>(params.hdrToneMapping);
+  out.colorAdaptationFlags = colorAdaptationFlags(params);
   out.film = params.film;
   out.paper = params.paper;
   out.printTiming = static_cast<int32_t>(params.printTiming);
@@ -632,6 +921,7 @@ KernelParams toKernelParams(const RenderParams &params, double time, int32_t wid
   out.negativeBleachBypassAmount = params.negativeBleachBypassAmount;
   out.negativeLeucoCyanCoupling = params.negativeLeucoCyanCoupling;
   out.printBleachBypassAmount = params.printBleachBypassAmount;
+  out.scanNegativeInvert = params.scanNegativeInvert ? 1u : 0u;
   out.filmGamma = params.filmPushPullMode == PushPullMode::Experimental
     ? params.filmGamma
     : params.filmGamma * filmPushPullGamma(params.filmPushPullStops);
@@ -907,6 +1197,14 @@ std::vector<float> makeDirCorrectedDensityCurves(
 }
 
 bool StaticProfileResourceData::validFor(const RenderParams &params) const {
+  const bool processNegativeResponseCached =
+    params.process != ProcessMode::ProcessNegative ||
+    (processNegativePrintTiming == params.printTiming &&
+     processNegativeFilterC == params.filterC &&
+     processNegativeFilterMShift == params.filterMShift &&
+     processNegativeFilterYShift == params.filterYShift &&
+     processNegativePreflashMFilterShift == params.preflashMFilterShift &&
+     processNegativePreflashYFilterShift == params.preflashYFilterShift);
   return film == params.film &&
          paper == params.paper &&
          rgbToRawMethod == params.rgbToRawMethod &&
@@ -914,6 +1212,7 @@ bool StaticProfileResourceData::validFor(const RenderParams &params) const {
          cameraUvCutNm == params.cameraUvCutNm &&
          cameraIrFilterEnabled == params.cameraIrFilterEnabled &&
          cameraIrCutNm == params.cameraIrCutNm &&
+         processNegativeResponseCached &&
          filmCurves &&
          paperCurves &&
          !logExposure.empty() &&
@@ -922,6 +1221,8 @@ bool StaticProfileResourceData::validFor(const RenderParams &params) const {
          !logSensitivity.empty() &&
          !bandpassHanatos.empty() &&
          !hanatosRawResponse.empty() &&
+         !paperHanatosResponse.empty() &&
+         !preflashPaperHanatosResponse.empty() &&
          !inputToReferenceXyz.empty() &&
          !inputToSrgb.empty() &&
          !colorDecodeLut.empty() &&
@@ -1031,6 +1332,12 @@ bool buildStaticProfileResourceData(
   next.cameraUvCutNm = params.cameraUvCutNm;
   next.cameraIrFilterEnabled = params.cameraIrFilterEnabled;
   next.cameraIrCutNm = params.cameraIrCutNm;
+  next.processNegativePrintTiming = params.printTiming;
+  next.processNegativeFilterC = params.filterC;
+  next.processNegativeFilterMShift = params.filterMShift;
+  next.processNegativeFilterYShift = params.filterYShift;
+  next.processNegativePreflashMFilterShift = params.preflashMFilterShift;
+  next.processNegativePreflashYFilterShift = params.preflashYFilterShift;
   next.filmCurves = filmCurves;
   next.paperCurves = paperCurves;
   next.curveInfo = {filmCurves->exposureCount, 0u, 0u, 0u};
@@ -1082,13 +1389,32 @@ bool buildStaticProfileResourceData(
   const std::vector<float> paperSensitivityLinear =
     makeLinearSensitivity(paperCurves->logSensitivity, paperCurves->wavelengthCount);
   next.mallettBasisIlluminant = makeMallettRawMatrix(*filmCurves, filmSensitivityLinear);
-  next.hanatosRawResponse = makeHanatosRawResponse(
+  std::vector<float> hanatosRawResponse = makeHanatosRawResponse(
     *filmCurves,
     filmSensitivityLinear,
     hanatosSpectraData,
     hanatos,
     params.rgbToRawMethod
   );
+  next.hanatosRawResponse = packHanatosResponsePairCpu(
+    hanatosRawResponse,
+    remapHanatosResponseForInputGamutCompressionCpu(*filmCurves, hanatosRawResponse, hanatos));
+
+  std::vector<float> paperHanatosResponse = makeHanatosResponseFromWeights(
+    makeProcessNegativePaperWeights(*paperCurves, paperSensitivityLinear, params, false),
+    hanatosSpectraData,
+    hanatos);
+  next.paperHanatosResponse = packHanatosResponsePairCpu(
+    paperHanatosResponse,
+    remapHanatosResponseForInputGamutCompressionCpu(*paperCurves, paperHanatosResponse, hanatos));
+
+  std::vector<float> preflashPaperHanatosResponse = makeHanatosResponseFromWeights(
+    makeProcessNegativePaperWeights(*paperCurves, paperSensitivityLinear, params, true),
+    hanatosSpectraData,
+    hanatos);
+  next.preflashPaperHanatosResponse = packHanatosResponsePairCpu(
+    preflashPaperHanatosResponse,
+    remapHanatosResponseForInputGamutCompressionCpu(*paperCurves, preflashPaperHanatosResponse, hanatos));
 
   assignFloats(next.logExposure, filmCurves->logExposure, filmExposureCount);
   assignFloats(next.densityCurves, filmCurves->densityCurves, filmExposureCount * 3u);

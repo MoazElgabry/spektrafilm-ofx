@@ -99,6 +99,8 @@ private:
   DeviceBuffer colorInfoDevice_;
   DeviceBuffer curveInfoDevice_;
   DeviceBuffer hanatosRawResponseDevice_;
+  DeviceBuffer paperHanatosResponseDevice_;
+  DeviceBuffer preflashPaperHanatosResponseDevice_;
   DeviceBuffer mallettBasisIlluminantDevice_;
   DeviceBuffer inputToReferenceXyzDevice_;
   DeviceBuffer inputToSrgbDevice_;
@@ -122,6 +124,7 @@ private:
   DeviceBuffer colorEncodeLutDevice_;
   StaticProfileResourceData staticResources_;
   std::vector<float> hanatosSpectraData_;
+  std::vector<float> outputGamutCompressionData_;
   bool staticBuffersUploaded_ = false;
   PinnedHostBuffer pinnedSourceStaging_;
   PinnedHostBuffer pinnedDestinationStaging_;

@@ -1,6 +1,9 @@
 #include "SpektraRenderer.h"
-#include "SpektraCudaRenderer.h"
 #include "SpektraVulkanRenderer.h"
+
+#if defined(SPEKTRAFILM_ENABLE_CUDA)
+#include "SpektraCudaRenderer.h"
+#endif
 
 #include <algorithm>
 #include <cctype>
@@ -22,11 +25,13 @@ std::unique_ptr<Renderer> createNativeRenderer() {
     return createVulkanRenderer();
   }
 
+#if defined(SPEKTRAFILM_ENABLE_CUDA)
   // keep the fast path first; Vulkan stays around as the compatibility backend
   std::unique_ptr<Renderer> cuda = createCudaRenderer();
   if (requested == "cuda" || (cuda && cuda->isAvailable())) {
     return cuda;
   }
+#endif
 
   return createVulkanRenderer();
 }
