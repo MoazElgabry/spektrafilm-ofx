@@ -1075,6 +1075,7 @@ bool CudaRenderer::renderCudaOwned(
     }
   }
 
+  // Device frame begins here; host transfers stay outside the processing graph.
   const auto gpuWorkStart = std::chrono::steady_clock::now();
   float kernelMs = 0.0f;
   std::array<char, 512> error{};
@@ -1233,6 +1234,7 @@ bool CudaRenderer::renderCudaOwned(
     });
   } else {
     float passMs = 0.0f;
+    // Shared dispatch helpers keep spatial pass ordering in one place.
     auto recordCudaPass = [&](const char *name, float milliseconds, uint32_t depth, uint64_t trafficBytes) {
       diagnostics_.passes.push_back({
         name,
@@ -1615,6 +1617,7 @@ bool CudaRenderer::renderCudaOwned(
       diagnostics_.finalPostProcessPath = true;
       return true;
     };
+    // Process-negative skips film development and exposes the print stock directly.
     if (finalProcessNegative) {
       float *printRawDevice = static_cast<float *>(scratchDeviceA_.pointer);
       passMs = 0.0f;
@@ -1699,7 +1702,7 @@ bool CudaRenderer::renderCudaOwned(
         return false;
       }
     } else {
-    // pre-development work: film-plane transform, exposure, camera diffusion and halation
+    // Main film path: exposure and spatial effects before development.
     const bool useEnlarger = !finalProcessNegative && enlargerTransformActive(params);
     const float *rawSourceDevice = sourceFrameDevice;
     float *rawDevice = static_cast<float *>(scratchDeviceA_.pointer);
@@ -2259,6 +2262,7 @@ bool CudaRenderer::renderCudaOwned(
         filmDensityDevice = redevelopedDensityDevice;
       }
 
+      // Grain runs in density space before print/final conversion.
       if (productionGrainPath || grainSynthesisPath) {
         diagnostics_.productionGrainPath = productionGrainPath;
         diagnostics_.grainSynthesisPath = grainSynthesisPath;
@@ -2688,6 +2692,7 @@ bool CudaRenderer::renderCudaOwned(
         });
         kernelMs += passMs;
       }
+      // Final output chooses scan-negative or print simulation, then scanner post.
       if (finalOutput) {
         passMs = 0.0f;
         const bool scannerPostPath = params.scannerEnabled && !rcmOutput;
@@ -3188,6 +3193,7 @@ bool CudaRenderer::renderCudaOwned(
       });
       diagnostics_.cudaDeviceToHostMs = 0.0;
     } else {
+      // Host-image fallback only; Resolve CUDA images use the device unpack path above.
       cudaError_t status = cudaMemcpyAsync(destinationDownloadHost, destinationDevice_.pointer, bytes, cudaMemcpyDeviceToHost, 0);
       if (status == cudaSuccess) {
         status = cudaStreamSynchronize(0);

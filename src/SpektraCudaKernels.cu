@@ -30,7 +30,7 @@ void setError(char *error, size_t errorSize, const char *message, cudaError_t st
   }
 }
 
-// image bridge kernels: OFX rowBytes/origin/half conversion around internal float RGBA
+// Host image bridge: OFX rowBytes/origin/half around internal float RGBA.
 __global__ void copyFloatKernel(const float *source, float *destination, size_t floatCount) {
   const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (index < floatCount) {
@@ -336,6 +336,7 @@ __device__ float4 sampleFloat4Clamped(const float *source, int x, int y, int wid
   return make_float4(source[offset], source[offset + 1u], source[offset + 2u], source[offset + 3u]);
 }
 
+// Input and negative exposure setup.
 __global__ void enlargerResampleKernel(
   const float *source,
   float *destination,
@@ -1246,7 +1247,7 @@ __device__ bool rgbInBoundsCuda(float3 rgb, float lowerBound, float upperBound) 
     rgb.x <= upperBound + epsilon && rgb.y <= upperBound + epsilon && rgb.z <= upperBound + epsilon;
 }
 
-__device__ float solveOklchCmaxCuda(
+__device__ __noinline__ float solveOklchCmaxCuda(
   float3 lab,
   float chroma,
   float hueX,
@@ -1288,7 +1289,7 @@ __device__ float solveOklchCmaxCuda(
   return lo;
 }
 
-__device__ float3 outputGamutCompressOklchCuda(
+__device__ __noinline__ float3 outputGamutCompressOklchCuda(
   float3 rgb,
   uint32_t colorSpace,
   const KernelColorInfo &colorInfo,
@@ -1383,6 +1384,27 @@ __device__ float3 finalizeOutputRgb(
   const float *colorEncodeLut,
   const uint32_t *colorTransferKind
 ) {
+  // Common path: avoid the heavier OKLch helpers unless color adaptation is enabled.
+  if (params.colorAdaptationFlags == 0u) {
+    if (params.outputRole == 1) {
+      const float peak = fmaxf(params.hdrPeakNits, fmaxf(params.hdrReferenceWhiteNits, 1.0f) + 1.0f);
+      const float3 nits = hdrMapToNits(rgb, params);
+      return params.hdrTransfer == 1
+        ? hlgDisplayNitsToSignal(nits, peak)
+        : make_float3(encodePq(nits.x), encodePq(nits.y), encodePq(nits.z));
+    }
+    if (params.outputRole == 2) {
+      const int colorSpace = params.outputColorSpace;
+      const bool inverseOotf =
+        colorSpace == 2 || colorSpace == 3 ||
+        (colorSpace >= 10 && colorSpace <= 18) ||
+        (colorSpace >= 21 && colorSpace <= 25);
+      if (inverseOotf) {
+        rgb = applyInverseRcmOotf(rgb);
+      }
+    }
+    return encodeOutputRgb(rgb, params, colorInfo, colorEncodeLut, colorTransferKind);
+  }
   if (params.outputRole == 1) {
     const float peak = fmaxf(params.hdrPeakNits, fmaxf(params.hdrReferenceWhiteNits, 1.0f) + 1.0f);
     const bool compressLightness = colorAdaptationEnabled(params, kColorAdaptationOutputLightnessCompression);
@@ -1690,6 +1712,7 @@ __device__ float3 scanIlluminantToOutputRgb(
 }
 
 // film development and DIR density correction
+// Film curve development and retained-silver density work.
 __global__ void developFromRawKernel(
   const float *raw,
   float *density,
@@ -1831,6 +1854,7 @@ __device__ float4 dirGaussianSampleY(
   return mul4s(value, info.invWeightSum);
 }
 
+// DIR coupler correction and its blur tails.
 __global__ void dirCorrectionFromDensityKernel(
   const float *density,
   float *correction,
@@ -2034,6 +2058,7 @@ __global__ void dirRedevelopKernel(
 }
 
 // diffusion is a weighted set of separable Gaussian lobes, used by camera and print stages
+// Diffusion pass family: blur components, accumulate, resolve.
 __global__ void clearFrameKernel(float *destination, int pixelCount) {
   const int index = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (index >= pixelCount) {
@@ -2507,6 +2532,7 @@ __device__ float4 halationChannelGaussianSampleY(
 }
 
 // halation: highlight boost, scatter tail, then emulsion bounce
+// Halation pass family: boost, scatter, bounce, resolve back to raw.
 __global__ void halationBoostInfoKernel(
   const float *raw,
   float *boostInfo,
@@ -3367,6 +3393,7 @@ __device__ float4 grainFrameGaussian(
 }
 
 // grain paths start from film density; preview, production and synthesis resolve differently
+// Grain models: production layers, synthesis, microstructure, preview.
 __global__ void productionGrainLayersFromDensityKernel(
   const float *density,
   float *layers,
@@ -3793,6 +3820,7 @@ __global__ void previewGrainFromDensityKernel(
 }
 
 // print exposure/density, followed later by scanner and display encoding
+// Print path and final output encode.
 __global__ void printRawFromFilmDensityKernel(
   const float *filmDensity,
   float *printRaw,
@@ -4351,6 +4379,7 @@ __device__ float gaussianWeight(float offset, float sigma) {
   return expf(-0.5f * (offset * offset) / fmaxf(sigma * sigma, 1.0e-8f));
 }
 
+// Scanner and print-glare post pass.
 __global__ void gaussianBlurXKernel(const float *source, float *destination, int width, int height, float sigma) {
   const int index = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
   const int pixelCount = width * height;
