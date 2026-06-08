@@ -59,6 +59,30 @@ bool envFlag(const char *name) {
   return text == "1" || text == "on" || text == "true" || text == "yes";
 }
 
+bool defaultHalationStrengthSelected(const RenderParams &params) {
+  return std::abs(params.halationStrengthR - 0.05f) <= 1.0e-6f &&
+    std::abs(params.halationStrengthG - 0.015f) <= 1.0e-6f &&
+    std::abs(params.halationStrengthB) <= 1.0e-6f;
+}
+
+void applyProfileHalationDefaults(
+  KernelParams &kernelParams,
+  const RenderParams &params,
+  const ProfileCurveSet &filmCurves
+) {
+  // Generated stock data defines the default halation shape; explicit user strengths still win.
+  if (filmCurves.halationFirstSigmaUm) {
+    kernelParams.halationFirstSigmaUmR = filmCurves.halationFirstSigmaUm[0];
+    kernelParams.halationFirstSigmaUmG = filmCurves.halationFirstSigmaUm[1];
+    kernelParams.halationFirstSigmaUmB = filmCurves.halationFirstSigmaUm[2];
+  }
+  if (filmCurves.halationStrength && defaultHalationStrengthSelected(params)) {
+    kernelParams.halationStrengthR = filmCurves.halationStrength[0];
+    kernelParams.halationStrengthG = filmCurves.halationStrength[1];
+    kernelParams.halationStrengthB = filmCurves.halationStrength[2];
+  }
+}
+
 uint32_t diffusionGroupSizeFromEnv() {
   const char *value = std::getenv("SPEKTRAFILM_DIFFUSION_GROUP_SIZE");
   if (!value || !*value) {
@@ -672,10 +696,6 @@ bool CudaRenderer::cudaFilmPipelineEligible(const RenderParams &params, bool &de
     reason = "The requested output mode is not implemented by the Windows CUDA backend.";
     return false;
   }
-  if (params.dirCouplersAmount > 0.0f && logRawOutput) {
-    reason = "CUDA DIR is a density-stage feature and is bypassed for FilmLogRaw.";
-    return false;
-  }
   (void)finalOutput;
   return true;
 }
@@ -918,6 +938,9 @@ bool CudaRenderer::renderCudaOwned(
       return false;
     }
     kernelParams = toKernelParams(params, time, width, height);
+    if (staticResources_.filmCurves) {
+      applyProfileHalationDefaults(kernelParams, params, *staticResources_.filmCurves);
+    }
     if (params.autoExposure) {
       kernelParams.autoExposureEv = measureAutoExposureEv(sourceUploadHost, width, height, params);
     }
@@ -933,6 +956,7 @@ bool CudaRenderer::renderCudaOwned(
     if (!uploadDeviceStruct(paramsDevice_, kernelParams)) {
       return false;
     }
+    // DIR starts after development; keep FilmLogRaw on CUDA and simply bypass the density-only stage.
     dirPath = params.dirCouplersAmount > 0.0f && params.renderOutput != RenderOutputMode::FilmLogRaw;
     dirBlurPath = dirPath && kernelParams.dirCouplersDiffusionUm > 0.0f;
     dirTailPath = dirBlurPath &&
@@ -971,14 +995,14 @@ bool CudaRenderer::renderCudaOwned(
       makeCameraDiffusionComponents(params, kernelParams.filmPixelSizeUm, cameraDiffusionInfo);
     printDiffusionComponents =
       makePrintDiffusionComponents(params, kernelParams.filmPixelSizeUm, printDiffusionInfo);
+    // Camera diffusion works on raw exposure, so FilmLogRaw must include it before raw-to-log conversion.
     cameraDiffusionPath =
       !finalProcessNegative &&
       params.cameraDiffusionEnabled &&
       params.cameraDiffusionStrength > 0.0f &&
       params.cameraDiffusionSpatialScale > 0.0f &&
       cameraDiffusionInfo.componentCount > 0u &&
-      !cameraDiffusionComponents.empty() &&
-      params.renderOutput != RenderOutputMode::FilmLogRaw;
+      !cameraDiffusionComponents.empty();
     printDiffusionPath =
       params.printDiffusionEnabled &&
       params.printDiffusionStrength > 0.0f &&

@@ -51,6 +51,16 @@ bool hasPass(const spektrafilm::RendererDiagnostics &diagnostics, const std::str
   return false;
 }
 
+float maxRgbDifference(const std::vector<float> &a, const std::vector<float> &b) {
+  float maximum = 0.0f;
+  for (size_t offset = 0; offset + 2u < a.size() && offset + 2u < b.size(); offset += 4u) {
+    maximum = std::max(maximum, std::abs(a[offset] - b[offset]));
+    maximum = std::max(maximum, std::abs(a[offset + 1u] - b[offset + 1u]));
+    maximum = std::max(maximum, std::abs(a[offset + 2u] - b[offset + 2u]));
+  }
+  return maximum;
+}
+
 spektrafilm::RenderParams baseParams() {
   spektrafilm::RenderParams params{};
   params.inputColorSpace = spektrafilm::ColorSpace::DavinciIntermediateWideGamut;
@@ -146,6 +156,43 @@ bool renderSpatial(spektrafilm::Renderer &renderer, const std::vector<float> &so
     validOutput(destination, "spatial render");
 }
 
+bool renderCameraDiffusionFilmLog(spektrafilm::Renderer &renderer, const std::vector<float> &source) {
+  // Keep FilmLogRaw on the same camera-diffusion path as the Metal and Vulkan backends.
+  std::vector<float> baseline(source.size(), -1.0f);
+  std::vector<float> diffused(source.size(), -1.0f);
+  const int32_t rowBytes = kWidth * kComponents * static_cast<int32_t>(sizeof(float));
+  const spektrafilm::ImageView src{source.data(), 0, 0, kWidth, kHeight, rowBytes, kComponents, 4};
+  const spektrafilm::RenderWindow window{0, 0, kWidth, kHeight};
+  spektrafilm::RenderParams params = baseParams();
+  params.renderOutput = spektrafilm::RenderOutputMode::FilmLogRaw;
+  params.dirCouplersAmount = 0.3f;
+  params.cameraDiffusionEnabled = false;
+  spektrafilm::MutableImageView baselineDst{baseline.data(), 0, 0, kWidth, kHeight, rowBytes, kComponents, 4};
+  if (!renderer.render(src, baselineDst, window, params, 3.25)) {
+    std::cerr << "CUDA camera-diffusion baseline render failed: " << renderer.lastError() << "\n";
+    return false;
+  }
+
+  params.cameraDiffusionEnabled = true;
+  params.cameraDiffusionStrength = 1.0f;
+  params.cameraDiffusionSpatialScale = 1.0f;
+  spektrafilm::MutableImageView diffusedDst{diffused.data(), 0, 0, kWidth, kHeight, rowBytes, kComponents, 4};
+  if (!renderer.render(src, diffusedDst, window, params, 3.25)) {
+    std::cerr << "CUDA camera-diffusion FilmLogRaw render failed: " << renderer.lastError() << "\n";
+    return false;
+  }
+  const auto &diagnostics = renderer.lastDiagnostics();
+  const float difference = maxRgbDifference(baseline, diffused);
+  if (!diagnostics.cameraDiffusionPath ||
+      diagnostics.dirPath ||
+      !hasPass(diagnostics, "cuda_camera_diffusion_resolve") ||
+      difference <= 1.0e-6f) {
+    std::cerr << "CUDA camera diffusion did not affect FilmLogRaw. max_difference=" << difference << "\n";
+    return false;
+  }
+  return validOutput(diffused, "camera-diffusion FilmLogRaw render");
+}
+
 bool renderProcessNegative(spektrafilm::Renderer &renderer, const std::vector<float> &source) {
   std::vector<float> destination(source.size(), -1.0f);
   const int32_t rowBytes = kWidth * kComponents * static_cast<int32_t>(sizeof(float));
@@ -227,6 +274,7 @@ int main() {
   if (!renderHost(*renderer, source) ||
       !renderDevice(*renderer, source) ||
       !renderSpatial(*renderer, source) ||
+      !renderCameraDiffusionFilmLog(*renderer, source) ||
       !renderProcessNegative(*renderer, source) ||
       !renderRcmAces(*renderer, source) ||
       !renderColorAdaptation(*renderer, source)) {
