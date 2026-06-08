@@ -229,6 +229,7 @@ typedef struct SpektraAppRenderParams {
   float scannerMtf50LpMm;
   float scannerUnsharpRadiusUm;
   float scannerUnsharpAmount;
+  int32_t scanNegativeInvert;
 } SpektraAppRenderParams;
 
 typedef struct SpektraAppGroupDescriptor {
@@ -275,6 +276,11 @@ const SpektraAppParamDescriptor *SpektraAppParamAt(uint32_t index);
 int32_t SpektraAppParamVisibleInFlavor(const SpektraAppParamDescriptor *descriptor, int32_t flavor);
 uint32_t SpektraAppOptionCount(const char *optionSet);
 const char *SpektraAppOptionLabel(const char *optionSet, uint32_t index);
+int32_t SpektraAppLinearRec2020ColorSpace(void);
+int32_t SpektraAppLinearRec709ColorSpace(void);
+int32_t SpektraAppLinearP3D65ColorSpace(void);
+int32_t SpektraAppSrgbColorSpace(void);
+int32_t SpektraAppDisplayP3ColorSpace(void);
 
 uint32_t SpektraAppFilmCount(void);
 const char *SpektraAppFilmName(uint32_t index);

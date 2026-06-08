@@ -316,12 +316,34 @@ bool applyParam(const std::string &keyRaw, const std::string &valueRaw, spektraf
   }
   if (key == "process") {
     const std::string mode = normalizedTag(value);
+    int processValue = 0;
+    if (parseInt(value, processValue)) {
+      switch (processValue) {
+        case 0:
+          params.process = spektrafilm::ProcessMode::PrintSimulation;
+          return true;
+        case 1:
+          params.process = spektrafilm::ProcessMode::ScanNegative;
+          return true;
+        case 2:
+          params.process = spektrafilm::ProcessMode::ProcessNegative;
+          params.rgbToRawMethod = spektrafilm::RgbToRawMethod::Hanatos2026;
+          return true;
+        default:
+          return fail();
+      }
+    }
     if (mode == "print_simulation" || mode == "print") {
       params.process = spektrafilm::ProcessMode::PrintSimulation;
       return true;
     }
     if (mode == "scan_negative" || mode == "scan") {
       params.process = spektrafilm::ProcessMode::ScanNegative;
+      return true;
+    }
+    if (mode == "process_negative" || mode == "negative_process" || mode == "negative_print") {
+      params.process = spektrafilm::ProcessMode::ProcessNegative;
+      params.rgbToRawMethod = spektrafilm::RgbToRawMethod::Hanatos2026;
       return true;
     }
     return fail();
@@ -358,8 +380,8 @@ bool applyParam(const std::string &keyRaw, const std::string &valueRaw, spektraf
       params.outputRole = spektrafilm::OutputRole::DisplayHdr;
       return true;
     }
-    if (role == "scene_handoff" || role == "scene") {
-      params.outputRole = spektrafilm::OutputRole::SceneHandoff;
+    if (role == "rcm" || role == "resolve_color_management" || role == "scene_handoff" || role == "scene") {
+      params.outputRole = spektrafilm::OutputRole::Rcm;
       return true;
     }
     return fail();
@@ -655,11 +677,6 @@ int main(int argc, const char **argv) {
         params.renderOutput == spektrafilm::RenderOutputMode::PrintDensityCmy) {
       params.process = spektrafilm::ProcessMode::PrintSimulation;
     }
-    if (params.renderOutput == spektrafilm::RenderOutputMode::FinalPreview &&
-        params.outputRole == spektrafilm::OutputRole::SceneHandoff) {
-      params.outputColorSpace = spektrafilm::ColorSpace::LinearRec2020;
-    }
-
     std::vector<float> sourcePixels;
     if (!readFloatRgba(options.inputPath, options.width, options.height, sourcePixels)) {
       std::cerr << "Unable to read input float RGBA file: " << options.inputPath << "\n";

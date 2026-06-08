@@ -929,6 +929,130 @@ std::vector<float> makeHanatosRawResponsePair(
   return packed;
 }
 
+std::vector<float> makeHanatosResponsePairFromWeights(
+  const ProfileCurveSet &referenceCurves,
+  const std::vector<float> &spectralWeights,
+  const std::vector<float> &hanatosSpectra,
+  const HanatosSpectraLutInfo &hanatos
+) {
+  const size_t responseCount = static_cast<size_t>(hanatos.width) * static_cast<size_t>(hanatos.height) * 3u;
+  std::vector<float> response(responseCount, 0.0f);
+  const size_t expectedSpectra = static_cast<size_t>(hanatos.width) * static_cast<size_t>(hanatos.height) * static_cast<size_t>(hanatos.wavelengthCount);
+  if (hanatos.width == 0u ||
+      hanatos.height == 0u ||
+      hanatos.wavelengthCount == 0u ||
+      hanatosSpectra.size() < expectedSpectra ||
+      spectralWeights.size() < static_cast<size_t>(hanatos.wavelengthCount) * 3u) {
+    return response;
+  }
+  for (uint32_t x = 0; x < hanatos.width; ++x) {
+    for (uint32_t y = 0; y < hanatos.height; ++y) {
+      float raw[3] = {0.0f, 0.0f, 0.0f};
+      const size_t spectraOffset = (static_cast<size_t>(x) * hanatos.height + y) * hanatos.wavelengthCount;
+      for (uint32_t wavelength = 0u; wavelength < hanatos.wavelengthCount; ++wavelength) {
+        const float spectrum = hanatosSpectra[spectraOffset + wavelength];
+        const uint32_t weightOffset = wavelength * 3u;
+        raw[0] += spectrum * spectralWeights[weightOffset];
+        raw[1] += spectrum * spectralWeights[weightOffset + 1u];
+        raw[2] += spectrum * spectralWeights[weightOffset + 2u];
+      }
+      const size_t responseOffset = (static_cast<size_t>(x) * hanatos.height + y) * 3u;
+      response[responseOffset] = raw[0];
+      response[responseOffset + 1u] = raw[1];
+      response[responseOffset + 2u] = raw[2];
+    }
+  }
+  std::vector<float> compressed = remapHanatosResponseForInputGamutCompression(referenceCurves, response, hanatos);
+  std::vector<float> packed;
+  packed.reserve((response.size() + compressed.size()) / 3u * 4u);
+  const auto appendPacked = [&](const std::vector<float> &source) {
+    for (size_t offset = 0u; offset + 2u < source.size(); offset += 3u) {
+      packed.push_back(source[offset]);
+      packed.push_back(source[offset + 1u]);
+      packed.push_back(source[offset + 2u]);
+      packed.push_back(0.0f);
+    }
+  };
+  appendPacked(response);
+  appendPacked(compressed);
+  return packed;
+}
+
+float filteredEnlargerIlluminantCpu(
+  uint32_t wavelength,
+  const RenderParams &params,
+  float cFilter,
+  float mFilterShift,
+  float yFilterShift
+) {
+  const uint32_t film = std::min<uint32_t>(
+    static_cast<uint32_t>(std::max(params.film, 0)),
+    std::max<uint32_t>(kSpektraFilmCount, 1u) - 1u
+  );
+  const uint32_t paper = std::min<uint32_t>(
+    static_cast<uint32_t>(std::max(params.paper, 0)),
+    std::max<uint32_t>(kSpektraPaperCount, 1u) - 1u
+  );
+  const uint32_t neutralOffset = (paper * kSpektraFilmCount + film) * 3u;
+  const float *neutral = neutralPrintFilters();
+  const float cc0 = std::max(neutral[neutralOffset] + cFilter, 0.0f);
+  const float cc1 = std::max(neutral[neutralOffset + 1u] + mFilterShift, 0.0f);
+  const float cc2 = std::max(neutral[neutralOffset + 2u] + yFilterShift, 0.0f);
+  const float wheel0 = std::pow(10.0f, -cc0 / 100.0f);
+  const float wheel1 = std::pow(10.0f, -cc1 / 100.0f);
+  const float wheel2 = std::pow(10.0f, -cc2 / 100.0f);
+  const uint32_t offset = wavelength * 3u;
+  const float *filters = customEnlargerFilters();
+  const float f0 = std::clamp(filters[offset], 0.0f, 1.0f);
+  const float f1 = std::clamp(filters[offset + 1u], 0.0f, 1.0f);
+  const float f2 = std::clamp(filters[offset + 2u], 0.0f, 1.0f);
+  const float dim0 = 1.0f - (1.0f - f0) * (1.0f - wheel0);
+  const float dim1 = 1.0f - (1.0f - f1) * (1.0f - wheel1);
+  const float dim2 = 1.0f - (1.0f - f2) * (1.0f - wheel2);
+  return thKg3Illuminant()[wavelength] * dim0 * dim1 * dim2;
+}
+
+std::vector<float> makeProcessNegativePaperWeights(
+  const ProfileCurveSet &paperCurves,
+  const std::vector<float> &paperSensitivityLinear,
+  const RenderParams &params,
+  bool preflash
+) {
+  std::vector<float> weights(static_cast<size_t>(paperCurves.wavelengthCount) * 3u, 0.0f);
+  if (paperSensitivityLinear.size() < weights.size()) {
+    return weights;
+  }
+  if (params.printTiming == PrintTimingMode::ApdPrinterDensity) {
+    std::array<float, 3> normalization = {0.0f, 0.0f, 0.0f};
+    for (uint32_t wavelength = 0u; wavelength < paperCurves.wavelengthCount; ++wavelength) {
+      const uint32_t offset = wavelength * 3u;
+      normalization[0] += std::max(academyPrinterDensityData()[offset], 0.0f);
+      normalization[1] += std::max(academyPrinterDensityData()[offset + 1u], 0.0f);
+      normalization[2] += std::max(academyPrinterDensityData()[offset + 2u], 0.0f);
+    }
+    const float preflashScale = preflash ? std::max(params.preflashExposure, 0.0f) : 1.0f;
+    for (uint32_t wavelength = 0u; wavelength < paperCurves.wavelengthCount; ++wavelength) {
+      const uint32_t offset = wavelength * 3u;
+      weights[offset] = preflashScale * std::max(academyPrinterDensityData()[offset], 0.0f) / std::max(normalization[0], 1.0e-10f);
+      weights[offset + 1u] = preflashScale * std::max(academyPrinterDensityData()[offset + 1u], 0.0f) / std::max(normalization[1], 1.0e-10f);
+      weights[offset + 2u] = preflashScale * std::max(academyPrinterDensityData()[offset + 2u], 0.0f) / std::max(normalization[2], 1.0e-10f);
+    }
+    return weights;
+  }
+  const float cFilter = preflash ? 0.0f : params.filterC;
+  const float mFilter = preflash ? params.preflashMFilterShift : params.filterMShift;
+  const float yFilter = preflash ? params.preflashYFilterShift : params.filterYShift;
+  const float preflashScale = preflash ? std::max(params.preflashExposure, 0.0f) : 1.0f;
+  for (uint32_t wavelength = 0u; wavelength < paperCurves.wavelengthCount; ++wavelength) {
+    const uint32_t offset = wavelength * 3u;
+    const float illuminant = filteredEnlargerIlluminantCpu(wavelength, params, cFilter, mFilter, yFilter);
+    weights[offset] = preflashScale * illuminant * paperSensitivityLinear[offset];
+    weights[offset + 1u] = preflashScale * illuminant * paperSensitivityLinear[offset + 1u];
+    weights[offset + 2u] = preflashScale * illuminant * paperSensitivityLinear[offset + 2u];
+  }
+  return weights;
+}
+
 uint32_t findMemoryTypeIndex(
   VkPhysicalDevice physicalDevice,
   uint32_t typeBits,
@@ -1066,18 +1190,25 @@ constexpr uint32_t kDefaultVulkanTileHeight = 256u;
 uint32_t estimateVulkanTileOverlap(const RenderParams &params) {
   uint32_t overlap = 0u;
   const bool finalOutput = params.renderOutput == RenderOutputMode::FinalPreview;
-  const bool sceneHandoffOutput = finalOutput && params.outputRole == OutputRole::SceneHandoff;
+  const bool rcmOutput = finalOutput && params.outputRole == OutputRole::Rcm;
   const bool finalPrintSimulation =
-    finalOutput && !sceneHandoffOutput && params.process == ProcessMode::PrintSimulation;
+    finalOutput && params.process == ProcessMode::PrintSimulation;
+  const bool finalProcessNegative =
+    finalOutput && params.process == ProcessMode::ProcessNegative;
   const bool finalPostProcessPath =
-    finalOutput && (params.process == ProcessMode::ScanNegative || sceneHandoffOutput || finalPrintSimulation);
+    finalOutput &&
+    (params.process == ProcessMode::ScanNegative ||
+     params.process == ProcessMode::ProcessNegative ||
+     finalPrintSimulation);
 
   if (params.cameraDiffusionEnabled &&
+      params.process != ProcessMode::ProcessNegative &&
       params.cameraDiffusionStrength > 0.0f &&
       params.cameraDiffusionSpatialScale > 0.0f) {
     overlap += kVulkanSpatialEffectRadiusPx;
   }
   if (params.halationEnabled &&
+      params.process != ProcessMode::ProcessNegative &&
       ((params.scatterAmount > 0.0f && params.scatterScale > 0.0f) ||
        (params.halationAmount > 0.0f &&
         params.halationScale > 0.0f &&
@@ -1087,22 +1218,25 @@ uint32_t estimateVulkanTileOverlap(const RenderParams &params) {
     overlap += kVulkanSpatialEffectRadiusPx;
   }
   if (params.dirCouplersAmount > 0.0f &&
+      params.process != ProcessMode::ProcessNegative &&
       (params.dirCouplersDiffusionUm > 0.0f ||
        (params.dirCouplersDiffusionTailUm > 0.0f && params.dirCouplersDiffusionTailWeight > 0.0f))) {
     overlap += kVulkanSpatialEffectRadiusPx;
   }
   if (params.grainEnabled &&
+      params.process != ProcessMode::ProcessNegative &&
       (params.grainModel == GrainModel::Production ||
        params.grainModel == GrainModel::GrainSynthesis)) {
     overlap += kVulkanGrainSpatialRadiusPx;
   }
-  if (finalPrintSimulation &&
+  if ((finalPrintSimulation || finalProcessNegative) &&
       params.printDiffusionEnabled &&
       params.printDiffusionStrength > 0.0f &&
       params.printDiffusionSpatialScale > 0.0f) {
     overlap += kVulkanSpatialEffectRadiusPx;
   }
   if (finalPostProcessPath &&
+      !rcmOutput &&
       params.scannerEnabled &&
       ((params.glarePercent > 0.0f && params.glareBlur > 0.0f) ||
        params.scannerMtf50LpMm > 0.0f ||
@@ -1177,8 +1311,8 @@ struct VulkanDiffusionComponent {
 static_assert(sizeof(VulkanDiffusionInfo) == 16u);
 static_assert(sizeof(VulkanDiffusionComponent) == 16u);
 
-constexpr uint32_t kCoreFrameFloatCount = 97u;
-constexpr uint32_t kCoreFrameIntCount = 28u;
+constexpr uint32_t kCoreFrameFloatCount = 105u;
+constexpr uint32_t kCoreFrameIntCount = 29u;
 constexpr uint32_t kCoreHalationSetCount = 13u;
 constexpr uint32_t kCoreDiffusionSetCount = 3u;
 constexpr uint32_t kCorePrintDiffusionSetCount = 2u;
@@ -1233,6 +1367,7 @@ enum : uint32_t {
   kPrintScanOpPrintRaw = 1u,
   kPrintScanOpFinalFromPrintRaw = 2u,
   kPrintScanOpFrameConstants = 3u,
+  kPrintScanOpPrintRawFromNegativeLight = 4u,
 };
 
 enum : uint32_t {
@@ -1658,8 +1793,8 @@ private:
       return false;
     }
 
-    VkDescriptorSetLayoutBinding bindings[29]{};
-    for (uint32_t bindingIndex = 0; bindingIndex < 29u; ++bindingIndex) {
+    VkDescriptorSetLayoutBinding bindings[31]{};
+    for (uint32_t bindingIndex = 0; bindingIndex < 31u; ++bindingIndex) {
       bindings[bindingIndex].binding = bindingIndex;
       bindings[bindingIndex].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
       bindings[bindingIndex].descriptorCount = 1;
@@ -2592,6 +2727,12 @@ struct VulkanRenderer::Impl {
     float cameraUvCutNm = 0.0f;
     bool cameraIrFilterEnabled = false;
     float cameraIrCutNm = 0.0f;
+    PrintTimingMode processNegativePrintTiming = PrintTimingMode::FilteredEnlarger;
+    float processNegativeFilterC = 0.0f;
+    float processNegativeFilterMShift = 0.0f;
+    float processNegativeFilterYShift = 0.0f;
+    float processNegativePreflashMFilterShift = 0.0f;
+    float processNegativePreflashYFilterShift = 0.0f;
     bool printScanResources = false;
     bool grainResources = false;
     const ProfileCurveSet *curves = nullptr;
@@ -2614,6 +2755,8 @@ struct VulkanRenderer::Impl {
     ScratchBuffer colorTransferKinds;
     ScratchBuffer mallettRawMatrix;
     ScratchBuffer hanatosRawResponse;
+    ScratchBuffer paperHanatosResponse;
+    ScratchBuffer preflashPaperHanatosResponse;
     ScratchBuffer paperLogExposure;
     ScratchBuffer paperDensityCurves;
     ScratchBuffer filmChannelDensity;
@@ -3308,6 +3451,8 @@ void VulkanRenderer::Impl::destroyStaticFilmResources() {
   destroyScratchBuffer(staticFilm.paperDensityCurves);
   destroyScratchBuffer(staticFilm.paperLogExposure);
   destroyScratchBuffer(staticFilm.hanatosRawResponse);
+  destroyScratchBuffer(staticFilm.paperHanatosResponse);
+  destroyScratchBuffer(staticFilm.preflashPaperHanatosResponse);
   destroyScratchBuffer(staticFilm.mallettRawMatrix);
   destroyScratchBuffer(staticFilm.colorTransferKinds);
   destroyScratchBuffer(staticFilm.colorDecodeLuts);
@@ -3324,6 +3469,12 @@ void VulkanRenderer::Impl::destroyStaticFilmResources() {
   staticFilm.cameraUvCutNm = 0.0f;
   staticFilm.cameraIrFilterEnabled = false;
   staticFilm.cameraIrCutNm = 0.0f;
+  staticFilm.processNegativePrintTiming = PrintTimingMode::FilteredEnlarger;
+  staticFilm.processNegativeFilterC = 0.0f;
+  staticFilm.processNegativeFilterMShift = 0.0f;
+  staticFilm.processNegativeFilterYShift = 0.0f;
+  staticFilm.processNegativePreflashMFilterShift = 0.0f;
+  staticFilm.processNegativePreflashYFilterShift = 0.0f;
   staticFilm.printScanResources = false;
   staticFilm.grainResources = false;
   staticFilm.curves = nullptr;
@@ -3751,6 +3902,14 @@ bool VulkanRenderer::Impl::prepareStaticFilmResources(
   bool includePrintScanResources,
   bool includeGrainResources
 ) {
+  const bool processNegativeResponseCached =
+    params.process != ProcessMode::ProcessNegative ||
+    (staticFilm.processNegativePrintTiming == params.printTiming &&
+     staticFilm.processNegativeFilterC == params.filterC &&
+     staticFilm.processNegativeFilterMShift == params.filterMShift &&
+     staticFilm.processNegativeFilterYShift == params.filterYShift &&
+     staticFilm.processNegativePreflashMFilterShift == params.preflashMFilterShift &&
+     staticFilm.processNegativePreflashYFilterShift == params.preflashYFilterShift);
   const bool coreResourcesCached =
     staticFilm.film == params.film &&
     staticFilm.rgbToRawMethod == params.rgbToRawMethod &&
@@ -3758,6 +3917,7 @@ bool VulkanRenderer::Impl::prepareStaticFilmResources(
     staticFilm.cameraUvCutNm == params.cameraUvCutNm &&
     staticFilm.cameraIrFilterEnabled == params.cameraIrFilterEnabled &&
     staticFilm.cameraIrCutNm == params.cameraIrCutNm &&
+    processNegativeResponseCached &&
     staticFilm.curves &&
     staticFilm.exposureCount > 0u &&
     staticFilm.wavelengthCount > 0u &&
@@ -3768,7 +3928,9 @@ bool VulkanRenderer::Impl::prepareStaticFilmResources(
     staticFilm.colorDecodeLuts.buffer != VK_NULL_HANDLE &&
     staticFilm.colorTransferKinds.buffer != VK_NULL_HANDLE &&
     staticFilm.mallettRawMatrix.buffer != VK_NULL_HANDLE &&
-    staticFilm.hanatosRawResponse.buffer != VK_NULL_HANDLE;
+    staticFilm.hanatosRawResponse.buffer != VK_NULL_HANDLE &&
+    staticFilm.paperHanatosResponse.buffer != VK_NULL_HANDLE &&
+    staticFilm.preflashPaperHanatosResponse.buffer != VK_NULL_HANDLE;
   const bool printScanResourcesCached =
     !includePrintScanResources ||
     (staticFilm.printScanResources &&
@@ -3923,8 +4085,31 @@ bool VulkanRenderer::Impl::prepareStaticFilmResources(
   if (hanatosRawResponse.empty()) {
     hanatosRawResponse.assign(8u, 0.0f);
   }
+  std::vector<float> paperHanatosResponse(8u, 0.0f);
+  std::vector<float> preflashPaperHanatosResponse(8u, 0.0f);
+  if (includePrintScanResources) {
+    const std::vector<float> paperSensitivityLinear = makeLinearSensitivity(paperCurves->logSensitivity, paperCurves->wavelengthCount);
+    const std::vector<float> processNegativePaperWeights = makeProcessNegativePaperWeights(
+      *paperCurves,
+      paperSensitivityLinear,
+      params,
+      false
+    );
+    const std::vector<float> processNegativePreflashWeights = makeProcessNegativePaperWeights(
+      *paperCurves,
+      paperSensitivityLinear,
+      params,
+      true
+    );
+    paperHanatosResponse = makeHanatosResponsePairFromWeights(*curves, processNegativePaperWeights, hanatosSpectraData, hanatos);
+    preflashPaperHanatosResponse = makeHanatosResponsePairFromWeights(*curves, processNegativePreflashWeights, hanatosSpectraData, hanatos);
+  }
   const VkDeviceSize hanatosRawResponseBytes =
     static_cast<VkDeviceSize>(hanatosRawResponse.size()) * sizeof(float);
+  const VkDeviceSize paperHanatosResponseBytes =
+    static_cast<VkDeviceSize>(paperHanatosResponse.size()) * sizeof(float);
+  const VkDeviceSize preflashPaperHanatosResponseBytes =
+    static_cast<VkDeviceSize>(preflashPaperHanatosResponse.size()) * sizeof(float);
   const uint64_t scratchBytesBefore = diagnostics.scratchAllocationBytes;
   const uint64_t scratchCountBefore = diagnostics.scratchAllocationCount;
   const uint64_t sharedBytesBefore = diagnostics.sharedScratchAllocationBytes;
@@ -3939,7 +4124,9 @@ bool VulkanRenderer::Impl::prepareStaticFilmResources(
       !uploadStaticBuffer(staticFilm.colorDecodeLuts, colorDecodeLuts(), transferLutBytes, "color decode LUTs") ||
       !uploadStaticBuffer(staticFilm.colorTransferKinds, colorTransferKinds(), transferKindBytes, "color transfer kinds") ||
       !uploadStaticBuffer(staticFilm.mallettRawMatrix, mallettRawMatrix.data(), mallettRawMatrixBytes, "Mallett raw matrix") ||
-      !uploadStaticBuffer(staticFilm.hanatosRawResponse, hanatosRawResponse.data(), hanatosRawResponseBytes, "Hanatos raw response")) {
+      !uploadStaticBuffer(staticFilm.hanatosRawResponse, hanatosRawResponse.data(), hanatosRawResponseBytes, "Hanatos raw response") ||
+      !uploadStaticBuffer(staticFilm.paperHanatosResponse, paperHanatosResponse.data(), paperHanatosResponseBytes, "paper Hanatos response") ||
+      !uploadStaticBuffer(staticFilm.preflashPaperHanatosResponse, preflashPaperHanatosResponse.data(), preflashPaperHanatosResponseBytes, "preflash paper Hanatos response")) {
     return false;
   }
   if (includeGrainResources &&
@@ -4022,6 +4209,12 @@ bool VulkanRenderer::Impl::prepareStaticFilmResources(
   staticFilm.cameraUvCutNm = params.cameraUvCutNm;
   staticFilm.cameraIrFilterEnabled = params.cameraIrFilterEnabled;
   staticFilm.cameraIrCutNm = params.cameraIrCutNm;
+  staticFilm.processNegativePrintTiming = params.printTiming;
+  staticFilm.processNegativeFilterC = params.filterC;
+  staticFilm.processNegativeFilterMShift = params.filterMShift;
+  staticFilm.processNegativeFilterYShift = params.filterYShift;
+  staticFilm.processNegativePreflashMFilterShift = params.preflashMFilterShift;
+  staticFilm.processNegativePreflashYFilterShift = params.preflashYFilterShift;
   staticFilm.printScanResources = includePrintScanResources;
   staticFilm.grainResources = includeGrainResources;
   staticFilm.curves = curves;
@@ -4104,7 +4297,7 @@ bool VulkanRenderer::Impl::ensureCoreFrameResources() {
   if (coreFrame.descriptorPool == VK_NULL_HANDLE) {
     VkDescriptorPoolSize poolSize{};
     poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    poolSize.descriptorCount = 29u * kCoreDescriptorSetCount;
+    poolSize.descriptorCount = 31u * kCoreDescriptorSetCount;
 
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -4613,12 +4806,15 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
     static_cast<float>(std::max(coordinateWidth, coordinateHeight)) /
     resolvedEnlargerScale(params);
   const bool finalOutput = params.renderOutput == RenderOutputMode::FinalPreview;
-  const bool sceneHandoffOutput = finalOutput && params.outputRole == OutputRole::SceneHandoff;
+  const bool rcmOutput = finalOutput && params.outputRole == OutputRole::Rcm;
   const bool finalPrintSimulation =
-    finalOutput && !sceneHandoffOutput && params.process == ProcessMode::PrintSimulation;
+    finalOutput && params.process == ProcessMode::PrintSimulation;
   const bool finalScanNegative =
-    finalOutput && (params.process == ProcessMode::ScanNegative || sceneHandoffOutput);
-  const bool finalPostProcessPath = finalPrintSimulation || finalScanNegative;
+    finalOutput && params.process == ProcessMode::ScanNegative;
+  const bool finalProcessNegative =
+    finalOutput && params.process == ProcessMode::ProcessNegative;
+  const bool printLikeFinalPath = finalPrintSimulation || finalProcessNegative;
+  const bool finalPostProcessPath = finalPrintSimulation || finalScanNegative || finalProcessNegative;
   const bool printScanPassEnabled = envFlagEnabledOrDefault(
     "SPEKTRAFILM_VULKAN_PRINT_SCAN_PASS",
     finalPostProcessPath
@@ -4628,8 +4824,8 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
   const bool printGlarePath =
     scannerPostFeatureEnabled &&
     printScanPassEnabled &&
-    finalPrintSimulation &&
-    !sceneHandoffOutput &&
+    printLikeFinalPath &&
+    !rcmOutput &&
     params.scannerEnabled &&
     params.glarePercent > 0.0f;
   const bool printGlareBlurPath = printGlarePath && params.glareBlur > 0.0f;
@@ -4637,20 +4833,20 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
     scannerPostFeatureEnabled &&
     printScanPassEnabled &&
     finalPostProcessPath &&
-    !sceneHandoffOutput &&
+    !rcmOutput &&
     params.scannerEnabled &&
     params.scannerMtf50LpMm > 0.0f;
   const bool scannerUnsharpPath =
     scannerPostFeatureEnabled &&
     printScanPassEnabled &&
     finalPostProcessPath &&
-    !sceneHandoffOutput &&
+    !rcmOutput &&
     params.scannerEnabled &&
     params.scannerUnsharpRadiusUm > 0.0f &&
     params.scannerUnsharpAmount > 0.0f;
   const bool scannerPostPath = printGlarePath || scannerBlurPath || scannerUnsharpPath;
   const bool grainFeatureEnabled =
-    envFlagEnabledOrDefault("SPEKTRAFILM_VULKAN_GRAIN_PASS", true) && params.grainEnabled;
+    envFlagEnabledOrDefault("SPEKTRAFILM_VULKAN_GRAIN_PASS", true) && params.grainEnabled && !finalProcessNegative;
   const bool grainSynthesisRequested =
     grainFeatureEnabled &&
     params.grainModel == GrainModel::GrainSynthesis;
@@ -4667,6 +4863,7 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
   VulkanDiffusionInfo cameraDiffusionInfo{};
   std::vector<VulkanDiffusionComponent> cameraDiffusionComponents;
   if (diffusionFeatureEnabled &&
+      !finalProcessNegative &&
       params.cameraDiffusionEnabled &&
       params.cameraDiffusionStrength > 0.0f &&
       params.cameraDiffusionSpatialScale > 0.0f) {
@@ -4687,7 +4884,7 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
   std::vector<VulkanDiffusionComponent> printDiffusionComponents;
   if (diffusionFeatureEnabled &&
       printScanPassEnabled &&
-      finalPrintSimulation &&
+      printLikeFinalPath &&
       params.printDiffusionEnabled &&
       params.printDiffusionStrength > 0.0f &&
       params.printDiffusionSpatialScale > 0.0f) {
@@ -4708,7 +4905,7 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
     (anyDiffusionComponentDownsamples(cameraDiffusionComponents, blurDownsample) ||
      anyDiffusionComponentDownsamples(printDiffusionComponents, blurDownsample));
   const bool dirFeatureEnabled = envFlagEnabledOrDefault("SPEKTRAFILM_VULKAN_DIR_PASS", true);
-  const bool dirPath = dirFeatureEnabled && params.dirCouplersAmount > 0.0f;
+  const bool dirPath = dirFeatureEnabled && !finalProcessNegative && params.dirCouplersAmount > 0.0f;
   const bool dirBlurPath = dirPath && params.dirCouplersDiffusionUm > 0.0f;
   const bool dirTailPath =
     dirBlurPath &&
@@ -4737,7 +4934,7 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
     diffusionDownsampleByteCount * static_cast<VkDeviceSize>(std::max(diffusionGroupSize, 1u));
   const bool destinationFormatConvert = destinationIsHalf;
   const bool halationFeatureEnabled =
-    envFlagEnabledOrDefault("SPEKTRAFILM_VULKAN_HALATION_PASS", true) && params.halationEnabled;
+    envFlagEnabledOrDefault("SPEKTRAFILM_VULKAN_HALATION_PASS", true) && params.halationEnabled && !finalProcessNegative;
   const bool halationScatterEnabled =
     halationFeatureEnabled &&
     params.scatterAmount > 0.0f &&
@@ -5198,6 +5395,7 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
     frameInts[25] = grainSynthesisPath ? 1u : 0u;
     frameInts[26] = grainBlurRecurrence ? 1u : 0u;
     frameInts[27] = colorAdaptationFlags(params);
+    frameInts[28] = params.scanNegativeInvert ? 1u : 0u;
 
     if (!coreFrame.frameFloats.mapped || !coreFrame.frameInts.mapped) {
       lastError = "Vulkan frame parameter buffers are not mapped.";
@@ -5280,6 +5478,14 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
   hanatosRawResponseBufferInfo.buffer = staticFilm.hanatosRawResponse.buffer;
   hanatosRawResponseBufferInfo.offset = 0;
   hanatosRawResponseBufferInfo.range = staticFilm.hanatosRawResponse.capacity;
+  VkDescriptorBufferInfo paperHanatosResponseBufferInfo{};
+  paperHanatosResponseBufferInfo.buffer = staticFilm.paperHanatosResponse.buffer;
+  paperHanatosResponseBufferInfo.offset = 0;
+  paperHanatosResponseBufferInfo.range = staticFilm.paperHanatosResponse.capacity;
+  VkDescriptorBufferInfo preflashPaperHanatosResponseBufferInfo{};
+  preflashPaperHanatosResponseBufferInfo.buffer = staticFilm.preflashPaperHanatosResponse.buffer;
+  preflashPaperHanatosResponseBufferInfo.offset = 0;
+  preflashPaperHanatosResponseBufferInfo.range = staticFilm.preflashPaperHanatosResponse.capacity;
   VkDescriptorBufferInfo paperLogExposureBufferInfo{};
   paperLogExposureBufferInfo.buffer = staticFilm.paperLogExposure.buffer;
   paperLogExposureBufferInfo.offset = 0;
@@ -5546,7 +5752,7 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
   frameIntsBufferInfo.offset = 0;
   frameIntsBufferInfo.range = coreFrame.frameInts.capacity;
 
-  std::array<VkWriteDescriptorSet, 420> writes{};
+  std::array<VkWriteDescriptorSet, 460> writes{};
   uint32_t writeCount = 0;
   auto writeStorageBuffer = [&](VkDescriptorSet set, uint32_t binding, const VkDescriptorBufferInfo &bufferInfo) {
     VkWriteDescriptorSet &write = writes[writeCount++];
@@ -5580,6 +5786,7 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
     writeStorageBuffer(set, 1, outputBufferInfo);
     writeStorageBuffer(set, 2, logExposureBufferInfo);
     writeStorageBuffer(set, 3, densityCurvesBufferInfo);
+    writeStorageBuffer(set, 5, colorDecodeLutsBufferInfo);
     writeStorageBuffer(set, 6, colorTransferKindsBufferInfo);
     writeStorageBuffer(set, 7, mallettRawMatrixBufferInfo);
     writeStorageBuffer(set, 8, inputToReferenceXyzBufferInfo);
@@ -5603,10 +5810,15 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
     writeStorageBuffer(set, 26, academyPrinterDensityDataBufferInfo);
     writeStorageBuffer(set, 27, frameFloatsBufferInfo);
     writeStorageBuffer(set, 28, frameIntsBufferInfo);
+    writeStorageBuffer(set, 29, paperHanatosResponseBufferInfo);
+    writeStorageBuffer(set, 30, preflashPaperHanatosResponseBufferInfo);
   };
   if (printScanPassEnabled) {
+    const VkDescriptorBufferInfo &printScanInputBufferInfo = finalProcessNegative
+      ? sourceBufferInfo
+      : finalFilmDensityBufferInfo;
     if (printDiffusionPath) {
-      writePrintScanSet(coreFrame.printDiffusionDescriptorSets[0], finalFilmDensityBufferInfo, printRawBufferInfo);
+      writePrintScanSet(coreFrame.printDiffusionDescriptorSets[0], printScanInputBufferInfo, printRawBufferInfo);
       writePrintScanSet(
         coreFrame.printDiffusionDescriptorSets[1],
         printDiffusionRawBufferInfo,
@@ -5615,7 +5827,7 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
     } else {
       writePrintScanSet(
         coreFrame.finalDescriptorSet,
-        finalFilmDensityBufferInfo,
+        printScanInputBufferInfo,
         scannerPostPath ? scannerPostABufferInfo : destinationBufferInfo
       );
     }
@@ -6199,72 +6411,74 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
     insertComputeBarrier();
   };
 
-  pushConstants._pad0 = preExposureRawPath ? 1u : 0u;
-  pushConstants._pad1 = colorAdaptationFlags(params);
-  pushConstants._pad2 = fullFrameSourcePath ? 1u : 0u;
-  vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, filmExposurePipeline);
-  vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, corePipelineLayout, 0, 1, &coreFrame.exposureDescriptorSet, 0, nullptr);
-  vkCmdPushConstants(commandBuffer, corePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pushConstants), &pushConstants);
-  vkCmdDispatch(commandBuffer, activeGroupsX(), activeGroupsY(), 1);
-  insertComputeBarrier();
+  if (!finalProcessNegative) {
+    pushConstants._pad0 = preExposureRawPath ? 1u : 0u;
+    pushConstants._pad1 = colorAdaptationFlags(params);
+    pushConstants._pad2 = fullFrameSourcePath ? 1u : 0u;
+    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, filmExposurePipeline);
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, corePipelineLayout, 0, 1, &coreFrame.exposureDescriptorSet, 0, nullptr);
+    vkCmdPushConstants(commandBuffer, corePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pushConstants), &pushConstants);
+    vkCmdDispatch(commandBuffer, activeGroupsX(), activeGroupsY(), 1);
+    insertComputeBarrier();
 
-  if (halationBoostEnabled) {
-    if (halationBoostLocalReductionEnabled) {
-      dispatchHalation1D(
-        coreFrame.halationDescriptorSets[10],
-        kHalationOpBoostMax,
-        kHalationBoostMaxChunkPixels,
-        halationBoostMaxChunkCount
-      );
-      dispatchHalation1D(
-        coreFrame.halationDescriptorSets[11],
-        kHalationOpBoostReduceMax,
-        halationBoostMaxChunkCount,
-        1u
-      );
-    }
-    dispatchHalation(coreFrame.halationDescriptorSets[12], kHalationOpBoostApply, 0u, 0u);
-  }
-
-  if (cameraDiffusionPath) {
-    dispatchDiffusionSequence(coreFrame.diffusionDescriptorSets[0], cameraDiffusionComponents);
-    consumeSpatialRadius(cameraDiffusionRadius);
-    if (!halationPassEnabled) {
-      dispatchDiffusion(coreFrame.diffusionDescriptorSets[1], kDiffusionOpRawToLog, 0u);
-    }
-  }
-
-  if (halationPassEnabled) {
-    if (halationScatterEnabled) {
-      dispatchHalation(coreFrame.halationDescriptorSets[0], kHalationOpBlurX, kHalationSigmaScatterCore, 0u);
-      dispatchHalation(coreFrame.halationDescriptorSets[1], kHalationOpBlurYStore, kHalationSigmaScatterCore, 0u);
-      dispatchHalation(coreFrame.halationDescriptorSets[2], kHalationOpClear, 0u, 0u);
-      for (uint32_t component = 0u; component < 3u; ++component) {
-        dispatchHalation(coreFrame.halationDescriptorSets[3], kHalationOpBlurX, kHalationSigmaScatterTail, component);
-        dispatchHalation(coreFrame.halationDescriptorSets[4], kHalationOpBlurYAccumulate, kHalationSigmaScatterTail, component);
+    if (halationBoostEnabled) {
+      if (halationBoostLocalReductionEnabled) {
+        dispatchHalation1D(
+          coreFrame.halationDescriptorSets[10],
+          kHalationOpBoostMax,
+          kHalationBoostMaxChunkPixels,
+          halationBoostMaxChunkCount
+        );
+        dispatchHalation1D(
+          coreFrame.halationDescriptorSets[11],
+          kHalationOpBoostReduceMax,
+          halationBoostMaxChunkCount,
+          1u
+        );
       }
-      dispatchHalation(coreFrame.halationDescriptorSets[5], kHalationOpScatterResolve, 0u, 0u);
+      dispatchHalation(coreFrame.halationDescriptorSets[12], kHalationOpBoostApply, 0u, 0u);
     }
-    if (halationBounceEnabled) {
-      dispatchHalation(coreFrame.halationDescriptorSets[6], kHalationOpClear, 0u, 0u);
-      for (uint32_t bounce = 0u; bounce < 3u; ++bounce) {
-        dispatchHalation(coreFrame.halationDescriptorSets[7], kHalationOpBlurX, kHalationSigmaBounce, bounce);
-        dispatchHalation(coreFrame.halationDescriptorSets[8], kHalationOpBlurYAccumulate, kHalationSigmaBounce, bounce);
-      }
-      dispatchHalation(coreFrame.halationDescriptorSets[9], kHalationOpBounceResolveLog, 0u, 0u);
-    } else {
-      dispatchHalation(coreFrame.halationDescriptorSets[9], kHalationOpRawToLog, 0u, 0u);
-    }
-    consumeSpatialRadius(halationRadius);
-  }
 
-  pushConstants._pad0 = 0u;
-  pushConstants._pad1 = colorAdaptationFlags(params);
-  pushConstants._pad2 = 0u;
-  vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, curveDevelopPipeline);
-  vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, corePipelineLayout, 0, 1, &coreFrame.developDescriptorSet, 0, nullptr);
-  vkCmdPushConstants(commandBuffer, corePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pushConstants), &pushConstants);
-  vkCmdDispatch(commandBuffer, activeGroupsX(), activeGroupsY(), 1);
+    if (cameraDiffusionPath) {
+      dispatchDiffusionSequence(coreFrame.diffusionDescriptorSets[0], cameraDiffusionComponents);
+      consumeSpatialRadius(cameraDiffusionRadius);
+      if (!halationPassEnabled) {
+        dispatchDiffusion(coreFrame.diffusionDescriptorSets[1], kDiffusionOpRawToLog, 0u);
+      }
+    }
+
+    if (halationPassEnabled) {
+      if (halationScatterEnabled) {
+        dispatchHalation(coreFrame.halationDescriptorSets[0], kHalationOpBlurX, kHalationSigmaScatterCore, 0u);
+        dispatchHalation(coreFrame.halationDescriptorSets[1], kHalationOpBlurYStore, kHalationSigmaScatterCore, 0u);
+        dispatchHalation(coreFrame.halationDescriptorSets[2], kHalationOpClear, 0u, 0u);
+        for (uint32_t component = 0u; component < 3u; ++component) {
+          dispatchHalation(coreFrame.halationDescriptorSets[3], kHalationOpBlurX, kHalationSigmaScatterTail, component);
+          dispatchHalation(coreFrame.halationDescriptorSets[4], kHalationOpBlurYAccumulate, kHalationSigmaScatterTail, component);
+        }
+        dispatchHalation(coreFrame.halationDescriptorSets[5], kHalationOpScatterResolve, 0u, 0u);
+      }
+      if (halationBounceEnabled) {
+        dispatchHalation(coreFrame.halationDescriptorSets[6], kHalationOpClear, 0u, 0u);
+        for (uint32_t bounce = 0u; bounce < 3u; ++bounce) {
+          dispatchHalation(coreFrame.halationDescriptorSets[7], kHalationOpBlurX, kHalationSigmaBounce, bounce);
+          dispatchHalation(coreFrame.halationDescriptorSets[8], kHalationOpBlurYAccumulate, kHalationSigmaBounce, bounce);
+        }
+        dispatchHalation(coreFrame.halationDescriptorSets[9], kHalationOpBounceResolveLog, 0u, 0u);
+      } else {
+        dispatchHalation(coreFrame.halationDescriptorSets[9], kHalationOpRawToLog, 0u, 0u);
+      }
+      consumeSpatialRadius(halationRadius);
+    }
+
+    pushConstants._pad0 = 0u;
+    pushConstants._pad1 = colorAdaptationFlags(params);
+    pushConstants._pad2 = 0u;
+    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, curveDevelopPipeline);
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, corePipelineLayout, 0, 1, &coreFrame.developDescriptorSet, 0, nullptr);
+    vkCmdPushConstants(commandBuffer, corePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pushConstants), &pushConstants);
+    vkCmdDispatch(commandBuffer, activeGroupsX(), activeGroupsY(), 1);
+  }
 
   if (dirPath) {
     insertComputeBarrier();
@@ -6331,7 +6545,7 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
     insertComputeBarrier();
 
     if (printDiffusionPath) {
-      pushConstants._pad0 = kPrintScanOpPrintRaw;
+      pushConstants._pad0 = finalProcessNegative ? kPrintScanOpPrintRawFromNegativeLight : kPrintScanOpPrintRaw;
       pushConstants._pad1 = 0u;
       pushConstants._pad2 = 0u;
       vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, corePipelineLayout, 0, 1, &coreFrame.printDiffusionDescriptorSets[0], 0, nullptr);
@@ -6735,7 +6949,7 @@ bool VulkanRenderer::Impl::renderCoreBootstrap(
 
   if (printScanPassEnabled) {
     if (printDiffusionPath) {
-      addComputePass("spektrafilm_print_raw_from_film_density");
+      addComputePass(finalProcessNegative ? "spektrafilm_print_raw_from_negative_light" : "spektrafilm_print_raw_from_film_density");
       addDiffusionPasses("spektrafilm_print", printDiffusionComponents);
       addComputePass("spektrafilm_final_from_print_raw");
     } else {

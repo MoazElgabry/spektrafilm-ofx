@@ -52,7 +52,7 @@ The available output formats are:
 | Format | Purpose |
 | --- | --- |
 | `Display Out SDR` | A finished display-referred SDR output. |
-| `Scene Handoff` | A scene-referred handoff for continued grading downstream. (Experimental) |
+| `RCM` | Resolve Color Management mode. The selected timeline color space is decoded as input and encoded back as output, with no separate output color-space selector. |
 | `Display Out HDR` | A finished display-referred HDR output using Rec.2100 PQ or HLG controls. |
 
 ### LUT Export

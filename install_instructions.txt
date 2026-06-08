@@ -1,7 +1,7 @@
 spektrafilm OFX installation
 ============================
 
-DISCLAIMER: spektrafilm OFX only works in the Studio version of DaVinci Resolve.
+DISCLAIMER: spektrafilm OFX only works in the Studio version of DaVinci Resolve. It may however work in the free version on macOS anyways for currently undetermined reasons.
 
 macOS
 -----

@@ -29,6 +29,7 @@ struct ChoiceOption {
 constexpr ChoiceOption kStaticOptions[] = {
   {"process", "Print simulation"},
   {"process", "Scan negative"},
+  {"process", "Process negative"},
   {"rgbToRawMethod", "Hanatos 2026"},
   {"rgbToRawMethod", "Hanatos 2025"},
   {"rgbToRawMethod", "Mallett 2019"},
@@ -60,7 +61,7 @@ constexpr ChoiceOption kStaticOptions[] = {
   {"colorSpace", "Rec.709 Gamma 2.4"},
   {"outputRole", "Display Out SDR"},
   {"outputRole", "Display Out HDR"},
-  {"outputRole", "Scene Handoff"},
+  {"outputRole", "RCM/ACES (Beta)"},
   {"hdrPreset", "PQ 1000"},
   {"hdrPreset", "PQ 4000"},
   {"hdrPreset", "HLG 1000"},
@@ -128,7 +129,8 @@ constexpr SpektraAppParamDescriptor param(
 }
 
 constexpr SpektraAppParamDescriptor kParams[] = {
-  param("process", "Mode", "color", SpektraAppParamKindChoice, kParamTagFlow, 0, 0.0, 0.0, 0.0, 0.0, 1.0, "process"),
+  param("process", "Mode", "color", SpektraAppParamKindChoice, kParamTagFlow, 0, 0.0, 0.0, 0.0, 0.0, 2.0, "process"),
+  param("scanNegativeInvert", "Invert Negative Scan", "color", SpektraAppParamKindBool, kParamTagFlow, 0, 0.0, 0.0, 0.0, 0.0, 1.0),
   param("inputColorSpace", "Input Color Space", "color", SpektraAppParamKindChoice, kParamTagFlow, 14, 0.0, 0.0, 0.0, 0.0, 25.0, "colorSpace"),
   param("outputColorSpace", "Output Color Space", "color", SpektraAppParamKindChoice, kParamTagFlow, 25, 0.0, 0.0, 0.0, 0.0, 25.0, "colorSpace"),
   param("outputRole", "Output Role", "color", SpektraAppParamKindChoice, kParamTagFlow, 0, 0.0, 0.0, 0.0, 0.0, 2.0, "outputRole"),
@@ -190,7 +192,7 @@ constexpr SpektraAppParamDescriptor kParams[] = {
   param("enlargerOffsetXPercent", "Offset X %", "filmPlane", SpektraAppParamKindDouble, kParamTagNone, 0, 0.0, 0.0, 0.0, -100.0, 100.0),
   param("enlargerOffsetYPercent", "Offset Y %", "filmPlane", SpektraAppParamKindDouble, kParamTagNone, 0, 0.0, 0.0, 0.0, -100.0, 100.0),
 
-  param("dirCouplersAmount", "Amount", "dir", SpektraAppParamKindDouble, kParamTagFlow, 0, 0.0, 0.0, 0.0, 0.0, 2.0),
+  param("dirCouplersAmount", "Amount", "dir", SpektraAppParamKindDouble, kParamTagFlow, 0, 1.0, 0.0, 0.0, 0.0, 2.0),
   param("dirCouplersDiffusionUm", "Diffusion um", "dir", SpektraAppParamKindDouble, kParamTagFlow, 0, 20.0, 0.0, 0.0, 0.0, 100.0),
   param("dirCouplersDiffusionTailUm", "Tail um", "dir", SpektraAppParamKindDouble, kParamTagNone, 0, 200.0, 0.0, 0.0, 0.0, 1000.0),
   param("dirCouplersDiffusionTailWeight", "Tail Weight", "dir", SpektraAppParamKindDouble, kParamTagNone, 0, 0.06, 0.0, 0.0, 0.0, 1.0),
@@ -287,6 +289,7 @@ bool sameName(const char *a, const char *b) {
 spektrafilm::RenderParams toRendererParams(const SpektraAppRenderParams &p) {
   spektrafilm::RenderParams out{};
   out.process = static_cast<spektrafilm::ProcessMode>(p.process);
+  out.scanNegativeInvert = p.scanNegativeInvert != 0;
   out.renderOutput = static_cast<spektrafilm::RenderOutputMode>(p.renderOutput);
   out.rgbToRawMethod = static_cast<spektrafilm::RgbToRawMethod>(p.rgbToRawMethod);
   out.inputColorSpace = static_cast<spektrafilm::ColorSpace>(p.inputColorSpace);
@@ -445,6 +448,27 @@ spektrafilm::RenderParams toRendererParams(const SpektraAppRenderParams &p) {
   out.scannerMtf50LpMm = p.scannerMtf50LpMm;
   out.scannerUnsharpRadiusUm = p.scannerUnsharpRadiusUm;
   out.scannerUnsharpAmount = p.scannerUnsharpAmount;
+  if (out.process == spektrafilm::ProcessMode::ProcessNegative) {
+    out.rgbToRawMethod = spektrafilm::RgbToRawMethod::Hanatos2026;
+    out.film = static_cast<int32_t>(spektrafilm::kSpektraDefaultFilmIndex);
+    out.filmFormat = spektrafilm::FilmFormat::Standard35;
+    out.cameraUvFilterEnabled = false;
+    out.cameraIrFilterEnabled = false;
+    out.filmExposureEv = 0.0f;
+    out.autoExposure = false;
+    out.filmPushPullMode = spektrafilm::PushPullMode::Standard;
+    out.filmPushPullStops = 0.0f;
+    out.negativeBleachBypassAmount = 0.0f;
+    out.negativeLeucoCyanCoupling = 1.0f;
+    out.filmGamma = 1.0f;
+    out.enlargerScale = 1.0f;
+    out.enlargerOffsetXPercent = 0.0f;
+    out.enlargerOffsetYPercent = 0.0f;
+    out.dirCouplersAmount = 0.0f;
+    out.grainEnabled = false;
+    out.halationEnabled = false;
+    out.cameraDiffusionEnabled = false;
+  }
   return out;
 }
 
@@ -577,6 +601,7 @@ SpektraAppRenderParams SpektraAppMakeDefaultRenderParams(void) {
   p.printGamma = 1.0f;
   p.enlargerScale = 1.0f;
   p.printerLightCalibration = 1;
+  p.dirCouplersAmount = 1.0f;
   p.dirCouplersDiffusionUm = 20.0f;
   p.dirCouplersDiffusionTailUm = 200.0f;
   p.dirCouplersDiffusionTailWeight = 0.06f;
@@ -705,6 +730,7 @@ int32_t SpektraAppSetBoolParam(SpektraAppRenderParams *p, const char *name, int3
   if (!p || !name) return 0;
   const int32_t flag = value ? 1 : 0;
   if (sameName(name, "cameraUvFilterEnabled")) p->cameraUvFilterEnabled = flag;
+  else if (sameName(name, "scanNegativeInvert")) p->scanNegativeInvert = flag;
   else if (sameName(name, "colorAdaptation")) p->colorAdaptation = flag;
   else if (sameName(name, "colorAdaptationInputCompression")) p->colorAdaptationInputCompression = flag;
   else if (sameName(name, "colorAdaptationCurveSmoothing")) p->colorAdaptationCurveSmoothing = flag;
@@ -920,6 +946,26 @@ const char *SpektraAppOptionLabel(const char *optionSet, uint32_t index) {
     }
   }
   return "";
+}
+
+int32_t SpektraAppLinearRec2020ColorSpace(void) {
+  return static_cast<int32_t>(spektrafilm::ColorSpace::LinearRec2020);
+}
+
+int32_t SpektraAppLinearRec709ColorSpace(void) {
+  return static_cast<int32_t>(spektrafilm::ColorSpace::LinearRec709);
+}
+
+int32_t SpektraAppLinearP3D65ColorSpace(void) {
+  return static_cast<int32_t>(spektrafilm::ColorSpace::LinearP3D65);
+}
+
+int32_t SpektraAppSrgbColorSpace(void) {
+  return static_cast<int32_t>(spektrafilm::ColorSpace::Srgb);
+}
+
+int32_t SpektraAppDisplayP3ColorSpace(void) {
+  return static_cast<int32_t>(spektrafilm::ColorSpace::DisplayP3);
 }
 
 uint32_t SpektraAppFilmCount(void) {

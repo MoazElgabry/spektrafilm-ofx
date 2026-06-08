@@ -13,7 +13,7 @@ const uint kOpUnsharpBlurY = 7u;
 const uint kOpFinalize = 8u;
 const uint kOutputRoleDisplaySdr = 0u;
 const uint kOutputRoleDisplayHdr = 1u;
-const uint kOutputRoleSceneHandoff = 2u;
+const uint kOutputRoleRcm = 2u;
 const uint kLinearRec2020ColorSpace = 14u;
 
 const uint kFrameColorEncodeMin = 22u;
@@ -530,7 +530,7 @@ vec3 finalizeOutputRgb(vec3 rgb) {
       ? hlgDisplayNitsToSignal(nits, peak, compressOutputGamut)
       : vec3(encodePq(nits.r), encodePq(nits.g), encodePq(nits.b));
   }
-  if (u(kFrameIntOutputRole) == kOutputRoleSceneHandoff) {
+  if (u(kFrameIntOutputRole) == kOutputRoleRcm) {
     return encodeOutputRgb(rgb);
   }
   return encodeOutputRgb(outputGamutCompressDisplaySdr(rgb));

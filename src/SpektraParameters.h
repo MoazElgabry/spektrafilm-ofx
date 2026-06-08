@@ -7,6 +7,7 @@ namespace spektrafilm {
 enum class ProcessMode : int32_t {
   PrintSimulation = 0,
   ScanNegative = 1,
+  ProcessNegative = 2,
 };
 
 //Outdated
@@ -43,7 +44,7 @@ enum class PrintTimingMode : int32_t {
 enum class OutputRole : int32_t {
   DisplaySdr = 0,
   DisplayHdr = 1,
-  SceneHandoff = 2,
+  Rcm = 2,
 };
 
 enum class HdrPreset : int32_t {
@@ -123,6 +124,7 @@ enum class ColorSpace : int32_t {
 
 struct RenderParams {
   ProcessMode process = ProcessMode::PrintSimulation;
+  bool scanNegativeInvert = false;
   RenderOutputMode renderOutput = RenderOutputMode::FinalPreview;
   RgbToRawMethod rgbToRawMethod = RgbToRawMethod::Hanatos2026;
   ColorSpace inputColorSpace = ColorSpace::ArriLogC4;

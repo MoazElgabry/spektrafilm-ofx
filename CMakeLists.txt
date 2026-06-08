@@ -27,8 +27,8 @@ else()
 endif()
 
 # Define platform-specific version variables that can be overridden via command line
-set(SPEKTRAFILM_MACOS_VERSION "0.2.7" CACHE STRING "Version number for macOS release")
-set(SPEKTRAFILM_WINDOWS_VERSION "0.1.8" CACHE STRING "Version number for Windows release")
+set(SPEKTRAFILM_MACOS_VERSION "0.2.8" CACHE STRING "Version number for macOS release")
+set(SPEKTRAFILM_WINDOWS_VERSION "0.1.9" CACHE STRING "Version number for Windows release")
 set(SPEKTRAFILM_LINUX_VERSION "${SPEKTRAFILM_WINDOWS_VERSION}" CACHE STRING "Version number for Linux developer builds")
 
 # Set the active version based on the target OS
@@ -57,6 +57,7 @@ option(SPEKTRAFILM_METAL_FAST_MATH "Build Metal shaders with -ffast-math. Candid
 option(SPEKTRAFILM_METAL_PROFILE_SOURCES "Build Metal shader library with source/debug info for Xcode Metal profiling. Do not enable for release builds." OFF)
 option(SPEKTRAFILM_OFX_METAL_GPU_BUFFERS "Advertise OFX Metal GPU buffer renders on macOS. CPU rendering remains the fallback." ON)
 option(SPEKTRAFILM_RELEASE_LTO "Enable interprocedural optimization for Release native targets when supported." ON)
+option(SPEKTRAFILM_LINUX_STATIC_STDLIB "Static-link the Linux OFX plugin C++ runtime to avoid host stdlib symbol interposition." ON)
 set(SPEKTRAFILM_METAL_LANGUAGE_STANDARD "macos-metal2.3" CACHE STRING "Metal language standard used to build SpektraFilm.metallib.")
 set(SPEKTRAFILM_METAL_OPTIMIZATION_LEVEL "-O3" CACHE STRING "Optimization level passed to the Metal shader compiler.")
 set(SPEKTRAFILM_METAL_EXTRA_FLAGS "" CACHE STRING "Extra flags passed to the Metal shader compiler.")
@@ -482,6 +483,22 @@ function(configure_spektra_target target artifact_name display_name plugin_id fl
     )
     if(WIN32)
       target_link_libraries(${target} PRIVATE shell32 user32)
+    elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+      target_compile_options(${target} PRIVATE
+        -fvisibility=hidden
+        -fvisibility-inlines-hidden
+      )
+      target_link_libraries(${target} PRIVATE ${CMAKE_DL_LIBS})
+      target_link_options(${target} PRIVATE
+        -Wl,-Bsymbolic-functions
+        -Wl,--exclude-libs,ALL
+      )
+      if(SPEKTRAFILM_LINUX_STATIC_STDLIB)
+        target_link_options(${target} PRIVATE
+          -static-libstdc++
+          -static-libgcc
+        )
+      endif()
     else()
       target_link_libraries(${target} PRIVATE ${CMAKE_DL_LIBS})
     endif()

@@ -58,6 +58,8 @@
 #  define SPEKTRA_EXPORT __attribute__((visibility("default")))
 #elif defined _WIN32
 #  define SPEKTRA_EXPORT __declspec(dllexport)
+#elif defined __linux__
+#  define SPEKTRA_EXPORT __attribute__((visibility("default")))
 #else
 #  define SPEKTRA_EXPORT
 #endif
@@ -158,10 +160,12 @@ constexpr uint32_t flowDevelopment() {
 
 inline constexpr ParamMetadata kParamMetadata[] = {
   {"process", "colorGroup", flow()},
+  {"scanNegativeInvert", "colorGroup", flow()},
   {"inputColorSpace", "colorGroup", flow()},
+  {"rcmInputColorSpace", "colorGroup", flow()},
   {"outputRole", "colorGroup", flow()},
   {"sdrOutputColorSpace", "colorGroup", flow()},
-  {"sceneOutputColorSpace", "colorGroup", development()},
+  {"sceneOutputColorSpace", "colorGroup", kParamTagDevelopment},
   {"hdrPreset", "colorGroup", flow()},
   {"hdrTransfer", "colorGroup", flow()},
   {"hdrReferenceWhiteNits", "colorGroup", flow()},
@@ -371,26 +375,20 @@ constexpr bool flavorAllowsDevelopmentControls() {
   return kPluginFlavor == PluginFlavor::FilmDev;
 }
 
-constexpr bool flavorAllowsSceneHandoff() {
-  return flavorAllowsDevelopmentControls();
-}
-
 int grainModelOptionCountForFlavor() {
   return flavorAllowsDevelopmentControls() ? 3 : 2;
 }
 
 constexpr int outputRoleOptionCountForFlavor() {
-  return flavorAllowsSceneHandoff() ? 3 : 2;
+  return 3;
 }
 
 spektrafilm::OutputRole outputRoleForFlavor(int value) {
   switch (static_cast<spektrafilm::OutputRole>(value)) {
     case spektrafilm::OutputRole::DisplayHdr:
       return spektrafilm::OutputRole::DisplayHdr;
-    case spektrafilm::OutputRole::SceneHandoff:
-      return flavorAllowsSceneHandoff()
-        ? spektrafilm::OutputRole::SceneHandoff
-        : spektrafilm::OutputRole::DisplaySdr;
+    case spektrafilm::OutputRole::Rcm:
+      return spektrafilm::OutputRole::Rcm;
     case spektrafilm::OutputRole::DisplaySdr:
     default:
       return spektrafilm::OutputRole::DisplaySdr;
@@ -438,10 +436,12 @@ constexpr int kGrainSeedMax = 1000000;
 
 inline constexpr ParamDefault kParamDefaults[] = {
   intDefault("process", 0),
+  boolDefault("scanNegativeInvert", false),
   intDefault("inputColorSpace", 0),
+  intDefault("rcmInputColorSpace", 0),
   intDefault("outputRole", 0),
   intDefault("sdrOutputColorSpace", 8),
-  intDefault("sceneOutputColorSpace", 3),
+  intDefault("sceneOutputColorSpace", 0),
   intDefault("hdrPreset", 0),
   intDefault("hdrTransfer", 0),
   doubleDefault("hdrReferenceWhiteNits", 203.0),
@@ -704,9 +704,19 @@ struct InstanceData {
   OfxImageClipHandle sourceClip = nullptr;
   OfxImageClipHandle outputClip = nullptr;
 
+  OfxParamHandle filteringGroup = nullptr;
+  OfxParamHandle enlargerGroup = nullptr;
+  OfxParamHandle filmGroup = nullptr;
+  OfxParamHandle printGroup = nullptr;
+  OfxParamHandle couplerGroup = nullptr;
+  OfxParamHandle grainGroup = nullptr;
+  OfxParamHandle grainSynthesisGroup = nullptr;
+  OfxParamHandle halationGroup = nullptr;
   OfxParamHandle process = nullptr;
+  OfxParamHandle scanNegativeInvert = nullptr;
   OfxParamHandle rgbToRawMethod = nullptr;
   OfxParamHandle inputColorSpace = nullptr;
+  OfxParamHandle rcmInputColorSpace = nullptr;
   OfxParamHandle outputRole = nullptr;
   OfxParamHandle sdrOutputColorSpace = nullptr;
   OfxParamHandle sceneOutputColorSpace = nullptr;
@@ -832,6 +842,7 @@ struct InstanceData {
   OfxParamHandle printDiffusionHaloSize = nullptr;
   OfxParamHandle printDiffusionBloomIntensity = nullptr;
   OfxParamHandle printDiffusionBloomSize = nullptr;
+  OfxParamHandle scannerGroup = nullptr;
   OfxParamHandle scannerEnabled = nullptr;
   OfxParamHandle scannerWhiteCorrection = nullptr;
   OfxParamHandle scannerBlackCorrection = nullptr;
@@ -848,6 +859,10 @@ struct InstanceData {
   OfxParamHandle lutDestination = nullptr;
   OfxParamHandle lutIdentifier = nullptr;
   OfxParamHandle exportLut = nullptr;
+  OfxParamHandle presetName = nullptr;
+  OfxParamHandle presetSelection = nullptr;
+  OfxParamHandle savePreset = nullptr;
+  OfxParamHandle loadPreset = nullptr;
 
   double lastPrinterLights[3] = {0.0, 0.0, 0.0};
   bool lastPrinterLightsInitialized = false;
@@ -1189,9 +1204,15 @@ void syncConditionalParamVisibility(InstanceData *data) {
   );
   const bool sdrOutput = outputRole == spektrafilm::OutputRole::DisplaySdr;
   const bool hdrOutput = outputRole == spektrafilm::OutputRole::DisplayHdr;
-  const bool sceneHandoff = outputRole == spektrafilm::OutputRole::SceneHandoff;
+  const bool rcmOutput = outputRole == spektrafilm::OutputRole::Rcm;
+  const int processValue = getIntValue(data->process, 0);
+  const bool scanNegative = processValue == static_cast<int>(spektrafilm::ProcessMode::ScanNegative);
+  const bool processNegative = processValue == static_cast<int>(spektrafilm::ProcessMode::ProcessNegative);
+  setParamSecretForFlavor(data->scanNegativeInvert, "scanNegativeInvert", !scanNegative);
+  setParamSecretForFlavor(data->inputColorSpace, "inputColorSpace", rcmOutput);
+  setParamSecretForFlavor(data->rcmInputColorSpace, "rcmInputColorSpace", !rcmOutput);
   setParamSecretForFlavor(data->sdrOutputColorSpace, "sdrOutputColorSpace", !sdrOutput);
-  setParamSecretForFlavor(data->sceneOutputColorSpace, "sceneOutputColorSpace", !sceneHandoff);
+  setParamSecretForFlavor(data->sceneOutputColorSpace, "sceneOutputColorSpace", true);
   setParamSecretForFlavor(data->hdrPreset, "hdrPreset", !hdrOutput);
   setParamSecretForFlavor(data->hdrTransfer, "hdrTransfer", !hdrOutput);
   setParamSecretForFlavor(data->hdrReferenceWhiteNits, "hdrReferenceWhiteNits", !hdrOutput);
@@ -1202,10 +1223,140 @@ void syncConditionalParamVisibility(InstanceData *data) {
   const bool colorAdaptationEnabled = getBoolValue(data->colorAdaptation, false);
   setParamSecretForFlavor(data->colorAdaptationInputCompression, "colorAdaptationInputCompression", !colorAdaptationEnabled);
   setParamSecretForFlavor(data->colorAdaptationCurveSmoothing, "colorAdaptationCurveSmoothing", !colorAdaptationEnabled);
-  setParamSecretForFlavor(data->colorAdaptationOutputLightnessCompression, "colorAdaptationOutputLightnessCompression", !colorAdaptationEnabled);
-  setParamSecretForFlavor(data->colorAdaptationOutputChromaCompression, "colorAdaptationOutputChromaCompression", !colorAdaptationEnabled);
+  setParamSecretForFlavor(data->colorAdaptationOutputLightnessCompression, "colorAdaptationOutputLightnessCompression", !colorAdaptationEnabled || rcmOutput);
+  setParamSecretForFlavor(data->colorAdaptationOutputChromaCompression, "colorAdaptationOutputChromaCompression", !colorAdaptationEnabled || rcmOutput);
 
-  const bool synthesisModel = getIntValue(data->grainModel, static_cast<int>(spektrafilm::GrainModel::Preview)) ==
+  setParamSecretForFlavor(data->filteringGroup, "filteringGroup", processNegative);
+  setParamSecretForFlavor(data->cameraUvFilterEnabled, "cameraUvFilterEnabled", processNegative);
+  setParamSecretForFlavor(data->cameraUvCutNm, "cameraUvCutNm", processNegative);
+  setParamSecretForFlavor(data->cameraIrFilterEnabled, "cameraIrFilterEnabled", processNegative);
+  setParamSecretForFlavor(data->cameraIrCutNm, "cameraIrCutNm", processNegative);
+
+  const bool printStageHidden = scanNegative;
+  setParamSecretForFlavor(data->enlargerGroup, "enlargerGroup", processNegative || printStageHidden);
+  setParamSecretForFlavor(data->enlargerScale, "enlargerScale", processNegative || printStageHidden);
+  setParamSecretForFlavor(data->enlargerOffsetXPercent, "enlargerOffsetXPercent", processNegative || printStageHidden);
+  setParamSecretForFlavor(data->enlargerOffsetYPercent, "enlargerOffsetYPercent", processNegative || printStageHidden);
+
+  setParamSecretForFlavor(data->filmGroup, "filmGroup", processNegative);
+  setParamSecretForFlavor(data->rgbToRawMethod, "rgbToRawMethod", processNegative);
+  setParamSecretForFlavor(data->film, "film", processNegative);
+  setParamSecretForFlavor(data->filmFormat, "filmFormat", processNegative);
+  setParamSecretForFlavor(data->filmExposureEv, "filmExposureEv", processNegative);
+  setParamSecretForFlavor(data->autoExposure, "autoExposure", processNegative);
+  setParamSecretForFlavor(data->autoExposureMethod, "autoExposureMethod", processNegative);
+  setParamSecretForFlavor(data->filmPushPullMode, "filmPushPullMode", processNegative);
+  setParamSecretForFlavor(data->filmPushPullStops, "filmPushPullStops", processNegative);
+  setParamSecretForFlavor(data->negativeBleachBypassAmount, "negativeBleachBypassAmount", processNegative);
+  setParamSecretForFlavor(data->negativeLeucoCyanCoupling, "negativeLeucoCyanCoupling", processNegative);
+  setParamSecretForFlavor(data->filmGamma, "filmGamma", processNegative);
+
+  setParamSecretForFlavor(data->printGroup, "printGroup", printStageHidden);
+  setParamSecretForFlavor(data->paper, "paper", printStageHidden);
+  setParamSecretForFlavor(data->printTiming, "printTiming", printStageHidden);
+  setParamSecretForFlavor(data->printPushPullStops, "printPushPullStops", printStageHidden);
+  setParamSecretForFlavor(data->printBleachBypassAmount, "printBleachBypassAmount", printStageHidden);
+  setParamSecretForFlavor(data->printExposureEv, "printExposureEv", printStageHidden);
+  setParamSecretForFlavor(data->printGamma, "printGamma", printStageHidden);
+  setParamSecretForFlavor(data->printShadowShape, "printShadowShape", printStageHidden);
+  setParamSecretForFlavor(data->printHighlightShape, "printHighlightShape", printStageHidden);
+
+  setParamSecretForFlavor(data->couplerGroup, "couplerGroup", processNegative);
+  setParamSecretForFlavor(data->dirAmount, "dirCouplersAmount", processNegative);
+  setParamSecretForFlavor(data->dirDiffusionUm, "dirCouplersDiffusionUm", processNegative);
+  setParamSecretForFlavor(data->dirDiffusionTailUm, "dirCouplersDiffusionTailUm", processNegative);
+  setParamSecretForFlavor(data->dirDiffusionTailWeight, "dirCouplersDiffusionTailWeight", processNegative);
+  setParamSecretForFlavor(data->dirInhibitionSameLayer, "dirCouplersInhibitionSameLayer", processNegative);
+  setParamSecretForFlavor(data->dirInhibitionInterlayer, "dirCouplersInhibitionInterlayer", processNegative);
+  setParamSecretForFlavor(data->dirGammaSameLayerRgb, "dirGammaSameLayerRgb", processNegative);
+  setParamSecretForFlavor(data->dirGammaRToGb, "dirGammaRToGb", processNegative);
+  setParamSecretForFlavor(data->dirGammaGToRb, "dirGammaGToRb", processNegative);
+  setParamSecretForFlavor(data->dirGammaBToRg, "dirGammaBToRg", processNegative);
+  setParamSecretForFlavor(data->dirCalibrateToStock, "dirCalibrateToStock", processNegative);
+  setParamSecretForFlavor(data->dirUsesStockCalibration, "dirUsesStockCalibration", true);
+
+  setParamSecretForFlavor(data->grainGroup, "grainGroup", processNegative);
+  setParamSecretForFlavor(data->grainEnabled, "grainEnabled", processNegative);
+  setParamSecretForFlavor(data->grainModel, "grainModel", processNegative);
+  setParamSecretForFlavor(data->grainAmount, "grainAmount", processNegative);
+  setParamSecretForFlavor(data->grainSaturation, "grainSaturation", processNegative);
+  setParamSecretForFlavor(data->grainSublayersEnabled, "grainSublayersEnabled", processNegative);
+  setParamSecretForFlavor(data->grainSubLayerCount, "grainSubLayerCount", processNegative);
+  setParamSecretForFlavor(data->grainParticleAreaUm2, "grainParticleAreaUm2", processNegative);
+  setParamSecretForFlavor(data->grainParticleScale, "grainParticleScale", processNegative);
+  setParamSecretForFlavor(data->grainParticleScaleLayers, "grainParticleScaleLayers", processNegative);
+  setParamSecretForFlavor(data->grainDensityMin, "grainDensityMin", processNegative);
+  setParamSecretForFlavor(data->grainUniformity, "grainUniformity", processNegative);
+  setParamSecretForFlavor(data->grainFinalBlurUm, "grainFinalBlurUm", processNegative);
+  setParamSecretForFlavor(data->grainBlurDyeCloudsUm, "grainBlurDyeCloudsUm", processNegative);
+  setParamSecretForFlavor(data->grainMicroStructure, "grainMicroStructure", processNegative);
+  setParamSecretForFlavor(data->grainSeed, "grainSeed", processNegative);
+  setParamSecretForFlavor(data->grainAnimate, "grainAnimate", processNegative);
+
+  setParamSecretForFlavor(data->grainSynthesisGroup, "grainSynthesisGroup", processNegative || !flavorAllowsDevelopmentControls());
+  setParamSecretForFlavor(data->grainSynthesisSamples, "grainSynthesisSamples", processNegative);
+  setParamSecretForFlavor(data->grainSynthesisMeanRadiusUm, "grainSynthesisMeanRadiusUm", processNegative);
+  setParamSecretForFlavor(data->grainSynthesisRadiusStdDevRatio, "grainSynthesisRadiusStdDevRatio", processNegative);
+  setParamSecretForFlavor(data->grainSynthesisObservationSigmaUm, "grainSynthesisObservationSigmaUm", processNegative);
+  setParamSecretForFlavor(data->grainSynthesisCellSizeRatio, "grainSynthesisCellSizeRatio", processNegative);
+  setParamSecretForFlavor(data->grainSynthesisMaxRadiusQuantile, "grainSynthesisMaxRadiusQuantile", processNegative);
+  setParamSecretForFlavor(data->grainSynthesisCoverageEpsilon, "grainSynthesisCoverageEpsilon", processNegative);
+  setParamSecretForFlavor(data->grainSynthesisMaxGrainsPerCell, "grainSynthesisMaxGrainsPerCell", processNegative);
+  setParamSecretForFlavor(data->grainSynthesisRadiusScale, "grainSynthesisRadiusScale", processNegative);
+  setParamSecretForFlavor(data->grainSynthesisLayerScale, "grainSynthesisLayerScale", processNegative);
+  setParamSecretForFlavor(data->grainSynthesisLayered, "grainSynthesisLayered", processNegative);
+
+  setParamSecretForFlavor(data->halationGroup, "halationGroup", processNegative);
+  setParamSecretForFlavor(data->halationEnabled, "halationEnabled", processNegative);
+  setParamSecretForFlavor(data->scatterAmount, "scatterAmount", processNegative);
+  setParamSecretForFlavor(data->scatterScale, "scatterScale", processNegative);
+  setParamSecretForFlavor(data->halationAmount, "halationAmount", processNegative);
+  setParamSecretForFlavor(data->halationScale, "halationScale", processNegative);
+  setParamSecretForFlavor(data->halationStrength, "halationStrength", processNegative);
+  setParamSecretForFlavor(data->halationBoostEv, "halationBoostEv", processNegative);
+  setParamSecretForFlavor(data->halationBoostRange, "halationBoostRange", processNegative);
+  setParamSecretForFlavor(data->halationProtectEv, "halationProtectEv", processNegative);
+
+  setParamSecretForFlavor(data->cameraDiffusionEnabled, "cameraDiffusionEnabled", processNegative);
+  setParamSecretForFlavor(data->cameraDiffusionFamily, "cameraDiffusionFamily", processNegative);
+  setParamSecretForFlavor(data->cameraDiffusionStrength, "cameraDiffusionStrength", processNegative);
+  setParamSecretForFlavor(data->cameraDiffusionSpatialScale, "cameraDiffusionSpatialScale", processNegative);
+  setParamSecretForFlavor(data->cameraDiffusionHaloWarmth, "cameraDiffusionHaloWarmth", processNegative);
+  setParamSecretForFlavor(data->cameraDiffusionCoreIntensity, "cameraDiffusionCoreIntensity", processNegative);
+  setParamSecretForFlavor(data->cameraDiffusionCoreSize, "cameraDiffusionCoreSize", processNegative);
+  setParamSecretForFlavor(data->cameraDiffusionHaloIntensity, "cameraDiffusionHaloIntensity", processNegative);
+  setParamSecretForFlavor(data->cameraDiffusionHaloSize, "cameraDiffusionHaloSize", processNegative);
+  setParamSecretForFlavor(data->cameraDiffusionBloomIntensity, "cameraDiffusionBloomIntensity", processNegative);
+  setParamSecretForFlavor(data->cameraDiffusionBloomSize, "cameraDiffusionBloomSize", processNegative);
+
+  setParamSecretForFlavor(data->printDiffusionEnabled, "printDiffusionEnabled", printStageHidden);
+  setParamSecretForFlavor(data->printDiffusionFamily, "printDiffusionFamily", printStageHidden);
+  setParamSecretForFlavor(data->printDiffusionStrength, "printDiffusionStrength", printStageHidden);
+  setParamSecretForFlavor(data->printDiffusionSpatialScale, "printDiffusionSpatialScale", printStageHidden);
+  setParamSecretForFlavor(data->printDiffusionHaloWarmth, "printDiffusionHaloWarmth", printStageHidden);
+  setParamSecretForFlavor(data->printDiffusionCoreIntensity, "printDiffusionCoreIntensity", printStageHidden);
+  setParamSecretForFlavor(data->printDiffusionCoreSize, "printDiffusionCoreSize", printStageHidden);
+  setParamSecretForFlavor(data->printDiffusionHaloIntensity, "printDiffusionHaloIntensity", printStageHidden);
+  setParamSecretForFlavor(data->printDiffusionHaloSize, "printDiffusionHaloSize", printStageHidden);
+  setParamSecretForFlavor(data->printDiffusionBloomIntensity, "printDiffusionBloomIntensity", printStageHidden);
+  setParamSecretForFlavor(data->printDiffusionBloomSize, "printDiffusionBloomSize", printStageHidden);
+
+  const bool scannerHidden = rcmOutput;
+  const bool printScanGlareHidden = scannerHidden || scanNegative;
+  setParamSecretForFlavor(data->scannerGroup, "scannerGroup", scannerHidden);
+  setParamSecretForFlavor(data->scannerEnabled, "scannerEnabled", scannerHidden);
+  setParamSecretForFlavor(data->scannerWhiteCorrection, "scannerWhiteCorrection", scannerHidden);
+  setParamSecretForFlavor(data->scannerBlackCorrection, "scannerBlackCorrection", scannerHidden);
+  setParamSecretForFlavor(data->scannerWhiteLevel, "scannerWhiteLevel", scannerHidden);
+  setParamSecretForFlavor(data->scannerBlackLevel, "scannerBlackLevel", scannerHidden);
+  setParamSecretForFlavor(data->glarePercent, "glarePercent", printScanGlareHidden);
+  setParamSecretForFlavor(data->glareRoughness, "glareRoughness", printScanGlareHidden);
+  setParamSecretForFlavor(data->glareBlur, "glareBlur", printScanGlareHidden);
+  setParamSecretForFlavor(data->scannerMtf50LpMm, "scannerMtf50LpMm", scannerHidden);
+  setParamSecretForFlavor(data->scannerUnsharpRadiusUm, "scannerUnsharpRadiusUm", scannerHidden);
+  setParamSecretForFlavor(data->scannerUnsharpAmount, "scannerUnsharpAmount", scannerHidden);
+
+  const bool synthesisModel = !processNegative && getIntValue(data->grainModel, static_cast<int>(spektrafilm::GrainModel::Preview)) ==
     static_cast<int>(spektrafilm::GrainModel::GrainSynthesis);
   setParamSecretForFlavor(data->grainSynthesisSize, "grainSynthesisSize", !synthesisModel);
   setParamSecretForFlavor(data->grainSynthesisAmount, "grainSynthesisAmount", !synthesisModel);
@@ -1213,22 +1364,23 @@ void syncConditionalParamVisibility(InstanceData *data) {
   setParamSecretForFlavor(data->grainSynthesisQuality, "grainSynthesisQuality", !synthesisModel);
 
   const bool sublayersEnabled = getBoolValue(data->grainSublayersEnabled, true);
-  setParamSecretForFlavor(data->grainSubLayerCount, "grainSubLayerCount", sublayersEnabled);
+  setParamSecretForFlavor(data->grainSubLayerCount, "grainSubLayerCount", processNegative || sublayersEnabled);
 
   const bool apdPrintTiming = spektrafilm::kSpektraAcademyPrinterDensityEnabled &&
     getIntValue(data->printTiming, static_cast<int>(spektrafilm::PrintTimingMode::FilteredEnlarger)) ==
     static_cast<int>(spektrafilm::PrintTimingMode::ApdPrinterDensity);
-  setParamSecretForFlavor(data->filterC, "filterC", apdPrintTiming);
-  setParamSecretForFlavor(data->filterMShift, "filterMShift", apdPrintTiming);
-  setParamSecretForFlavor(data->filterYShift, "filterYShift", apdPrintTiming);
-  setParamSecretForFlavor(data->preflashMFilterShift, "preflashMFilterShift", apdPrintTiming);
-  setParamSecretForFlavor(data->preflashYFilterShift, "preflashYFilterShift", apdPrintTiming);
-  setParamSecretForFlavor(data->printerLightsGang, "printerLightsGang", !apdPrintTiming);
-  setParamSecretForFlavor(data->printerLightsGroup, "printerLightsGroup", !apdPrintTiming);
-  setParamSecretForFlavor(data->printerLightR, "printerLightR", !apdPrintTiming);
-  setParamSecretForFlavor(data->printerLightG, "printerLightG", !apdPrintTiming);
-  setParamSecretForFlavor(data->printerLightB, "printerLightB", !apdPrintTiming);
-  setParamSecretForFlavor(data->printerLightCalibration, "printerLightCalibration", !apdPrintTiming);
+  setParamSecretForFlavor(data->filterC, "filterC", scanNegative || apdPrintTiming);
+  setParamSecretForFlavor(data->filterMShift, "filterMShift", scanNegative || apdPrintTiming);
+  setParamSecretForFlavor(data->filterYShift, "filterYShift", scanNegative || apdPrintTiming);
+  setParamSecretForFlavor(data->preflashExposure, "preflashExposure", scanNegative || processNegative);
+  setParamSecretForFlavor(data->preflashMFilterShift, "preflashMFilterShift", scanNegative || processNegative || apdPrintTiming);
+  setParamSecretForFlavor(data->preflashYFilterShift, "preflashYFilterShift", scanNegative || processNegative || apdPrintTiming);
+  setParamSecretForFlavor(data->printerLightsGang, "printerLightsGang", scanNegative || !apdPrintTiming);
+  setParamSecretForFlavor(data->printerLightsGroup, "printerLightsGroup", scanNegative || !apdPrintTiming);
+  setParamSecretForFlavor(data->printerLightR, "printerLightR", scanNegative || !apdPrintTiming);
+  setParamSecretForFlavor(data->printerLightG, "printerLightG", scanNegative || !apdPrintTiming);
+  setParamSecretForFlavor(data->printerLightB, "printerLightB", scanNegative || !apdPrintTiming);
+  setParamSecretForFlavor(data->printerLightCalibration, "printerLightCalibration", scanNegative || !apdPrintTiming);
 
   const bool lutExportAllowed = outputRole == spektrafilm::OutputRole::DisplaySdr;
   setParamEnabled(data->exportLut, lutExportAllowed);
@@ -1351,17 +1503,9 @@ spektrafilm::RenderParams readParams(InstanceData *data, OfxTime time) {
     spektrafilm::ColorSpace::Rec709Gamma22,
     spektrafilm::ColorSpace::Rec709Gamma24,
   };
-  constexpr spektrafilm::ColorSpace kSceneOutputColorSpaces[] = {
-    spektrafilm::ColorSpace::ArriLogC4,
-    spektrafilm::ColorSpace::ArriLogC3Ei800,
-    spektrafilm::ColorSpace::BmdFilmWideGamutGen5,
+  constexpr spektrafilm::ColorSpace kRcmInputColorSpaces[] = {
     spektrafilm::ColorSpace::DavinciIntermediateWideGamut,
-    spektrafilm::ColorSpace::RedLog3G10RedWideGamutRgb,
-    spektrafilm::ColorSpace::SonySLog3SGamut3,
-    spektrafilm::ColorSpace::SonySLog3SGamut3Cine,
-    spektrafilm::ColorSpace::CanonLog2CinemaGamutD55,
-    spektrafilm::ColorSpace::CanonLog3CinemaGamutD55,
-    spektrafilm::ColorSpace::PanasonicVLogVGamut,
+    spektrafilm::ColorSpace::BmdFilmWideGamutGen5,
     spektrafilm::ColorSpace::Aces2065_1,
     spektrafilm::ColorSpace::AcesCg,
     spektrafilm::ColorSpace::AcesCct,
@@ -1369,22 +1513,42 @@ spektrafilm::RenderParams readParams(InstanceData *data, OfxTime time) {
     spektrafilm::ColorSpace::LinearRec2020,
     spektrafilm::ColorSpace::LinearRec709,
     spektrafilm::ColorSpace::LinearP3D65,
+    spektrafilm::ColorSpace::Rec709Gamma24,
+    spektrafilm::ColorSpace::Rec709Gamma22,
+    spektrafilm::ColorSpace::Srgb,
+    spektrafilm::ColorSpace::DisplayP3,
+    spektrafilm::ColorSpace::P3D65Gamma22,
+    spektrafilm::ColorSpace::P3D65Gamma26,
+    spektrafilm::ColorSpace::DciP3,
   };
 
   spektrafilm::RenderParams params{};
-  params.process = getIntAtTime(data->process, time, 0) == 1
-    ? spektrafilm::ProcessMode::ScanNegative
-    : spektrafilm::ProcessMode::PrintSimulation;
+  switch (getIntAtTime(data->process, time, 0)) {
+    case 1:
+      params.process = spektrafilm::ProcessMode::ScanNegative;
+      break;
+    case 2:
+      params.process = spektrafilm::ProcessMode::ProcessNegative;
+      break;
+    case 0:
+    default:
+      params.process = spektrafilm::ProcessMode::PrintSimulation;
+      break;
+  }
   params.rgbToRawMethod = rgbToRawMethodFromChoice(getIntAtTime(data->rgbToRawMethod, time, 0));
+  if (params.process == spektrafilm::ProcessMode::ProcessNegative) {
+    params.rgbToRawMethod = spektrafilm::RgbToRawMethod::Hanatos2026;
+  }
   params.inputColorSpace = static_cast<spektrafilm::ColorSpace>(getIntAtTime(data->inputColorSpace, time, 0));
   params.outputRole = outputRoleForFlavor(getIntAtTime(data->outputRole, time, 0));
-  if (params.outputRole == spektrafilm::OutputRole::SceneHandoff) {
-    const int sceneIndex = std::clamp(
-      getIntAtTime(data->sceneOutputColorSpace, time, 3),
+  if (params.outputRole == spektrafilm::OutputRole::Rcm) {
+    const int rcmIndex = std::clamp(
+      getIntAtTime(data->rcmInputColorSpace, time, 0),
       0,
-      static_cast<int>(std::size(kSceneOutputColorSpaces) - 1u)
+      static_cast<int>(std::size(kRcmInputColorSpaces) - 1u)
     );
-    params.outputColorSpace = kSceneOutputColorSpaces[sceneIndex];
+    params.inputColorSpace = kRcmInputColorSpaces[rcmIndex];
+    params.outputColorSpace = kRcmInputColorSpaces[rcmIndex];
   } else {
     const int sdrIndex = std::clamp(
       getIntAtTime(data->sdrOutputColorSpace, time, 8),
@@ -1393,6 +1557,7 @@ spektrafilm::RenderParams readParams(InstanceData *data, OfxTime time) {
     );
     params.outputColorSpace = kSdrOutputColorSpaces[sdrIndex];
   }
+  params.scanNegativeInvert = getBoolAtTime(data->scanNegativeInvert, time, false);
   params.hdrPreset = static_cast<spektrafilm::HdrPreset>(getIntAtTime(data->hdrPreset, time, 0));
   params.hdrTransfer = static_cast<spektrafilm::HdrTransfer>(getIntAtTime(data->hdrTransfer, time, 0));
   params.hdrReferenceWhiteNits = static_cast<float>(getDoubleAtTime(data->hdrReferenceWhiteNits, time, 203.0));
@@ -1613,6 +1778,27 @@ spektrafilm::RenderParams readParams(InstanceData *data, OfxTime time) {
   params.gpuRenderTiling = getIntAtTime(data->gpuRenderTiling, time, 0) == 1
     ? spektrafilm::GpuRenderTilingMode::Tiled
     : spektrafilm::GpuRenderTilingMode::LegacyFullFrame;
+  if (params.process == spektrafilm::ProcessMode::ProcessNegative) {
+    params.rgbToRawMethod = spektrafilm::RgbToRawMethod::Hanatos2026;
+    params.film = static_cast<int32_t>(spektrafilm::kSpektraDefaultFilmIndex);
+    params.filmFormat = spektrafilm::FilmFormat::Standard35;
+    params.cameraUvFilterEnabled = false;
+    params.cameraIrFilterEnabled = false;
+    params.filmExposureEv = 0.0f;
+    params.autoExposure = false;
+    params.filmPushPullMode = spektrafilm::PushPullMode::Standard;
+    params.filmPushPullStops = 0.0f;
+    params.negativeBleachBypassAmount = 0.0f;
+    params.negativeLeucoCyanCoupling = 1.0f;
+    params.filmGamma = 1.0f;
+    params.enlargerScale = 1.0f;
+    params.enlargerOffsetXPercent = 0.0f;
+    params.enlargerOffsetYPercent = 0.0f;
+    params.dirCouplersAmount = 0.0f;
+    params.grainEnabled = false;
+    params.halationEnabled = false;
+    params.cameraDiffusionEnabled = false;
+  }
   return params;
 }
 
@@ -2558,15 +2744,23 @@ const char *pluginFlavorName() {
 }
 
 const char *processName(spektrafilm::ProcessMode process) {
-  return process == spektrafilm::ProcessMode::ScanNegative ? "Scan negative" : "Print simulation";
+  switch (process) {
+    case spektrafilm::ProcessMode::ScanNegative:
+      return "Scan negative";
+    case spektrafilm::ProcessMode::ProcessNegative:
+      return "Process negative";
+    case spektrafilm::ProcessMode::PrintSimulation:
+    default:
+      return "Print simulation";
+  }
 }
 
 const char *outputRoleName(spektrafilm::OutputRole role) {
   switch (role) {
     case spektrafilm::OutputRole::DisplayHdr:
       return "Display Out HDR";
-    case spektrafilm::OutputRole::SceneHandoff:
-      return "Scene Handoff (Dev)";
+    case spektrafilm::OutputRole::Rcm:
+      return "RCM/ACES (Beta)";
     case spektrafilm::OutputRole::DisplaySdr:
     default:
       return "Display Out SDR";
@@ -2668,6 +2862,32 @@ std::string currentDatePrefix() {
   return out.str();
 }
 
+std::string currentTimestampSuffix() {
+  std::time_t now = std::time(nullptr);
+  std::tm local{};
+#if defined _WIN32
+  localtime_s(&local, &now);
+#else
+  localtime_r(&now, &local);
+#endif
+  std::ostringstream out;
+  out << std::put_time(&local, "%y%m%d_%H%M%S");
+  return out.str();
+}
+
+std::string currentReadableTimestamp() {
+  std::time_t now = std::time(nullptr);
+  std::tm local{};
+#if defined _WIN32
+  localtime_s(&local, &now);
+#else
+  localtime_r(&now, &local);
+#endif
+  std::ostringstream out;
+  out << std::put_time(&local, "%Y-%m-%d %H:%M:%S");
+  return out.str();
+}
+
 std::string randomExportCode() {
   static std::mt19937 generator{std::random_device{}()};
   static std::uniform_int_distribution<int> distribution(0, 0xffffff);
@@ -2739,6 +2959,14 @@ std::filesystem::path userLutFolder() {
   return homeFolder() / "Movies" / "spektrafilm";
 #else
   return homeFolder() / "spektrafilm";
+#endif
+}
+
+std::filesystem::path userDocumentsFolder() {
+#if defined _WIN32
+  return homeFolder() / "Documents";
+#else
+  return homeFolder() / "Documents";
 #endif
 }
 
@@ -2965,6 +3193,462 @@ std::string getStringValue(OfxParamHandle handle) {
     return {};
   }
   return value;
+}
+
+constexpr const char *kPresetExtension = ".spkpreset";
+constexpr const char *kPresetFormat = "spektrafilm-preset-v1";
+
+struct PresetEntry {
+  std::string displayName;
+  std::string created;
+  std::filesystem::path path;
+};
+
+std::filesystem::path presetFolder() {
+  return userDocumentsFolder() / "spektrafilm" / "presets";
+}
+
+std::string lowercaseAscii(std::string value) {
+  for (char &ch : value) {
+    ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  }
+  return value;
+}
+
+bool isPresetFilePath(const std::filesystem::path &path) {
+  return lowercaseAscii(path.extension().string()) == kPresetExtension;
+}
+
+std::string trimString(std::string value) {
+  const auto isSpace = [](unsigned char ch) {
+    return std::isspace(ch) != 0;
+  };
+  while (!value.empty() && isSpace(static_cast<unsigned char>(value.front()))) {
+    value.erase(value.begin());
+  }
+  while (!value.empty() && isSpace(static_cast<unsigned char>(value.back()))) {
+    value.pop_back();
+  }
+  return value;
+}
+
+std::string jsonEscape(const std::string &value) {
+  std::ostringstream out;
+  for (unsigned char ch : value) {
+    switch (ch) {
+      case '\\':
+        out << "\\\\";
+        break;
+      case '"':
+        out << "\\\"";
+        break;
+      case '\b':
+        out << "\\b";
+        break;
+      case '\f':
+        out << "\\f";
+        break;
+      case '\n':
+        out << "\\n";
+        break;
+      case '\r':
+        out << "\\r";
+        break;
+      case '\t':
+        out << "\\t";
+        break;
+      default:
+        if (ch < 0x20u) {
+          out << "\\u" << std::hex << std::setw(4) << std::setfill('0') << static_cast<int>(ch) << std::dec;
+        } else {
+          out << static_cast<char>(ch);
+        }
+        break;
+    }
+  }
+  return out.str();
+}
+
+bool appendUtf8Codepoint(uint32_t codepoint, std::string &out) {
+  if (codepoint <= 0x7fu) {
+    out.push_back(static_cast<char>(codepoint));
+    return true;
+  }
+  if (codepoint <= 0x7ffu) {
+    out.push_back(static_cast<char>(0xc0u | (codepoint >> 6u)));
+    out.push_back(static_cast<char>(0x80u | (codepoint & 0x3fu)));
+    return true;
+  }
+  if (codepoint <= 0xffffu) {
+    out.push_back(static_cast<char>(0xe0u | (codepoint >> 12u)));
+    out.push_back(static_cast<char>(0x80u | ((codepoint >> 6u) & 0x3fu)));
+    out.push_back(static_cast<char>(0x80u | (codepoint & 0x3fu)));
+    return true;
+  }
+  if (codepoint <= 0x10ffffu) {
+    out.push_back(static_cast<char>(0xf0u | (codepoint >> 18u)));
+    out.push_back(static_cast<char>(0x80u | ((codepoint >> 12u) & 0x3fu)));
+    out.push_back(static_cast<char>(0x80u | ((codepoint >> 6u) & 0x3fu)));
+    out.push_back(static_cast<char>(0x80u | (codepoint & 0x3fu)));
+    return true;
+  }
+  return false;
+}
+
+int hexNibble(char ch) {
+  if (ch >= '0' && ch <= '9') {
+    return ch - '0';
+  }
+  if (ch >= 'a' && ch <= 'f') {
+    return 10 + ch - 'a';
+  }
+  if (ch >= 'A' && ch <= 'F') {
+    return 10 + ch - 'A';
+  }
+  return -1;
+}
+
+bool jsonUnescapeString(const std::string &text, size_t &pos, std::string &value) {
+  if (pos >= text.size() || text[pos] != '"') {
+    return false;
+  }
+  ++pos;
+  std::string decoded;
+  while (pos < text.size()) {
+    const char ch = text[pos++];
+    if (ch == '"') {
+      value = std::move(decoded);
+      return true;
+    }
+    if (ch != '\\') {
+      decoded.push_back(ch);
+      continue;
+    }
+    if (pos >= text.size()) {
+      return false;
+    }
+    const char escaped = text[pos++];
+    switch (escaped) {
+      case '"':
+      case '\\':
+      case '/':
+        decoded.push_back(escaped);
+        break;
+      case 'b':
+        decoded.push_back('\b');
+        break;
+      case 'f':
+        decoded.push_back('\f');
+        break;
+      case 'n':
+        decoded.push_back('\n');
+        break;
+      case 'r':
+        decoded.push_back('\r');
+        break;
+      case 't':
+        decoded.push_back('\t');
+        break;
+      case 'u': {
+        if (pos + 4u > text.size()) {
+          return false;
+        }
+        uint32_t codepoint = 0;
+        for (int i = 0; i < 4; ++i) {
+          const int nibble = hexNibble(text[pos++]);
+          if (nibble < 0) {
+            return false;
+          }
+          codepoint = (codepoint << 4u) | static_cast<uint32_t>(nibble);
+        }
+        if (!appendUtf8Codepoint(codepoint, decoded)) {
+          return false;
+        }
+        break;
+      }
+      default:
+        return false;
+    }
+  }
+  return false;
+}
+
+bool extractJsonString(const std::string &text, const char *key, std::string &value) {
+  const std::string quotedKey = std::string("\"") + key + "\"";
+  size_t pos = text.find(quotedKey);
+  if (pos == std::string::npos) {
+    return false;
+  }
+  pos += quotedKey.size();
+  while (pos < text.size() && std::isspace(static_cast<unsigned char>(text[pos]))) {
+    ++pos;
+  }
+  if (pos >= text.size() || text[pos] != ':') {
+    return false;
+  }
+  ++pos;
+  while (pos < text.size() && std::isspace(static_cast<unsigned char>(text[pos]))) {
+    ++pos;
+  }
+  return jsonUnescapeString(text, pos, value);
+}
+
+std::string hexEncode(const std::string &value) {
+  constexpr char digits[] = "0123456789abcdef";
+  std::string encoded;
+  encoded.reserve(value.size() * 2u);
+  for (unsigned char ch : value) {
+    encoded.push_back(digits[ch >> 4u]);
+    encoded.push_back(digits[ch & 0x0fu]);
+  }
+  return encoded;
+}
+
+bool hexDecode(const std::string &value, std::string &decoded) {
+  if ((value.size() % 2u) != 0u) {
+    return false;
+  }
+  std::string out;
+  out.reserve(value.size() / 2u);
+  for (size_t i = 0; i < value.size(); i += 2u) {
+    const int high = hexNibble(value[i]);
+    const int low = hexNibble(value[i + 1u]);
+    if (high < 0 || low < 0) {
+      return false;
+    }
+    out.push_back(static_cast<char>((high << 4) | low));
+  }
+  decoded = std::move(out);
+  return true;
+}
+
+bool readTextFile(const std::filesystem::path &path, std::string &text, std::string &error) {
+  std::ifstream input(path, std::ios::binary);
+  if (!input) {
+    error = "Could not open spektrafilm preset file for reading: " + path.string();
+    return false;
+  }
+  text.assign(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+  if (!input.good() && !input.eof()) {
+    error = "Could not read spektrafilm preset file: " + path.string();
+    return false;
+  }
+  return true;
+}
+
+bool writePresetFile(
+  const std::filesystem::path &path,
+  const std::string &displayName,
+  const DefaultsSnapshot &snapshot,
+  std::string &error
+) {
+  error.clear();
+  std::error_code ec;
+  std::filesystem::create_directories(path.parent_path(), ec);
+  if (ec) {
+    error = "Could not create spektrafilm preset folder: " + path.parent_path().string();
+    return false;
+  }
+
+  std::string payload = encodeDefaultsSnapshot(snapshot);
+  obfuscateDefaultsText(payload);
+
+  std::ostringstream json;
+  json << "{\n";
+  json << "  \"format\": \"" << kPresetFormat << "\",\n";
+  json << "  \"name\": \"" << jsonEscape(displayName) << "\",\n";
+  json << "  \"created\": \"" << jsonEscape(currentReadableTimestamp()) << "\",\n";
+  json << "  \"plugin\": \"" << jsonEscape(pluginFlavorName()) << "\",\n";
+  json << "  \"version\": \"" << jsonEscape(SPEKTRAFILM_VERSION_STRING) << "\",\n";
+  json << "  \"payload_encoding\": \"obfuscated-snapshot-hex\",\n";
+  json << "  \"payload_hex\": \"" << hexEncode(payload) << "\"\n";
+  json << "}\n";
+
+  const std::filesystem::path tempPath = path.string() + ".tmp";
+  {
+    std::ofstream output(tempPath, std::ios::binary | std::ios::trunc);
+    if (!output) {
+      error = "Could not open spektrafilm preset file for writing: " + tempPath.string();
+      return false;
+    }
+    const std::string text = json.str();
+    output.write(text.data(), static_cast<std::streamsize>(text.size()));
+    if (!output) {
+      error = "Could not write spektrafilm preset file: " + tempPath.string();
+      return false;
+    }
+  }
+
+  std::filesystem::rename(tempPath, path, ec);
+  if (ec) {
+    std::filesystem::remove(path, ec);
+    ec.clear();
+    std::filesystem::rename(tempPath, path, ec);
+  }
+  if (ec) {
+    error = "Could not replace spektrafilm preset file: " + path.string();
+    return false;
+  }
+  return true;
+}
+
+bool readPresetSnapshot(
+  const std::filesystem::path &path,
+  DefaultsSnapshot &snapshot,
+  std::string &displayName,
+  std::string &error
+) {
+  error.clear();
+  std::string text;
+  if (!readTextFile(path, text, error)) {
+    return false;
+  }
+
+  std::string format;
+  if (!extractJsonString(text, "format", format) || format != kPresetFormat) {
+    error = "spektrafilm preset file is not a recognized preset: " + path.string();
+    return false;
+  }
+  if (!extractJsonString(text, "name", displayName)) {
+    displayName = path.stem().string();
+  }
+  std::string payloadEncoding;
+  if (!extractJsonString(text, "payload_encoding", payloadEncoding) || payloadEncoding != "obfuscated-snapshot-hex") {
+    error = "spektrafilm preset file uses an unsupported payload encoding: " + path.string();
+    return false;
+  }
+  std::string payloadHex;
+  if (!extractJsonString(text, "payload_hex", payloadHex)) {
+    error = "spektrafilm preset file is missing its snapshot payload: " + path.string();
+    return false;
+  }
+  std::string payload;
+  if (!hexDecode(payloadHex, payload)) {
+    error = "spektrafilm preset file contains an invalid snapshot payload: " + path.string();
+    return false;
+  }
+  obfuscateDefaultsText(payload);
+  DefaultsSnapshot decoded;
+  if (!decodeDefaultsSnapshot(payload, decoded)) {
+    error = "spektrafilm preset file payload is not a recognized params snapshot: " + path.string();
+    return false;
+  }
+  snapshot = std::move(decoded);
+  return true;
+}
+
+PresetEntry presetEntryForPath(const std::filesystem::path &path) {
+  PresetEntry entry{};
+  entry.path = path;
+  entry.displayName = path.stem().string();
+  std::string text;
+  std::string ignoredError;
+  if (readTextFile(path, text, ignoredError)) {
+    std::string name;
+    if (extractJsonString(text, "name", name) && !trimString(name).empty()) {
+      entry.displayName = name;
+    }
+    extractJsonString(text, "created", entry.created);
+  }
+  return entry;
+}
+
+std::vector<PresetEntry> listPresetEntries() {
+  std::vector<PresetEntry> entries;
+  std::error_code ec;
+  const std::filesystem::path folder = presetFolder();
+  if (!std::filesystem::exists(folder, ec)) {
+    return entries;
+  }
+  for (std::filesystem::directory_iterator it(folder, ec), end; !ec && it != end; it.increment(ec)) {
+    std::error_code fileEc;
+    if (!it->is_regular_file(fileEc) || fileEc) {
+      continue;
+    }
+    if (!isPresetFilePath(it->path())) {
+      continue;
+    }
+    entries.push_back(presetEntryForPath(it->path()));
+  }
+  std::sort(entries.begin(), entries.end(), [](const PresetEntry &a, const PresetEntry &b) {
+    const int nameCompare = a.displayName.compare(b.displayName);
+    if (nameCompare != 0) {
+      return nameCompare < 0;
+    }
+    const int createdCompare = a.created.compare(b.created);
+    if (createdCompare != 0) {
+      return createdCompare < 0;
+    }
+    return a.path.string() < b.path.string();
+  });
+  return entries;
+}
+
+std::vector<std::string> presetChoiceLabels(const std::vector<PresetEntry> &entries) {
+  if (entries.empty()) {
+    return {"No presets found"};
+  }
+  std::vector<std::string> labels;
+  labels.reserve(entries.size());
+  for (const PresetEntry &entry : entries) {
+    labels.push_back(entry.displayName.empty() ? entry.path.stem().string() : entry.displayName);
+  }
+  return labels;
+}
+
+bool samePresetPath(const std::filesystem::path &a, const std::filesystem::path &b) {
+  return a.lexically_normal().string() == b.lexically_normal().string();
+}
+
+int presetIndexForPath(const std::vector<PresetEntry> &entries, const std::filesystem::path &path) {
+  for (size_t i = 0; i < entries.size(); ++i) {
+    if (samePresetPath(entries[i].path, path)) {
+      return static_cast<int>(i);
+    }
+  }
+  return entries.empty() ? 0 : static_cast<int>(entries.size() - 1u);
+}
+
+void refreshPresetDropdown(InstanceData *data, const std::filesystem::path &selectedPath = {}) {
+  if (!data || !data->presetSelection || !gParamHost || !gPropHost) {
+    return;
+  }
+  const std::vector<PresetEntry> entries = listPresetEntries();
+  const std::vector<std::string> labels = presetChoiceLabels(entries);
+  std::vector<const char *> labelPointers;
+  labelPointers.reserve(labels.size());
+  for (const std::string &label : labels) {
+    labelPointers.push_back(label.c_str());
+  }
+
+  OfxPropertySetHandle props = nullptr;
+  if (gParamHost->paramGetPropertySet(data->presetSelection, &props) == kOfxStatOK && props) {
+    gPropHost->propReset(props, kOfxParamPropChoiceOption);
+    gPropHost->propSetStringN(props, kOfxParamPropChoiceOption, static_cast<int>(labelPointers.size()), labelPointers.data());
+  }
+
+  const int selected = !selectedPath.empty() ? presetIndexForPath(entries, selectedPath) : std::clamp(getIntValue(data->presetSelection, 0), 0, static_cast<int>(labels.size() - 1u));
+  gParamHost->paramSetValue(data->presetSelection, selected);
+}
+
+std::string normalizedPresetName(const std::string &rawName) {
+  const std::string trimmed = trimString(rawName);
+  return trimmed.empty() ? "spektrafilm_preset" : trimmed;
+}
+
+std::filesystem::path generatedPresetPath(const std::string &displayName) {
+  const std::filesystem::path folder = presetFolder();
+  const std::string cleanName = sanitizePathComponent(displayName.empty() ? "spektrafilm_preset" : displayName);
+  const std::string timestamp = currentTimestampSuffix();
+  for (int attempt = 0; attempt < 64; ++attempt) {
+    const std::string suffix = attempt == 0 ? timestamp : timestamp + "_" + randomExportCode();
+    const std::filesystem::path path = folder / (cleanName + "_" + suffix + kPresetExtension);
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec)) {
+      return path;
+    }
+  }
+  return folder / (cleanName + "_" + timestamp + "_" + randomExportCode() + kPresetExtension);
 }
 
 int currentLutSize(InstanceData *data) {
@@ -3209,9 +3893,19 @@ OfxStatus createInstance(OfxImageEffectHandle effect) {
   gEffectHost->clipGetHandle(effect, kOfxImageEffectSimpleSourceClipName, &data->sourceClip, nullptr);
   gEffectHost->clipGetHandle(effect, kOfxImageEffectOutputClipName, &data->outputClip, nullptr);
 
+  cacheParam(paramSet, "filteringGroup", data->filteringGroup);
+  cacheParam(paramSet, "enlargerGroup", data->enlargerGroup);
+  cacheParam(paramSet, "filmGroup", data->filmGroup);
+  cacheParam(paramSet, "printGroup", data->printGroup);
+  cacheParam(paramSet, "couplerGroup", data->couplerGroup);
+  cacheParam(paramSet, "grainGroup", data->grainGroup);
+  cacheParam(paramSet, "grainSynthesisGroup", data->grainSynthesisGroup);
+  cacheParam(paramSet, "halationGroup", data->halationGroup);
   cacheParam(paramSet, "process", data->process);
+  cacheParam(paramSet, "scanNegativeInvert", data->scanNegativeInvert);
   cacheParam(paramSet, "rgbToRawMethod", data->rgbToRawMethod);
   cacheParam(paramSet, "inputColorSpace", data->inputColorSpace);
+  cacheParam(paramSet, "rcmInputColorSpace", data->rcmInputColorSpace);
   cacheParam(paramSet, "outputRole", data->outputRole);
   cacheParam(paramSet, "sdrOutputColorSpace", data->sdrOutputColorSpace);
   cacheParam(paramSet, "sceneOutputColorSpace", data->sceneOutputColorSpace);
@@ -3337,6 +4031,7 @@ OfxStatus createInstance(OfxImageEffectHandle effect) {
   cacheParam(paramSet, "printDiffusionHaloSize", data->printDiffusionHaloSize);
   cacheParam(paramSet, "printDiffusionBloomIntensity", data->printDiffusionBloomIntensity);
   cacheParam(paramSet, "printDiffusionBloomSize", data->printDiffusionBloomSize);
+  cacheParam(paramSet, "scannerGroup", data->scannerGroup);
   cacheParam(paramSet, "scannerEnabled", data->scannerEnabled);
   cacheParam(paramSet, "scannerWhiteCorrection", data->scannerWhiteCorrection);
   cacheParam(paramSet, "scannerBlackCorrection", data->scannerBlackCorrection);
@@ -3353,6 +4048,11 @@ OfxStatus createInstance(OfxImageEffectHandle effect) {
   cacheParam(paramSet, "lutDestination", data->lutDestination);
   cacheParam(paramSet, "lutIdentifier", data->lutIdentifier);
   cacheParam(paramSet, "exportLut", data->exportLut);
+  cacheParam(paramSet, "presetName", data->presetName);
+  cacheParam(paramSet, "presetSelection", data->presetSelection);
+  cacheParam(paramSet, "savePreset", data->savePreset);
+  cacheParam(paramSet, "loadPreset", data->loadPreset);
+  refreshPresetDropdown(data);
 
   DefaultsSnapshot savedDefaults;
   bool defaultsFound = false;
@@ -3419,9 +4119,11 @@ OfxStatus instanceChanged(OfxImageEffectHandle effect, OfxPropertySetHandle inAr
   const bool saveDefaultsChanged = changedName && std::strcmp(changedName, "saveDefaults") == 0;
   const bool resetDefaultsChanged = changedName && std::strcmp(changedName, "resetDefaults") == 0;
   const bool exportLutChanged = changedName && std::strcmp(changedName, "exportLut") == 0;
+  const bool savePresetChanged = changedName && std::strcmp(changedName, "savePreset") == 0;
+  const bool loadPresetChanged = changedName && std::strcmp(changedName, "loadPreset") == 0;
   const bool openManualChanged = changedName && std::strcmp(changedName, "openUserManual") == 0;
   if (copyParamsChanged || pasteParamsChanged || saveDefaultsChanged || resetDefaultsChanged ||
-      exportLutChanged || openManualChanged) {
+      exportLutChanged || savePresetChanged || loadPresetChanged || openManualChanged) {
     OfxParamSetHandle paramSet = nullptr;
     gEffectHost->getParamSet(effect, &paramSet);
     OfxTime time = 0.0;
@@ -3468,6 +4170,61 @@ OfxStatus instanceChanged(OfxImageEffectHandle effect, OfxPropertySetHandle inAr
       }
       showMessage(effect, kOfxMessageError, "spektrafilmDefaults", error.empty() ? "Could not save spektrafilm defaults." : error);
       return kOfxStatFailed;
+    }
+    if (savePresetChanged) {
+      DefaultsSnapshot snapshot;
+      captureParamSetSnapshot(paramSet, time, snapshot);
+      const std::string displayName = normalizedPresetName(getStringValue(data->presetName));
+      const std::filesystem::path path = generatedPresetPath(displayName);
+      std::string error;
+      if (!writePresetFile(path, displayName, snapshot, error)) {
+        showMessage(effect, kOfxMessageError, "spektrafilmPreset", error.empty() ? "Could not save spektrafilm preset." : error);
+        return kOfxStatFailed;
+      }
+      if (data->presetName) {
+        gParamHost->paramSetValue(data->presetName, displayName.c_str());
+      }
+      refreshPresetDropdown(data, path);
+      showMessage(
+        effect,
+        kOfxMessageMessage,
+        "spektrafilmPreset",
+        "spektrafilm preset saved successfully: " + displayName + "\nPreset folder: " + presetFolder().string()
+      );
+      return kOfxStatOK;
+    }
+    if (loadPresetChanged) {
+      const std::vector<PresetEntry> entries = listPresetEntries();
+      if (entries.empty()) {
+        showMessage(effect, kOfxMessageWarning, "spektrafilmPreset", "No spektrafilm presets found.\nPreset folder: " + presetFolder().string());
+        refreshPresetDropdown(data);
+        return kOfxStatReplyDefault;
+      }
+      const int selected = getIntValue(data->presetSelection, 0);
+      if (selected < 0 || selected >= static_cast<int>(entries.size())) {
+        showMessage(effect, kOfxMessageWarning, "spektrafilmPreset", "Selected spektrafilm preset is no longer available.");
+        refreshPresetDropdown(data);
+        return kOfxStatReplyDefault;
+      }
+
+      DefaultsSnapshot presetSnapshot;
+      std::string displayName;
+      std::string error;
+      if (!readPresetSnapshot(entries[static_cast<size_t>(selected)].path, presetSnapshot, displayName, error)) {
+        showMessage(effect, kOfxMessageError, "spektrafilmPreset", error.empty() ? "Could not load spektrafilm preset." : error);
+        refreshPresetDropdown(data);
+        return kOfxStatFailed;
+      }
+      gParamHost->paramEditBegin(paramSet, "Load spektrafilm preset");
+      applySnapshotToParamSet(paramSet, presetSnapshot);
+      if (data->presetName && !displayName.empty()) {
+        gParamHost->paramSetValue(data->presetName, displayName.c_str());
+      }
+      gParamHost->paramEditEnd(paramSet);
+      syncConditionalParamVisibility(data);
+      refreshPresetDropdown(data, entries[static_cast<size_t>(selected)].path);
+      showMessage(effect, kOfxMessageMessage, "spektrafilmPreset", "spektrafilm preset loaded: " + (displayName.empty() ? entries[static_cast<size_t>(selected)].displayName : displayName));
+      return kOfxStatOK;
     }
     if (exportLutChanged) {
       std::filesystem::path path;
@@ -4142,8 +4899,9 @@ OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHandle) {
   defineGroup(paramSet, "infoGroup", "Info", false);
   defineGroup(paramSet, "manageGroup", "Manage", false);
 
-  const char *processOptions[] = {"Print simulation", "Scan negative"};
-  defineChoice(paramSet, "process", "Mode", processOptions, 2, 0, "colorGroup");
+  const char *processOptions[] = {"Print simulation", "Scan negative", "Process negative"};
+  defineChoice(paramSet, "process", "Mode", processOptions, 3, 0, "colorGroup");
+  defineBool(paramSet, "scanNegativeInvert", "Invert Negative Scan", false, "colorGroup");
   const char *rgbToRawOptions[] = {"Hanatos 2026", "Hanatos 2025", "Mallett 2019"};
   defineChoice(paramSet, "rgbToRawMethod", "RGB to Raw", rgbToRawOptions, 3, 0, "filmGroup");
   const char *colorSpaces[] = {
@@ -4174,24 +4932,26 @@ OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHandle) {
     "Rec.709 Gamma 2.2",
     "Rec.709 Gamma 2.4"
   };
-  const char *sceneOutputColorSpaces[] = {
-    "ARRI LogC4",
-    "ARRI LogC3 EI800",
-    "BMDFilm WideGamut Gen5",
+  const char *rcmInputColorSpaces[] = {
     "DaVinci Intermediate WideGamut",
-    "RED Log3G10 REDWideGamutRGB",
-    "Sony S-Log3 S-Gamut3",
-    "Sony S-Log3 S-Gamut3.Cine",
-    "Canon Log2 CinemaGamut D55",
-    "Canon Log3 CinemaGamut D55",
-    "Panasonic V-Log V-Gamut",
+    "BMDFilm WideGamut Gen5",
     "ACES2065-1",
     "ACEScg",
     "ACEScct",
     "ACEScc",
     "Linear Rec.2020",
     "Linear Rec.709",
-    "Linear P3-D65"
+    "Linear P3-D65",
+    "Rec.709 Gamma 2.4",
+    "Rec.709 Gamma 2.2",
+    "sRGB",
+    "Display P3",
+    "P3-D65 Gamma 2.2",
+    "P3-D65 Gamma 2.6",
+    "DCI-P3"
+  };
+  const char *sceneOutputColorSpaces[] = {
+    "DaVinci Intermediate WideGamut"
   };
   const char *sdrOutputColorSpaces[] = {
     "sRGB",
@@ -4205,10 +4965,11 @@ OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHandle) {
     "Rec.709 Gamma 2.4"
   };
   defineChoice(paramSet, "inputColorSpace", "Input Color Space", colorSpaces, static_cast<int>(sizeof(colorSpaces) / sizeof(colorSpaces[0])), 0, "colorGroup");
-  const char *outputRoles[] = {"Display Out SDR", "Display Out HDR", "Scene Handoff (Dev)"};
+  defineChoice(paramSet, "rcmInputColorSpace", "Input Color Space", rcmInputColorSpaces, static_cast<int>(sizeof(rcmInputColorSpaces) / sizeof(rcmInputColorSpaces[0])), 0, "colorGroup");
+  const char *outputRoles[] = {"Display Out SDR", "Display Out HDR", "RCM/ACES (Beta)"};
   defineChoice(paramSet, "outputRole", "Output Role", outputRoles, outputRoleOptionCountForFlavor(), 0, "colorGroup");
   defineChoice(paramSet, "sdrOutputColorSpace", "Output Color Space", sdrOutputColorSpaces, static_cast<int>(sizeof(sdrOutputColorSpaces) / sizeof(sdrOutputColorSpaces[0])), 8, "colorGroup");
-  defineChoice(paramSet, "sceneOutputColorSpace", "Output Color Space", sceneOutputColorSpaces, static_cast<int>(sizeof(sceneOutputColorSpaces) / sizeof(sceneOutputColorSpaces[0])), 3, "colorGroup");
+  defineChoice(paramSet, "sceneOutputColorSpace", "Output Color Space", sceneOutputColorSpaces, static_cast<int>(sizeof(sceneOutputColorSpaces) / sizeof(sceneOutputColorSpaces[0])), 0, "colorGroup");
   const char *hdrPresets[] = {"PQ 1000", "PQ 4000", "HLG 1000", "Custom"};
   defineChoice(paramSet, "hdrPreset", "HDR Preset", hdrPresets, 4, 0, "colorGroup");
   const char *hdrTransfers[] = {"Rec.2100 ST2084 (PQ)", "Rec.2100 HLG"};
@@ -4384,6 +5145,17 @@ OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHandle) {
   defineChoice(paramSet, "lutDestination", "LUT Destination", lutDestinations, 5, 0, "manageGroup");
   defineSingleLineString(paramSet, "lutIdentifier", "LUT Identifier", "spektrafilm", "manageGroup");
   definePushButton(paramSet, "exportLut", "Export LUT", "manageGroup");
+  defineSingleLineString(paramSet, "presetName", "Preset Name", "spektrafilm_preset", "manageGroup");
+  const std::vector<PresetEntry> presetEntries = listPresetEntries();
+  const std::vector<std::string> presetLabels = presetChoiceLabels(presetEntries);
+  std::vector<const char *> presetLabelPointers;
+  presetLabelPointers.reserve(presetLabels.size());
+  for (const std::string &label : presetLabels) {
+    presetLabelPointers.push_back(label.c_str());
+  }
+  defineChoice(paramSet, "presetSelection", "Preset", presetLabelPointers.data(), static_cast<int>(presetLabelPointers.size()), 0, "manageGroup");
+  definePushButton(paramSet, "savePreset", "Save Preset", "manageGroup");
+  definePushButton(paramSet, "loadPreset", "Load Preset", "manageGroup");
   definePushButton(paramSet, "copyParams", "Copy Params", "manageGroup");
   definePushButton(paramSet, "pasteParams", "Paste Params", "manageGroup");
   definePushButton(paramSet, "saveDefaults", "Set Defaults", "manageGroup");

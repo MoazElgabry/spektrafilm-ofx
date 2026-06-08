@@ -5,19 +5,42 @@ layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
 const float kLog10E = 0.4342944819032518;
 const uint kOutputRoleDisplaySdr = 0u;
 const uint kOutputRoleDisplayHdr = 1u;
-const uint kOutputRoleSceneHandoff = 2u;
+const uint kOutputRoleRcm = 2u;
+const int kBmdFilmWideGamutGen5ColorSpace = 2;
+const int kDavinciIntermediateWideGamutColorSpace = 3;
+const int kAces2065_1ColorSpace = 10;
+const int kAcesCgColorSpace = 11;
+const int kAcesCctColorSpace = 12;
+const int kAcesCcColorSpace = 13;
 const int kLinearRec2020ColorSpace = 14;
+const int kLinearRec709ColorSpace = 15;
+const int kLinearP3D65ColorSpace = 16;
 const int kLinearSrgbColorSpace = 17;
+const int kDisplayP3ColorSpace = 18;
+const int kDciP3ColorSpace = 21;
+const int kP3D65Gamma22ColorSpace = 22;
+const int kP3D65Gamma26ColorSpace = 23;
+const int kRec709Gamma22ColorSpace = 24;
+const int kRec709Gamma24ColorSpace = 25;
 const uint kPrintScanOpFull = 0u;
 const uint kPrintScanOpPrintRaw = 1u;
 const uint kPrintScanOpFinalFromPrintRaw = 2u;
 const uint kPrintScanOpFrameConstants = 3u;
+const uint kPrintScanOpPrintRawFromNegativeLight = 4u;
 const uint kFramePrintExposureScaleR = 91u;
 const uint kFramePrintExposureScaleG = 92u;
 const uint kFramePrintExposureScaleB = 93u;
 const uint kFramePrintPreflashR = 94u;
 const uint kFramePrintPreflashG = 95u;
 const uint kFramePrintPreflashB = 96u;
+const uint kFrameFilmDmaxScanY = 97u;
+const uint kFrameFilmDminScanY = 98u;
+const uint kFrameFilmDmaxScanR = 99u;
+const uint kFrameFilmDmaxScanG = 100u;
+const uint kFrameFilmDmaxScanB = 101u;
+const uint kFrameFilmDminScanR = 102u;
+const uint kFrameFilmDminScanG = 103u;
+const uint kFrameFilmDminScanB = 104u;
 const uint kFrameHdrReferenceWhiteNits = 72u;
 const uint kFrameHdrPeakNits = 73u;
 const uint kFrameHdrExposureEv = 74u;
@@ -26,6 +49,7 @@ const uint kFrameIntOutputRole = 2u;
 const uint kFrameIntHdrTransfer = 20u;
 const uint kFrameIntHdrToneMapping = 21u;
 const uint kFrameIntColorAdaptationFlags = 27u;
+const uint kFrameIntScanNegativeInvert = 28u;
 const uint kColorAdaptationInputCompression = 1u << 0u;
 const uint kColorAdaptationCurveSmoothing = 1u << 1u;
 const uint kColorAdaptationOutputLightnessCompression = 1u << 2u;
@@ -50,6 +74,10 @@ layout(std430, binding = 2) readonly buffer FilmLogExposure {
 
 layout(std430, binding = 3) readonly buffer FilmDensityCurves {
   float filmDensityCurves[];
+};
+
+layout(std430, binding = 5) readonly buffer ColorDecodeLuts {
+  float colorDecodeLuts[];
 };
 
 layout(std430, binding = 6) readonly buffer ColorTransferKinds {
@@ -144,6 +172,14 @@ layout(std430, binding = 28) readonly buffer FrameInts {
   uint frameInts[];
 };
 
+layout(std430, binding = 29) readonly buffer PaperHanatosResponse {
+  vec4 paperHanatosResponse[];
+};
+
+layout(std430, binding = 30) readonly buffer PreflashPaperHanatosResponse {
+  vec4 preflashPaperHanatosResponse[];
+};
+
 layout(push_constant) uniform CoreParams {
   uint width;
   uint height;
@@ -195,6 +231,42 @@ bool colorAdaptationEnabled(uint flag) {
 
 uint colorSpaceIndex(int colorSpace) {
   return uint(clamp(colorSpace, 0, int(max(params.colorSpaceCount, 1u)) - 1));
+}
+
+float sampleColorDecodeLut(float value, uint colorSpace) {
+  const uint lutSize = max(params.transferLutSize, 2u);
+  const float decodeMin = params.colorDecodeMin;
+  const float decodeMax = params.colorDecodeMax;
+  const float range = max(decodeMax - decodeMin, 1.0e-6);
+  const float step = range / float(lutSize - 1u);
+  const uint offset = colorSpace * lutSize;
+  if (value <= decodeMin) {
+    const float y0 = colorDecodeLuts[offset];
+    const float y1 = colorDecodeLuts[offset + 1u];
+    return y0 + (value - decodeMin) * ((y1 - y0) / max(step, 1.0e-12));
+  }
+  if (value >= decodeMax) {
+    const float y0 = colorDecodeLuts[offset + lutSize - 2u];
+    const float y1 = colorDecodeLuts[offset + lutSize - 1u];
+    return y1 + (value - decodeMax) * ((y1 - y0) / max(step, 1.0e-12));
+  }
+  const float position = ((value - decodeMin) / range) * float(lutSize - 1u);
+  const uint lo = uint(floor(position));
+  const uint hi = min(lo + 1u, lutSize - 1u);
+  const float t = position - float(lo);
+  return mix(colorDecodeLuts[offset + lo], colorDecodeLuts[offset + hi], t);
+}
+
+vec3 decodeInputRgb(vec3 rgb) {
+  const uint colorSpace = colorSpaceIndex(params.inputColorSpace);
+  if (colorTransferKinds[colorSpace] == kTransferLinear) {
+    return rgb;
+  }
+  return vec3(
+    sampleColorDecodeLut(rgb.r, colorSpace),
+    sampleColorDecodeLut(rgb.g, colorSpace),
+    sampleColorDecodeLut(rgb.b, colorSpace)
+  );
 }
 
 uint finalOutputColorSpace() {
@@ -332,6 +404,48 @@ vec3 encodeOutputRgb(vec3 rgb) {
 
 float rec2020Luminance(vec3 rgb) {
   return dot(rgb, vec3(0.2627, 0.6780, 0.0593));
+}
+
+bool rcmInverseOotfEnabled(uint colorSpace) {
+  switch (int(colorSpace)) {
+    case kBmdFilmWideGamutGen5ColorSpace:
+    case kDavinciIntermediateWideGamutColorSpace:
+    case kAces2065_1ColorSpace:
+    case kAcesCgColorSpace:
+    case kAcesCctColorSpace:
+    case kAcesCcColorSpace:
+    case kLinearRec2020ColorSpace:
+    case kLinearRec709ColorSpace:
+    case kLinearP3D65ColorSpace:
+    case kLinearSrgbColorSpace:
+    case kDisplayP3ColorSpace:
+    case kDciP3ColorSpace:
+    case kP3D65Gamma22ColorSpace:
+    case kP3D65Gamma26ColorSpace:
+    case kRec709Gamma22ColorSpace:
+    case kRec709Gamma24ColorSpace:
+      return true;
+    default:
+      return false;
+  }
+}
+
+float applyInverseRcmOotfChannel(float value) {
+  // Resolve CST inverse OOTF: inverse BT.1886 EOTF, then inverse BT.709 OETF.
+  const float x = abs(value);
+  const float signal = pow(x, 1.0 / 2.4);
+  const float sceneLinear = signal < 0.081
+    ? signal / 4.5
+    : pow((signal + 0.099) / 1.099, 1.0 / 0.45);
+  return value < 0.0 ? -sceneLinear : sceneLinear;
+}
+
+vec3 applyInverseRcmOotf(vec3 displayLinear) {
+  return vec3(
+    applyInverseRcmOotfChannel(displayLinear.r),
+    applyInverseRcmOotfChannel(displayLinear.g),
+    applyInverseRcmOotfChannel(displayLinear.b)
+  );
 }
 
 vec3 hdrApplyLuminanceToneMap(vec3 rgb) {
@@ -556,20 +670,23 @@ vec3 finalizeDisplaySdrRgb(vec3 rgb) {
   return encodeOutputRgb(outputGamutCompressDisplaySdr(rgb));
 }
 
-vec3 finalizeSceneHandoffRgb(vec3 sceneCreativeLinear) {
-  return encodeOutputRgb(sceneCreativeLinear);
+vec3 finalizeRcmRgb(vec3 timelineLinear) {
+  const uint colorSpace = finalOutputColorSpace();
+  if (rcmInverseOotfEnabled(colorSpace)) {
+    timelineLinear = applyInverseRcmOotf(timelineLinear);
+  }
+  return encodeOutputRgb(timelineLinear);
 }
 
 vec3 finalizeOutputRgb(vec3 rgb) {
   if (u(kFrameIntOutputRole) == kOutputRoleDisplayHdr) {
     return finalizeDisplayHdrRgb(rgb);
   }
-  if (u(kFrameIntOutputRole) == kOutputRoleSceneHandoff) {
-    // Scene Handoff is a scene-referred contract. It may include the
-    // SpektraFilm creative look, but must not include SDR/HDR display
-    // rendering, OOTF/RRT/ODT-style rendering, nits mapping, tone mapping,
-    // display gamut compression, or display gamma.
-    return finalizeSceneHandoffRgb(rgb);
+  if (u(kFrameIntOutputRole) == kOutputRoleRcm) {
+    // RCM returns the selected timeline color space with the same inverse
+    // OOTF the user would otherwise apply in a matching CST before Resolve's
+    // normal timeline-to-display transform.
+    return finalizeRcmRgb(rgb);
   }
   return finalizeDisplaySdrRgb(rgb);
 }
@@ -779,6 +896,43 @@ vec3 hanatosRaw(vec3 xyz) {
   return raw * max(b, 0.0);
 }
 
+vec3 processNegativeHanatosRaw(vec3 xyz, bool preflash) {
+  if (params.hanatosWidth < 2u || params.hanatosHeight < 2u) {
+    return vec3(0.0);
+  }
+  const float b = xyz.x + xyz.y + xyz.z;
+  const vec2 xy = clamp(xyz.xy / max(b, 1.0e-10), vec2(0.0), vec2(1.0));
+  const float tx = clamp((1.0 - xy.x) * (1.0 - xy.x), 0.0, 1.0);
+  const float ty = clamp(xy.y / max(1.0 - xy.x, 1.0e-10), 0.0, 1.0);
+  const float xCoord = tx * float(params.hanatosWidth - 1u);
+  const float yCoord = ty * float(params.hanatosHeight - 1u);
+  const int xBase = xCoord >= float(params.hanatosWidth - 1u) ? int(params.hanatosWidth - 2u) : int(floor(xCoord));
+  const int yBase = yCoord >= float(params.hanatosHeight - 1u) ? int(params.hanatosHeight - 2u) : int(floor(yCoord));
+  const float xFrac = xCoord >= float(params.hanatosWidth - 1u) ? 1.0 : xCoord - float(xBase);
+  const float yFrac = yCoord >= float(params.hanatosHeight - 1u) ? 1.0 : yCoord - float(yBase);
+  float wx[4] = float[4](mitchellWeight(xFrac + 1.0), mitchellWeight(xFrac), mitchellWeight(xFrac - 1.0), mitchellWeight(xFrac - 2.0));
+  float wy[4] = float[4](mitchellWeight(yFrac + 1.0), mitchellWeight(yFrac), mitchellWeight(yFrac - 1.0), mitchellWeight(yFrac - 2.0));
+  vec3 raw = vec3(0.0);
+  float weightSum = 0.0;
+  const uint responseOffset = colorAdaptationEnabled(kColorAdaptationInputCompression)
+    ? params.hanatosWidth * params.hanatosHeight
+    : 0u;
+  for (uint i = 0u; i < 4u; ++i) {
+    const uint xi = safeIndex(xBase - 1 + int(i), params.hanatosWidth);
+    for (uint j = 0u; j < 4u; ++j) {
+      const uint yj = safeIndex(yBase - 1 + int(j), params.hanatosHeight);
+      const float weight = wx[i] * wy[j];
+      weightSum += weight;
+      const uint offset = responseOffset + xi * params.hanatosHeight + yj;
+      raw += weight * (preflash ? preflashPaperHanatosResponse[offset].xyz : paperHanatosResponse[offset].xyz);
+    }
+  }
+  if (weightSum != 0.0) {
+    raw /= weightSum;
+  }
+  return max(raw * max(b, 0.0), vec3(0.0));
+}
+
 vec3 mallettRaw(vec3 linearSrgb) {
   const vec3 srgb = max(linearSrgb, vec3(0.0));
   return vec3(
@@ -977,6 +1131,13 @@ vec3 printerLightExposureScale() {
   return exp2((internalPoints + resolvedPoints) / 12.0);
 }
 
+vec3 apdPrinterTimingExposureScale() {
+  if (u(3u) != 1u) {
+    return vec3(1.0);
+  }
+  return printerLightExposureScale();
+}
+
 vec3 apdNeutralExposureScale() {
   if (u(3u) != 1u || u(12u) == 0u) {
     return vec3(1.0);
@@ -1062,6 +1223,12 @@ float printMidgrayExposureFactor() {
   return 1.0 / max(rawMidgrayGeomean, 1.0e-10);
 }
 
+vec4 scanDensityToOutputRgbLinearY(
+  vec3 densityCmy,
+  float retainedSilverDensity,
+  bool printStage
+);
+
 void buildFrameConstants() {
   const uint wavelengthCount = u(8u);
   for (uint wavelength = 0u; wavelength < wavelengthCount; ++wavelength) {
@@ -1085,6 +1252,20 @@ void buildFrameConstants() {
   frameFloats[kFramePrintPreflashR] = preflash.r;
   frameFloats[kFramePrintPreflashG] = preflash.g;
   frameFloats[kFramePrintPreflashB] = preflash.b;
+  const vec4 filmDmaxScan = u(kFrameIntScanNegativeInvert) != 0u
+    ? scanDensityToOutputRgbLinearY(vec3(f(16u), f(17u), f(18u)), 0.0, false)
+    : vec4(0.0);
+  const vec4 filmDminScan = u(kFrameIntScanNegativeInvert) != 0u
+    ? scanDensityToOutputRgbLinearY(vec3(0.0), 0.0, false)
+    : vec4(0.0);
+  frameFloats[kFrameFilmDmaxScanY] = filmDmaxScan.a;
+  frameFloats[kFrameFilmDminScanY] = filmDminScan.a;
+  frameFloats[kFrameFilmDmaxScanR] = filmDmaxScan.r;
+  frameFloats[kFrameFilmDmaxScanG] = filmDmaxScan.g;
+  frameFloats[kFrameFilmDmaxScanB] = filmDmaxScan.b;
+  frameFloats[kFrameFilmDminScanR] = filmDminScan.r;
+  frameFloats[kFrameFilmDminScanG] = filmDminScan.g;
+  frameFloats[kFrameFilmDminScanB] = filmDminScan.b;
 }
 
 vec3 timedPrintRaw(vec3 filmDensityCmy) {
@@ -1092,6 +1273,23 @@ vec3 timedPrintRaw(vec3 filmDensityCmy) {
   const vec3 exposureScale = vec3(f(kFramePrintExposureScaleR), f(kFramePrintExposureScaleG), f(kFramePrintExposureScaleB));
   const vec3 preflash = vec3(f(kFramePrintPreflashR), f(kFramePrintPreflashG), f(kFramePrintPreflashB));
   return max(raw * exposureScale + preflash, vec3(0.0));
+}
+
+vec3 timedPrintRawFromNegativeLight(vec3 inputRgb) {
+  const vec3 decoded = decodeInputRgb(inputRgb);
+  const vec3 referenceXyz = multiplyInputToReferenceXyz(max(decoded, vec3(0.0)), params.inputColorSpace);
+  const vec3 raw = processNegativeHanatosRaw(referenceXyz, false);
+  const vec3 midgrayXyz = multiplyInputToReferenceXyz(vec3(0.184), kLinearSrgbColorSpace);
+  const vec3 midgrayRaw = max(processNegativeHanatosRaw(midgrayXyz, false), vec3(1.0e-10));
+  const float midgrayGeomean = exp((log(midgrayRaw.r) + log(midgrayRaw.g) + log(midgrayRaw.b)) / 3.0);
+  const float exposureFactor = 1.0 / max(midgrayGeomean, 1.0e-10);
+  const vec3 preflashWhiteXyz = multiplyInputToReferenceXyz(vec3(1.0), kLinearSrgbColorSpace);
+  const vec3 preflashRaw = processNegativeHanatosRaw(preflashWhiteXyz, true);
+  const float exposure = exp2(f(3u));
+  return max(
+    raw * apdPrinterTimingExposureScale() * exposureFactor * exposure + preflashRaw * exposure,
+    vec3(0.0)
+  );
 }
 
 vec3 printLogRaw(vec3 filmDensityCmy) {
@@ -1175,14 +1373,35 @@ vec3 scannerBlackWhiteCorrection(vec3 rgb, float sourceY, float referenceBlackY,
 }
 
 vec3 applyPrintScanOutputContract(vec4 scan) {
+  if (u(kFrameIntOutputRole) == kOutputRoleRcm) {
+    return scan.rgb;
+  }
   return scannerBlackWhiteCorrection(scan.rgb, scan.a, 0.0, 1.0);
 }
 
 vec3 applyFilmScanOutputContract(vec4 scan) {
-  if (u(kFrameIntOutputRole) == kOutputRoleSceneHandoff || u(10u) == 0u) {
+  if (u(kFrameIntScanNegativeInvert) == 0u) {
     return scan.rgb;
   }
-  return scannerBlackWhiteCorrection(scan.rgb, scan.a, 0.0, 1.0);
+  const vec3 dmaxRgb = vec3(f(kFrameFilmDmaxScanR), f(kFrameFilmDmaxScanG), f(kFrameFilmDmaxScanB));
+  const vec3 dminRgb = vec3(f(kFrameFilmDminScanR), f(kFrameFilmDminScanG), f(kFrameFilmDminScanB));
+  const vec3 rawScanRange = dminRgb - dmaxRgb;
+  const vec3 scanRangeSign = mix(vec3(-1.0), vec3(1.0), greaterThanEqual(rawScanRange, vec3(0.0)));
+  const vec3 scanRange = scanRangeSign * max(abs(rawScanRange), vec3(1.0e-6));
+  const float dmaxY = f(kFrameFilmDmaxScanY);
+  const float dminY = f(kFrameFilmDminScanY);
+  const float yRange = max(dminY - dmaxY, 1.0e-10);
+  const bool positiveFilm = u(10u) != 0u;
+  const vec3 normalizedRgb = positiveFilm
+    ? (scan.rgb - dmaxRgb) / scanRange
+    : (dminRgb - scan.rgb) / scanRange;
+  const float normalizedY = positiveFilm
+    ? (scan.a - dmaxY) / yRange
+    : (dminY - scan.a) / yRange;
+  if (u(kFrameIntOutputRole) == kOutputRoleRcm) {
+    return normalizedRgb;
+  }
+  return scannerBlackWhiteCorrection(normalizedRgb, normalizedY, 0.0, 1.0);
 }
 
 void main() {
@@ -1205,19 +1424,24 @@ void main() {
   }
   const uint index = gid.y * params.width + gid.x;
   vec4 pixel = loadFilmDensityPixel(index);
-  const bool sceneHandoffOutput = u(kFrameIntOutputRole) == kOutputRoleSceneHandoff;
-  const bool finalPrintSimulation = u(0u) == 0u && !sceneHandoffOutput;
-  const bool finalScanNegative = u(0u) == 1u || sceneHandoffOutput;
+  const bool finalPrintSimulation = u(0u) == 0u;
+  const bool finalScanNegative = u(0u) == 1u;
+  const bool finalProcessNegative = u(0u) == 2u;
+  const bool printLikeFinal = finalPrintSimulation || finalProcessNegative;
 
   if (params._pad0 == kPrintScanOpPrintRaw) {
     storeDestinationPixel(index, vec4(timedPrintRaw(pixel.rgb), pixel.a));
+    return;
+  }
+  if (params._pad0 == kPrintScanOpPrintRawFromNegativeLight) {
+    storeDestinationPixel(index, vec4(timedPrintRawFromNegativeLight(pixel.rgb), pixel.a));
     return;
   }
 
   const bool deferOutputEncode = params._pad1 != 0u;
 
   if (params._pad0 == kPrintScanOpFinalFromPrintRaw) {
-    if (finalPrintSimulation) {
+    if (printLikeFinal) {
       const vec3 printDensity = developPrintDensity(log(max(pixel.rgb, vec3(0.0)) + vec3(1.0e-10)) * kLog10E);
       const vec3 bypassedPrintDensity = bleachBypassDyeDensity(printDensity, f(9u), true);
       const float retainedSilver = bleachBypassRetainedSilverDensity(printDensity, f(9u), true);
@@ -1235,8 +1459,9 @@ void main() {
     return;
   }
 
-  if (finalPrintSimulation) {
-    const vec3 printDensity = developPrintDensity(printLogRaw(pixel.rgb));
+  if (finalPrintSimulation || finalProcessNegative) {
+    const vec3 printRaw = finalProcessNegative ? timedPrintRawFromNegativeLight(pixel.rgb) : timedPrintRaw(pixel.rgb);
+    const vec3 printDensity = developPrintDensity(log(max(printRaw, vec3(0.0)) + vec3(1.0e-10)) * kLog10E);
     const vec3 bypassedPrintDensity = bleachBypassDyeDensity(printDensity, f(9u), true);
     const float retainedSilver = bleachBypassRetainedSilverDensity(printDensity, f(9u), true);
     vec4 scan = scanDensityToOutputRgbLinearY(
@@ -1256,7 +1481,7 @@ void main() {
     pixel.rgb = applyFilmScanOutputContract(scan);
   }
 
-  if ((finalPrintSimulation || finalScanNegative) && !deferOutputEncode) {
+  if ((finalPrintSimulation || finalScanNegative || finalProcessNegative) && !deferOutputEncode) {
     pixel.rgb = finalizeOutputRgb(pixel.rgb);
   }
   storeDestinationPixel(index, pixel);
